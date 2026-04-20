@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewRequest
+from khonliang_reviewer import ReviewRequest, ReviewResult
 
 from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
@@ -40,8 +40,10 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
+from reviewer.pricing_seed import load_default_pricing
 from reviewer.rules import PolicyDecision, PolicyInput, decide
 from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
+from reviewer.storage import UsageStore, open_usage_store
 
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,22 @@ def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
     return line_count, file_count
 
 
+def _positive_float_or_none(val: Any) -> float | None:
+    """Coerce ``val`` to a positive float, or None when it's falsy/invalid.
+
+    The ``usage_summary`` skill accepts ``since``/``until`` as floats
+    with a default of 0. Treating 0 as "no filter" lets callers omit
+    the field on the bus wire without constructing explicit nulls.
+    """
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
 def _policy_input_for(
     *, kind: str, content: str, context: dict[str, Any]
 ) -> PolicyInput:
@@ -216,14 +234,35 @@ class ReviewerAgent(BaseAgent):
         self,
         *,
         selector: ProviderSelector | None = None,
+        usage_store: UsageStore | None = None,
         github_client: ReviewerGithubClient | None = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self._injected_selector = selector
         self._cached_selector: ProviderSelector | None = None
+        self._injected_store = usage_store
+        self._cached_store: UsageStore | None = None
         self._injected_github = github_client
         self._cached_github: ReviewerGithubClient | None = None
+
+    async def start(self) -> None:
+        """Eager-init the usage store so the SQLite file lands on launch.
+
+        Operators rely on seeing ``data/reviewer.db`` appear as soon as
+        the agent boots (for tailing, backups, monitoring) rather than
+        waiting for the first skill call to create it lazily. The
+        selector + github client stay lazy — provider construction can
+        be expensive (Ollama HTTP client, Claude CLI probe) and is only
+        worth paying for when a review actually runs.
+        """
+        # _ensure_usage_store is idempotent; tests that inject an
+        # in-memory store skip the filesystem touch entirely.
+        try:
+            self._ensure_usage_store()
+        except Exception as exc:
+            logger.warning("reviewer usage store init failed at start(): %s", exc)
+        await super().start()
 
     # -- skill surface -------------------------------------------------
 
@@ -272,6 +311,19 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "dry_run": {"type": "boolean", "default": False},
                     "event": {"type": "string", "default": "COMMENT"},
+                },
+                since="0.1.0",
+            ),
+            Skill(
+                "usage_summary",
+                "Aggregated token usage + estimated API cost grouped by "
+                "(backend, model). All filters optional; omit to summarize "
+                "the full history.",
+                {
+                    "backend": {"type": "string", "default": ""},
+                    "model": {"type": "string", "default": ""},
+                    "since": {"type": "number", "default": 0},
+                    "until": {"type": "number", "default": 0},
                 },
                 since="0.1.0",
             ),
@@ -328,6 +380,7 @@ class ReviewerAgent(BaseAgent):
         )
 
         result = await provider.review(request)
+        await self._record_usage(result)
         return result.to_dict()
 
     @handler("review_diff")
@@ -346,11 +399,11 @@ class ReviewerAgent(BaseAgent):
     async def handle_review_pr(self, args: dict[str, Any]) -> dict[str, Any]:
         """End-to-end: fetch PR, review via review_text, post back to GitHub.
 
-        ``event`` defaults to ``"COMMENT"`` and is the only value the
-        reviewer actually uses today — approval authority stays human
-        per the FR. Callers can still pass it explicitly for future
-        expansion (``"REQUEST_CHANGES"`` when a concern-level finding
-        merits blocking, etc.).
+        ``event`` defaults to ``"COMMENT"`` — the only event the reviewer
+        agent is allowed to use autonomously. ``APPROVE`` is rejected at
+        the validation step (approval authority stays human per FR).
+        ``REQUEST_CHANGES`` / ``PENDING`` are still accepted for operator
+        tooling + human-in-the-loop scenarios.
         """
         repo = str(args.get("repo") or "").strip()
         if not repo:
@@ -386,8 +439,8 @@ class ReviewerAgent(BaseAgent):
             return {"error": f"github fetch failed: {exc}"}
 
         # Feed the diff into review_text via the shared path so selector,
-        # rule table, and (WU5b-landed) usage recording all run exactly
-        # once per review, regardless of which entry skill was called.
+        # rule table, and usage recording all run exactly once per
+        # review, regardless of which entry skill was called.
         review_args: dict[str, Any] = {
             "kind": "pr_diff",
             "content": diff,
@@ -447,7 +500,79 @@ class ReviewerAgent(BaseAgent):
             },
         }
 
+    @handler("usage_summary")
+    async def handle_usage_summary(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return token + cost aggregates grouped by (backend, model).
+
+        Storage failures (DB path unreadable, permission issue, bad
+        YAML on seed) surface as a structured ``{"error": "..."}``
+        response rather than raising — keeps the skill surface from
+        crashing out when the store is broken.
+        """
+        try:
+            store = self._ensure_usage_store()
+            summaries = store.summarize(
+                backend=(args.get("backend") or None),
+                model=(args.get("model") or None),
+                since=_positive_float_or_none(args.get("since")),
+                until=_positive_float_or_none(args.get("until")),
+            )
+        except Exception as exc:
+            logger.warning("usage_summary failed: %s", exc)
+            return {
+                "error": f"usage_summary failed: {exc}",
+                "entries": [],
+                "total_rows": 0,
+                "total_cost_usd": 0.0,
+            }
+        return {
+            "entries": [s.to_dict() for s in summaries],
+            "total_rows": sum(s.rows for s in summaries),
+            "total_cost_usd": sum(s.total_cost_usd for s in summaries),
+        }
+
     # -- internals -----------------------------------------------------
+
+    async def _record_usage(self, result: ReviewResult) -> None:
+        """Persist the usage event + emit ``reviewer.usage`` on the bus.
+
+        Called from the review handlers after provider.review() returns.
+        Zero-cost events (Ollama-backed) get their ``estimated_api_cost_usd``
+        back-filled from the ``model_pricing`` table before storage.
+
+        Every failure path — store open/create, cost back-fill, write,
+        publish — is wrapped so accounting problems never propagate
+        into the caller's review. That's the whole point of this
+        method being separate from the review flow itself.
+        """
+        if result.usage is None:
+            return
+        try:
+            store = self._ensure_usage_store()
+        except Exception as exc:
+            logger.warning("reviewer usage store unavailable: %s", exc)
+            return
+
+        try:
+            filled = store.back_fill_cost(result.usage)
+        except Exception as exc:
+            logger.warning("reviewer usage back_fill_cost failed: %s", exc)
+            filled = result.usage
+        # Mutate the result so the caller sees the back-filled cost too.
+        result.usage = filled
+
+        try:
+            store.write_usage(filled)
+        except Exception as exc:
+            logger.warning("reviewer_usage write failed: %s", exc)
+
+        try:
+            await self.publish("reviewer.usage", filled.to_dict())
+        except RuntimeError as exc:
+            # Agent not connected (tests, dry-run) — expected in those paths.
+            logger.debug("skipping reviewer.usage publish: %s", exc)
+        except Exception as exc:
+            logger.warning("reviewer.usage publish failed: %s", exc)
 
     def _ensure_selector(self) -> ProviderSelector:
         if self._injected_selector is not None:
@@ -462,6 +587,24 @@ class ReviewerAgent(BaseAgent):
         if self._cached_github is None:
             self._cached_github = ReviewerGithubClient()
         return self._cached_github
+
+    def _ensure_usage_store(self) -> UsageStore:
+        if self._injected_store is not None:
+            return self._injected_store
+        if self._cached_store is None:
+            config = self._load_config()
+            db_path = str(config.get("db_path") or "data/reviewer.db")
+            store = open_usage_store(db_path)
+            try:
+                seeded = store.seed_pricing_if_empty(load_default_pricing())
+                if seeded:
+                    logger.info("seeded %d default pricing rows", seeded)
+            except Exception as exc:
+                # Seeding is best-effort — missing YAML or parse error
+                # shouldn't block agent startup.
+                logger.warning("default pricing seed failed: %s", exc)
+            self._cached_store = store
+        return self._cached_store
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()

@@ -1,0 +1,84 @@
+# Default per-model pricing seeded into the `model_pricing` table on first
+# startup. Manual refresh only — update this file and `DELETE FROM model_pricing`
+# (or re-init the DB) to pick up new rates. Automatic scraping of Anthropic /
+# Ollama pricing pages is out of scope per fr_developer_e72d8835.
+#
+# Rates are USD per million tokens. All known fields: input, output,
+# cache_read, cache_creation. Fields not published by a vendor default to 0
+# in the DB.
+#
+# as_of dates are when the rates were captured from the source URL — check
+# upstream before trusting for live billing.
+
+pricing:
+  # -----------------------------------------------------------------
+  # claude_cli — rates equal what the Anthropic API would charge for the
+  # same token counts. For subscription-backed calls (via
+  # CLAUDE_CODE_OAUTH_TOKEN) the cost is hypothetical: "what this would
+  # have cost on the API". The CLI envelope's total_cost_usd typically
+  # lands at the same number; this table serves as a fallback when the
+  # envelope is absent or zero.
+  # -----------------------------------------------------------------
+  - backend: claude_cli
+    model: claude-opus-4-7
+    input_per_mtoken_usd: 15.0
+    output_per_mtoken_usd: 75.0
+    cache_read_per_mtoken_usd: 1.5
+    cache_creation_per_mtoken_usd: 18.75
+    source_url: https://www.anthropic.com/pricing
+    as_of: "2026-04-20"
+
+  - backend: claude_cli
+    model: claude-sonnet-4-6
+    input_per_mtoken_usd: 3.0
+    output_per_mtoken_usd: 15.0
+    cache_read_per_mtoken_usd: 0.3
+    cache_creation_per_mtoken_usd: 3.75
+    source_url: https://www.anthropic.com/pricing
+    as_of: "2026-04-20"
+
+  - backend: claude_cli
+    model: claude-haiku-4-5
+    input_per_mtoken_usd: 1.0
+    output_per_mtoken_usd: 5.0
+    cache_read_per_mtoken_usd: 0.1
+    cache_creation_per_mtoken_usd: 1.25
+    source_url: https://www.anthropic.com/pricing
+    as_of: "2026-04-20"
+
+  # -----------------------------------------------------------------
+  # ollama — local models cost $0 to run but still have "effective" rates
+  # if the same model is invoked against an equivalent cloud API. Leaving
+  # local model rates at 0 reports accurately that you're not paying
+  # per-token for local inference. Cloud models (*.cloud) get non-zero
+  # rates so usage_summary reflects actual spend.
+  # -----------------------------------------------------------------
+  - backend: ollama
+    model: qwen3.5
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: local
+    as_of: "2026-04-20"
+
+  - backend: ollama
+    model: glm-4.7-flash
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: local
+    as_of: "2026-04-20"
+
+  # Ollama cloud examples — placeholder rates. Adjust once canonical
+  # Ollama cloud pricing is published and captured.
+  - backend: ollama
+    model: kimi-k2.5:cloud
+    input_per_mtoken_usd: 1.0
+    output_per_mtoken_usd: 4.0
+    source_url: https://ollama.com/pricing
+    as_of: "2026-04-20"
+
+  - backend: ollama
+    model: glm-5:cloud
+    input_per_mtoken_usd: 1.0
+    output_per_mtoken_usd: 4.0
+    source_url: https://ollama.com/pricing
+    as_of: "2026-04-20"

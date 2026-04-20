@@ -6,5 +6,8 @@ build/
 .venv/
 .pytest_cache/
 data/*.db
+*.db
+*.db-shm
+*.db-wal
 config.yaml
 .mcp.json
