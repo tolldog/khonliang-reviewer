@@ -554,6 +554,55 @@ async def test_review_pr_non_positive_pr_number_returns_error():
         assert "error" in result
 
 
+async def test_review_pr_rejects_bool_pr_number():
+    """`bool` subclasses `int`; True/False must NOT silently coerce to 1/0."""
+    provider = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness(provider)
+    for bad in (True, False):
+        result = await harness.call(
+            "review_pr", {"repo": "tolldog/example", "pr_number": bad}
+        )
+        assert "error" in result
+        assert "boolean" in result["error"]
+    assert provider.last_request is None
+
+
+async def test_review_pr_rejects_non_bool_dry_run():
+    """String "false" (or any non-bool) must NOT be truth-tested via bool()."""
+    provider = _RecordingProvider("ollama", _make_result())
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    for bad in ("false", "true", 0, 1, "yes", None):
+        result = await harness.call(
+            "review_pr",
+            {"repo": "tolldog/example", "pr_number": 42, "dry_run": bad},
+        )
+        assert "error" in result
+        assert "dry_run" in result["error"]
+    assert provider.last_request is None
+    assert github.submit_calls == []
+
+
+async def test_review_pr_accepts_explicit_bool_dry_run():
+    """Explicit True/False still work."""
+    provider = _RecordingProvider("ollama", _make_result())
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    result_dry = await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "dry_run": True},
+    )
+    assert result_dry["github"]["dry_run"] is True
+
+    result_live = await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "dry_run": False},
+    )
+    assert result_live["github"]["dry_run"] is False
+
+
 async def test_review_pr_fetch_failure_returns_error():
     provider = _RecordingProvider("ollama", _make_result())
     github = _FakeGithub(

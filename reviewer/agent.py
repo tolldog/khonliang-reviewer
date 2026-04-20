@@ -409,6 +409,11 @@ class ReviewerAgent(BaseAgent):
         if not repo:
             return {"error": "repo is required (owner/name form)"}
         pr_raw = args.get("pr_number")
+        # Reject bool explicitly — bool subclasses int, so `int(True)` silently
+        # becomes PR #1 and `int(False)` becomes 0. Both are wrong and need to
+        # surface as errors rather than targeting the wrong PR.
+        if isinstance(pr_raw, bool):
+            return {"error": "pr_number must be an integer, not a boolean"}
         try:
             pr_number = int(pr_raw)
         except (TypeError, ValueError):
@@ -416,7 +421,17 @@ class ReviewerAgent(BaseAgent):
         if pr_number <= 0:
             return {"error": "pr_number must be positive"}
 
-        dry_run = bool(args.get("dry_run", False))
+        dry_run_raw = args.get("dry_run", False)
+        # Strict bool: `bool(val)` would accept any truthy value including the
+        # string "false", which would unexpectedly skip posting. Force a real
+        # boolean so operator typos / YAML-to-JSON mishaps fail loudly.
+        if not isinstance(dry_run_raw, bool):
+            return {
+                "error": (
+                    f"dry_run must be a boolean, got {type(dry_run_raw).__name__}"
+                )
+            }
+        dry_run = dry_run_raw
         event_raw = str(args.get("event") or "COMMENT").strip().upper()
         if event_raw not in _VALID_REVIEW_EVENTS:
             return {
