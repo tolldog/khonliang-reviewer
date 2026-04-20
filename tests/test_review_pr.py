@@ -95,6 +95,27 @@ def test_format_summary_level_finding_appended_to_body():
     assert comments == []
 
 
+def test_format_additional_notes_heading_even_with_empty_summary():
+    """Summary-level findings must carry the heading even without a top summary."""
+    body, comments = _format_for_github(
+        {
+            "summary": "",
+            "findings": [
+                {
+                    "severity": "nit",
+                    "title": "Style",
+                    "body": "Prefer trailing commas.",
+                    "path": None,
+                    "line": None,
+                }
+            ],
+        }
+    )
+    assert body.startswith("### Additional notes")
+    assert "🟢 Nit" in body
+    assert comments == []
+
+
 def test_format_mixed_anchored_and_summary_level_findings():
     body, comments = _format_for_github(
         {
@@ -380,6 +401,39 @@ async def test_review_pr_custom_event_flag_threads_through():
     )
 
     assert github.submit_calls[0]["event"] == "REQUEST_CHANGES"
+
+
+async def test_review_pr_event_is_normalized_to_upper_case():
+    provider = _RecordingProvider("ollama", _make_result())
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "event": "comment"},
+    )
+
+    assert github.submit_calls[0]["event"] == "COMMENT"
+
+
+async def test_review_pr_rejects_unsupported_event():
+    """Typos + unsupported events fail with a structured bus error, not a 4xx."""
+    provider = _RecordingProvider("ollama", _make_result())
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    result = await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "event": "SHIPIT"},
+    )
+
+    assert "error" in result
+    assert "event must be one of" in result["error"]
+    assert "SHIPIT" in result["error"]
+    # GitHub surface never touched
+    assert github.submit_calls == []
+    # Provider also not invoked (validation happens before the review)
+    assert provider.last_request is None
 
 
 # ---------------------------------------------------------------------------

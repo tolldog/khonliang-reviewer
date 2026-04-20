@@ -31,14 +31,9 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewFinding, ReviewRequest
+from khonliang_reviewer import ReviewRequest
 
-from reviewer.github_client import (
-    GithubClientError,
-    PRMetadata,
-    ReviewerGithubClient,
-    SubmittedReview,
-)
+from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
@@ -69,6 +64,13 @@ _SEVERITY_LABELS = {
     "comment": "🟡 Comment",
     "concern": "🔴 Concern",
 }
+
+
+#: GitHub-supported values for the ``event`` parameter on a review
+#: submission. The reviewer agent validates ``review_pr``'s ``event``
+#: against this set before touching GitHub so typos surface as a
+#: structured bus error rather than a 4xx later.
+_VALID_REVIEW_EVENTS = frozenset({"COMMENT", "APPROVE", "REQUEST_CHANGES", "PENDING"})
 
 
 def _format_for_github(
@@ -133,9 +135,11 @@ def _format_for_github(
 
     body = summary.strip()
     if summary_extras:
-        if body:
-            body += "\n\n### Additional notes\n\n"
-        body += "\n".join(summary_extras)
+        # Always mark the extras with a heading so the bullet list has
+        # a clear context, even when the model returned an empty
+        # top-level summary.
+        separator = "\n\n" if body else ""
+        body += f"{separator}### Additional notes\n\n" + "\n".join(summary_extras)
     if not body:
         body = "No findings."
     return body, inline_comments
@@ -349,7 +353,15 @@ class ReviewerAgent(BaseAgent):
             return {"error": "pr_number must be positive"}
 
         dry_run = bool(args.get("dry_run", False))
-        event = str(args.get("event") or "COMMENT")
+        event_raw = str(args.get("event") or "COMMENT").strip().upper()
+        if event_raw not in _VALID_REVIEW_EVENTS:
+            return {
+                "error": (
+                    "event must be one of "
+                    f"{sorted(_VALID_REVIEW_EVENTS)}; got {event_raw!r}"
+                )
+            }
+        event = event_raw
 
         github = self._ensure_github_client()
         try:
