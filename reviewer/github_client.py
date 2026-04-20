@@ -121,7 +121,9 @@ class ReviewerGithubClient:
                     "or remove the GitHub dependency from the reviewer "
                     "agent."
                 ) from exc
-            self._gh = GitHub(self._token) if self._token else GitHub()
+            # Keyword form avoids reliance on the positional-arg order
+            # of githubkit's GitHub constructor across minor versions.
+            self._gh = GitHub(token=self._token) if self._token else GitHub()
         return self._gh
 
     # -- reads ---------------------------------------------------------

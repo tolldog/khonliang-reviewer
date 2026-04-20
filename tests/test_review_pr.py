@@ -94,6 +94,67 @@ def test_format_summary_level_finding_appended_to_body():
     assert comments == []
 
 
+def test_format_zero_line_finding_falls_back_to_summary_level():
+    """GitHub rejects line=0; the formatter must demote to summary-level."""
+    body, comments = _format_for_github(
+        {
+            "summary": "",
+            "findings": [
+                {
+                    "severity": "nit",
+                    "title": "Zero line",
+                    "body": "bad line number",
+                    "path": "a.py",
+                    "line": 0,
+                }
+            ],
+        }
+    )
+    assert comments == []
+    assert "Zero line" in body
+
+
+def test_format_negative_line_finding_falls_back_to_summary_level():
+    """Similarly, negative line numbers can't anchor — demote, don't post."""
+    body, comments = _format_for_github(
+        {
+            "summary": "",
+            "findings": [
+                {
+                    "severity": "nit",
+                    "title": "Negative line",
+                    "body": "x",
+                    "path": "a.py",
+                    "line": -3,
+                }
+            ],
+        }
+    )
+    assert comments == []
+    assert "Negative line" in body
+
+
+def test_format_bool_line_finding_falls_back_to_summary_level():
+    """`bool` subclasses `int`; `True`/`False` must NOT pass as line numbers."""
+    for val in (True, False):
+        body, comments = _format_for_github(
+            {
+                "summary": "",
+                "findings": [
+                    {
+                        "severity": "nit",
+                        "title": "Bool line",
+                        "body": "x",
+                        "path": "a.py",
+                        "line": val,
+                    }
+                ],
+            }
+        )
+        assert comments == []
+        assert "Bool line" in body
+
+
 def test_format_additional_notes_heading_even_with_empty_summary():
     """Summary-level findings must carry the heading even without a top summary."""
     body, comments = _format_for_github(

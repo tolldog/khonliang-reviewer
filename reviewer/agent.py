@@ -110,8 +110,17 @@ def _format_for_github(
         line = finding.get("line")
         suggestion = finding.get("suggestion")
 
+        # GitHub review-comments require a string path and a POSITIVE
+        # line number; ``bool`` is excluded explicitly because it
+        # subclasses ``int`` (``True`` would otherwise read as line 1).
+        # Findings that don't satisfy both fall back to summary-level
+        # notes to avoid 422 Unprocessable Entity from GitHub.
         anchored = (
-            isinstance(path, str) and path and isinstance(line, int)
+            isinstance(path, str)
+            and bool(path)
+            and isinstance(line, int)
+            and not isinstance(line, bool)
+            and line > 0
         )
         if anchored:
             parts = [f"**{label} — {title}**" if title else f"**{label}**"]
