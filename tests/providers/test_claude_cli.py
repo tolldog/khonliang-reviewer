@@ -362,6 +362,34 @@ async def test_append_system_prompt_flag_threaded_through(monkeypatch):
     assert argv[idx + 1] == "You are a reviewer."
 
 
+async def test_model_from_metadata_threaded_as_cli_flag(monkeypatch):
+    """Caller-specified model (via request.metadata) reaches claude -p --model."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    request = _make_request(
+        metadata={"repo": "tolldog/ex", "pr_number": 7, "model": "sonnet"}
+    )
+    await ClaudeCliProvider().review(request)
+
+    argv = calls[0]
+    assert "--model" in argv
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "sonnet"
+
+
+async def test_no_model_in_metadata_omits_model_flag(monkeypatch):
+    """Without a caller-specified model, no --model flag is passed."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    request = _make_request(metadata={"repo": "tolldog/ex", "pr_number": 7})
+    await ClaudeCliProvider().review(request)
+
+    argv = calls[0]
+    assert "--model" not in argv
+
+
 async def test_provider_name_is_claude_cli():
     assert ClaudeCliProvider.name == "claude_cli"
     assert ClaudeCliProvider().name == "claude_cli"

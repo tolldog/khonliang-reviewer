@@ -138,6 +138,12 @@ class ClaudeCliProvider(ReviewProvider):
         ]
         if self.config.append_system_prompt:
             cmd += ["--append-system-prompt", self.config.append_system_prompt]
+        # Caller-specified model flows via request.metadata["model"].
+        # `claude -p --model <spec>` accepts either an alias (`opus`, `sonnet`)
+        # or a fully-qualified id (`claude-opus-4-7`).
+        requested_model = request.metadata.get("model")
+        if isinstance(requested_model, str) and requested_model:
+            cmd += ["--model", requested_model]
         # Prompt goes via stdin, not argv: diffs easily exceed OS ARG_MAX
         # (~128KB on Linux) and argv is visible to other users via `ps`.
 
