@@ -11,10 +11,15 @@ Two tables:
   :data:`UsageEvent.estimated_api_cost_usd` can be back-filled for
   backends that don't return cost in-band (Ollama).
 
-The store is process-local. Access is serialized by Python's
-``sqlite3`` thread-safety default + ``check_same_thread=False`` so
-asyncio coroutines can call through without a dedicated thread pool.
-Writes are small; contention is not expected at reviewer-agent scale.
+The store is process-local. ``check_same_thread=False`` is used only
+so asyncio coroutines scheduled on different threads can call through
+the same connection — it does NOT serialize concurrent access or make
+the connection safe to use from multiple callers at once. The reviewer
+agent drives reviews sequentially per-request from a single event
+loop, and writes are infrequent + small, so actual contention is not
+expected. If that invariant ever changes (parallel reviews, a
+background writer, etc.), add explicit locking or move to a
+per-coroutine connection before relying on the current shape.
 """
 
 from __future__ import annotations

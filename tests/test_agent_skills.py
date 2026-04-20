@@ -579,6 +579,59 @@ async def test_usage_summary_on_empty_store_returns_zeros():
     assert result["total_cost_usd"] == 0.0
 
 
+async def test_usage_summary_returns_structured_error_on_store_failure(monkeypatch):
+    """DB-open/query failures must not crash the skill — return error payload."""
+    harness = _make_harness()
+
+    def boom() -> None:
+        raise RuntimeError("disk is on fire")
+
+    monkeypatch.setattr(harness.agent, "_ensure_usage_store", boom)
+
+    result = await harness.call("usage_summary", {})
+
+    assert "error" in result
+    assert "disk is on fire" in result["error"]
+    # Structured fallback fields still present so callers don't KeyError
+    assert result["entries"] == []
+    assert result["total_rows"] == 0
+    assert result["total_cost_usd"] == 0.0
+
+
+async def test_review_preserves_success_when_usage_store_broken(monkeypatch):
+    """A broken store must NOT cause the caller's review to appear failed."""
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+
+    def boom() -> None:
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(harness.agent, "_ensure_usage_store", boom)
+
+    result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    # Review still posted normally — accounting failure swallowed.
+    assert result["disposition"] == "posted"
+    assert result["summary"] == "ok"
+
+
+async def test_review_preserves_success_when_back_fill_raises(monkeypatch):
+    """back_fill_cost() errors must be swallowed like write_usage errors."""
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+    store = harness.agent._injected_store
+    assert store is not None
+
+    def boom(event):
+        raise RuntimeError("pricing table locked")
+
+    monkeypatch.setattr(store, "back_fill_cost", boom)
+
+    result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert result["disposition"] == "posted"
+
+
 async def test_usage_summary_since_zero_treated_as_no_filter():
     """Omitting since/until (default=0) must not filter to an empty window."""
     fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))

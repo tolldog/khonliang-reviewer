@@ -279,14 +279,29 @@ class ReviewerAgent(BaseAgent):
 
     @handler("usage_summary")
     async def handle_usage_summary(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Return token + cost aggregates grouped by (backend, model)."""
-        store = self._ensure_usage_store()
-        summaries = store.summarize(
-            backend=(args.get("backend") or None),
-            model=(args.get("model") or None),
-            since=_positive_float_or_none(args.get("since")),
-            until=_positive_float_or_none(args.get("until")),
-        )
+        """Return token + cost aggregates grouped by (backend, model).
+
+        Storage failures (DB path unreadable, permission issue, bad
+        YAML on seed) surface as a structured ``{"error": "..."}``
+        response rather than raising — keeps the skill surface from
+        crashing out when the store is broken.
+        """
+        try:
+            store = self._ensure_usage_store()
+            summaries = store.summarize(
+                backend=(args.get("backend") or None),
+                model=(args.get("model") or None),
+                since=_positive_float_or_none(args.get("since")),
+                until=_positive_float_or_none(args.get("until")),
+            )
+        except Exception as exc:
+            logger.warning("usage_summary failed: %s", exc)
+            return {
+                "error": f"usage_summary failed: {exc}",
+                "entries": [],
+                "total_rows": 0,
+                "total_cost_usd": 0.0,
+            }
         return {
             "entries": [s.to_dict() for s in summaries],
             "total_rows": sum(s.rows for s in summaries),
@@ -302,20 +317,32 @@ class ReviewerAgent(BaseAgent):
         Zero-cost events (Ollama-backed) get their ``estimated_api_cost_usd``
         back-filled from the ``model_pricing`` table before storage.
 
-        Publish failures (agent not connected to the bus, transport
-        errors) log and are swallowed — they must not cause the caller's
-        review to appear failed.
+        Every failure path — store open/create, cost back-fill, write,
+        publish — is wrapped so accounting problems never propagate
+        into the caller's review. That's the whole point of this
+        method being separate from the review flow itself.
         """
         if result.usage is None:
             return
-        store = self._ensure_usage_store()
-        filled = store.back_fill_cost(result.usage)
+        try:
+            store = self._ensure_usage_store()
+        except Exception as exc:
+            logger.warning("reviewer usage store unavailable: %s", exc)
+            return
+
+        try:
+            filled = store.back_fill_cost(result.usage)
+        except Exception as exc:
+            logger.warning("reviewer usage back_fill_cost failed: %s", exc)
+            filled = result.usage
         # Mutate the result so the caller sees the back-filled cost too.
         result.usage = filled
+
         try:
             store.write_usage(filled)
         except Exception as exc:
             logger.warning("reviewer_usage write failed: %s", exc)
+
         try:
             await self.publish("reviewer.usage", filled.to_dict())
         except RuntimeError as exc:
