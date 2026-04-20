@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewRequest
+from khonliang_reviewer import ReviewRequest, ReviewResult, UsageEvent
 
 from reviewer.providers import (
     ClaudeCliProvider,
@@ -39,8 +39,10 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
+from reviewer.pricing_seed import load_default_pricing
 from reviewer.rules import PolicyDecision, PolicyInput, decide
 from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
+from reviewer.storage import UsageStore, open_usage_store
 
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,22 @@ def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
     if content.startswith("diff --git"):
         file_count += 1
     return line_count, file_count
+
+
+def _positive_float_or_none(val: Any) -> float | None:
+    """Coerce ``val`` to a positive float, or None when it's falsy/invalid.
+
+    The ``usage_summary`` skill accepts ``since``/``until`` as floats
+    with a default of 0. Treating 0 as "no filter" lets callers omit
+    the field on the bus wire without constructing explicit nulls.
+    """
+    if val is None:
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
 
 
 def _policy_input_for(
@@ -118,11 +136,14 @@ class ReviewerAgent(BaseAgent):
         self,
         *,
         selector: ProviderSelector | None = None,
+        usage_store: UsageStore | None = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self._injected_selector = selector
         self._cached_selector: ProviderSelector | None = None
+        self._injected_store = usage_store
+        self._cached_store: UsageStore | None = None
 
     # -- skill surface -------------------------------------------------
 
@@ -154,6 +175,19 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
+                },
+                since="0.1.0",
+            ),
+            Skill(
+                "usage_summary",
+                "Aggregated token usage + estimated API cost grouped by "
+                "(backend, model). All filters optional; omit to summarize "
+                "the full history.",
+                {
+                    "backend": {"type": "string", "default": ""},
+                    "model": {"type": "string", "default": ""},
+                    "since": {"type": "number", "default": 0},
+                    "until": {"type": "number", "default": 0},
                 },
                 since="0.1.0",
             ),
@@ -210,6 +244,7 @@ class ReviewerAgent(BaseAgent):
         )
 
         result = await provider.review(request)
+        await self._record_usage(result)
         return result.to_dict()
 
     @handler("review_diff")
@@ -224,7 +259,52 @@ class ReviewerAgent(BaseAgent):
         forwarded["content"] = diff
         return await self.handle_review_text(forwarded)
 
+    @handler("usage_summary")
+    async def handle_usage_summary(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return token + cost aggregates grouped by (backend, model)."""
+        store = self._ensure_usage_store()
+        summaries = store.summarize(
+            backend=(args.get("backend") or None),
+            model=(args.get("model") or None),
+            since=_positive_float_or_none(args.get("since")),
+            until=_positive_float_or_none(args.get("until")),
+        )
+        return {
+            "entries": [s.to_dict() for s in summaries],
+            "total_rows": sum(s.rows for s in summaries),
+            "total_cost_usd": sum(s.total_cost_usd for s in summaries),
+        }
+
     # -- internals -----------------------------------------------------
+
+    async def _record_usage(self, result: ReviewResult) -> None:
+        """Persist the usage event + emit ``reviewer.usage`` on the bus.
+
+        Called from the review handlers after provider.review() returns.
+        Zero-cost events (Ollama-backed) get their ``estimated_api_cost_usd``
+        back-filled from the ``model_pricing`` table before storage.
+
+        Publish failures (agent not connected to the bus, transport
+        errors) log and are swallowed — they must not cause the caller's
+        review to appear failed.
+        """
+        if result.usage is None:
+            return
+        store = self._ensure_usage_store()
+        filled = store.back_fill_cost(result.usage)
+        # Mutate the result so the caller sees the back-filled cost too.
+        result.usage = filled
+        try:
+            store.write_usage(filled)
+        except Exception as exc:
+            logger.warning("reviewer_usage write failed: %s", exc)
+        try:
+            await self.publish("reviewer.usage", filled.to_dict())
+        except RuntimeError as exc:
+            # Agent not connected (tests, dry-run) — expected in those paths.
+            logger.debug("skipping reviewer.usage publish: %s", exc)
+        except Exception as exc:
+            logger.warning("reviewer.usage publish failed: %s", exc)
 
     def _ensure_selector(self) -> ProviderSelector:
         if self._injected_selector is not None:
@@ -232,6 +312,24 @@ class ReviewerAgent(BaseAgent):
         if self._cached_selector is None:
             self._cached_selector = self._build_default_selector()
         return self._cached_selector
+
+    def _ensure_usage_store(self) -> UsageStore:
+        if self._injected_store is not None:
+            return self._injected_store
+        if self._cached_store is None:
+            config = self._load_config()
+            db_path = str(config.get("db_path") or "data/reviewer.db")
+            store = open_usage_store(db_path)
+            try:
+                seeded = store.seed_pricing_if_empty(load_default_pricing())
+                if seeded:
+                    logger.info("seeded %d default pricing rows", seeded)
+            except Exception as exc:
+                # Seeding is best-effort — missing YAML or parse error
+                # shouldn't block agent startup.
+                logger.warning("default pricing seed failed: %s", exc)
+            self._cached_store = store
+        return self._cached_store
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()

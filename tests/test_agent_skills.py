@@ -23,6 +23,7 @@ from khonliang_reviewer import (
 )
 from reviewer.agent import ReviewerAgent
 from reviewer.selector import ProviderSelector, SelectorConfig
+from reviewer.storage import open_usage_store
 
 
 class _RecordingProvider(ReviewProvider):
@@ -84,7 +85,11 @@ def _make_harness(
             default_backend=default_backend, default_model=default_model
         ),
     )
-    return AgentTestHarness(ReviewerAgent, selector=selector)
+    return AgentTestHarness(
+        ReviewerAgent,
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +406,188 @@ async def test_context_diff_size_overrides_content_estimate():
 
     assert ollama.last_request is not None
     assert ollama.last_request.metadata["model"] == "kimi-k2.5:cloud"
+
+
+# ---------------------------------------------------------------------------
+# Usage persistence + bus-event emission
+# ---------------------------------------------------------------------------
+
+
+async def test_review_writes_usage_row_to_store():
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+    store = harness.agent._injected_store
+    assert store is not None
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    summaries = store.summarize()
+    assert len(summaries) == 1
+    assert summaries[0].rows == 1
+    assert summaries[0].backend == "ollama"
+    assert summaries[0].model == "qwen3.5"
+    assert summaries[0].input_tokens == 10
+    assert summaries[0].output_tokens == 5
+
+
+async def test_review_emits_reviewer_usage_event(monkeypatch):
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+
+    published: list[tuple[str, dict]] = []
+
+    async def fake_publish(topic: str, payload: dict) -> None:
+        published.append((topic, payload))
+
+    monkeypatch.setattr(harness.agent, "publish", fake_publish)
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert len(published) == 1
+    topic, payload = published[0]
+    assert topic == "reviewer.usage"
+    assert payload["backend"] == "ollama"
+    assert payload["input_tokens"] == 10
+    assert payload["output_tokens"] == 5
+
+
+async def test_review_swallows_bus_publish_failures(monkeypatch):
+    """A publish failure must not cause the caller's review to appear failed."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    async def broken_publish(topic: str, payload: dict) -> None:
+        raise RuntimeError("agent not connected")
+
+    monkeypatch.setattr(harness.agent, "publish", broken_publish)
+
+    result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+    # publish failure doesn't propagate into the result
+    assert result["disposition"] == "posted"
+
+
+async def test_review_backfills_cost_from_model_pricing():
+    """Ollama reviews (cost=0 from provider) get cost filled from pricing table."""
+    from khonliang_reviewer import ModelPricing
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+    store = harness.agent._injected_store
+    assert store is not None
+    store.put_pricing(
+        ModelPricing(
+            backend="ollama",
+            model="qwen3.5",
+            input_per_mtoken_usd=1_000_000.0,  # dramatic rate so math is obvious
+            output_per_mtoken_usd=2_000_000.0,
+        )
+    )
+
+    result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    # 10 input * $1,000,000/M + 5 output * $2,000,000/M
+    # = 10.0 + 10.0 = 20.0
+    assert result["usage"]["estimated_api_cost_usd"] == 20.0
+
+
+async def test_review_preserves_provider_cost_when_nonzero():
+    """Claude envelopes already carry total_cost_usd; back-fill must not overwrite."""
+    fake = _RecordingProvider(
+        "claude_cli",
+        _make_result(
+            backend="claude_cli",
+            model="claude-opus-4-7",
+        ),
+    )
+    # Set the result's usage cost > 0 to simulate a Claude CLI response
+    fake._response.usage.estimated_api_cost_usd = 0.12345
+
+    harness = _make_harness(
+        {"claude_cli": fake}, default_backend="claude_cli", default_model="claude-opus-4-7"
+    )
+    store = harness.agent._injected_store
+    assert store is not None
+    # Put pricing that would yield a DIFFERENT cost if applied
+    from khonliang_reviewer import ModelPricing
+
+    store.put_pricing(
+        ModelPricing(
+            backend="claude_cli",
+            model="claude-opus-4-7",
+            input_per_mtoken_usd=100.0,
+            output_per_mtoken_usd=100.0,
+        )
+    )
+
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "backend": "claude_cli",
+            "model": "claude-opus-4-7",
+        },
+    )
+    # original cost preserved
+    assert result["usage"]["estimated_api_cost_usd"] == 0.12345
+
+
+# ---------------------------------------------------------------------------
+# usage_summary skill
+# ---------------------------------------------------------------------------
+
+
+async def test_usage_summary_aggregates_after_multiple_reviews():
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+
+    for _ in range(3):
+        await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    result = await harness.call("usage_summary", {})
+    assert result["total_rows"] == 3
+    assert len(result["entries"]) == 1
+    entry = result["entries"][0]
+    assert entry["backend"] == "ollama"
+    assert entry["model"] == "qwen3.5"
+    assert entry["rows"] == 3
+    # 3 reviews * 10 input tokens each = 30
+    assert entry["input_tokens"] == 30
+
+
+async def test_usage_summary_respects_backend_filter():
+    ollama_fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude_fake = _RecordingProvider("claude_cli", _make_result(backend="claude_cli", model="claude-opus-4-7"))
+    harness = _make_harness({"ollama": ollama_fake, "claude_cli": claude_fake})
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "backend": "claude_cli"},
+    )
+
+    ollama_only = await harness.call("usage_summary", {"backend": "ollama"})
+    assert ollama_only["total_rows"] == 1
+    assert ollama_only["entries"][0]["backend"] == "ollama"
+
+
+async def test_usage_summary_on_empty_store_returns_zeros():
+    harness = _make_harness()
+    result = await harness.call("usage_summary", {})
+    assert result["entries"] == []
+    assert result["total_rows"] == 0
+    assert result["total_cost_usd"] == 0.0
+
+
+async def test_usage_summary_since_zero_treated_as_no_filter():
+    """Omitting since/until (default=0) must not filter to an empty window."""
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    result = await harness.call("usage_summary", {"since": 0, "until": 0})
+    assert result["total_rows"] == 1
 
 
 # ---------------------------------------------------------------------------
