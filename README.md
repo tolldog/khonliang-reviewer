@@ -77,8 +77,15 @@ Start the reviewer agent against the bus:
 .venv/bin/python -m reviewer.agent --id reviewer-primary --bus http://localhost:8787 --config /absolute/path/to/config.yaml
 ```
 
-At the current scaffold stage no skills are registered yet. They land in
-subsequent work units.
+The agent registers `review_text` and `review_diff` bus skills. Provider
+selection currently supports caller override (`backend` / `model` args)
+with a config-level default fallback. Rule-table-driven selection
+(`kind` + profile + diff size) wires in once `reviewer.rules` lands on
+main; until then callers either name the provider/model explicitly or
+get the config default.
+
+`review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
+aggregation) are upcoming work units and not yet registered.
 
 ## Repository Boundaries
 
