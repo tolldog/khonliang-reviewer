@@ -17,6 +17,7 @@ import pytest
 
 from khonliang_reviewer import ReviewRequest
 from reviewer.providers.ollama import (
+    OllamaAuthError,
     OllamaHealthcheckError,
     OllamaProvider,
     OllamaProviderConfig,
@@ -394,11 +395,30 @@ async def test_healthcheck_unreachable_raises():
     with pytest.raises(OllamaHealthcheckError) as excinfo:
         await OllamaProvider(client=client).healthcheck()
     assert "not reachable" in str(excinfo.value)
+    # reachability failure is NOT an auth error
+    assert not isinstance(excinfo.value, OllamaAuthError)
+
+
+async def test_healthcheck_auth_rejection_raises_auth_error():
+    client = _make_client(models_list_raises=_api_error(openai.AuthenticationError))
+    with pytest.raises(OllamaAuthError) as excinfo:
+        await OllamaProvider(client=client).healthcheck()
+    assert "rejected credentials" in str(excinfo.value)
+
+
+async def test_healthcheck_generic_api_error_falls_back_to_healthcheck_failed():
+    client = _make_client(models_list_raises=_api_error(openai.APIError))
+    with pytest.raises(OllamaHealthcheckError) as excinfo:
+        await OllamaProvider(client=client).healthcheck()
+    assert "healthcheck failed" in str(excinfo.value)
+    assert not isinstance(excinfo.value, OllamaAuthError)
 
 
 async def test_healthcheck_error_is_runtime_error():
-    """Callers can catch RuntimeError broadly."""
+    """Callers can catch RuntimeError broadly — covers both subclasses."""
     assert issubclass(OllamaHealthcheckError, RuntimeError)
+    assert issubclass(OllamaAuthError, OllamaHealthcheckError)
+    assert issubclass(OllamaAuthError, RuntimeError)
 
 
 # ---------------------------------------------------------------------------

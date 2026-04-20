@@ -30,18 +30,30 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
+from reviewer.providers._prompt import build_review_prompt
 
 
 logger = logging.getLogger(__name__)
 
 
 class OllamaHealthcheckError(RuntimeError):
-    """Raised when :meth:`OllamaProvider.healthcheck` cannot reach the endpoint.
+    """Base for :meth:`OllamaProvider.healthcheck` failures.
 
     Distinct from generic :class:`RuntimeError` so agent boot can catch
-    the reachability-specific case without confusing it with auth or
-    model-missing problems.
+    all healthcheck problems broadly while still distinguishing specific
+    cases via subclasses. Today's subclass is :class:`OllamaAuthError`
+    for credential failures; reachability / generic failures raise the
+    base class itself.
+    """
+
+
+class OllamaAuthError(OllamaHealthcheckError):
+    """Raised when the endpoint rejects credentials during healthcheck.
+
+    Separated from the general reachability case so agent boot can
+    surface "wrong key / expired token" differently from "server
+    unreachable"; callers that want either of them can still catch
+    :class:`OllamaHealthcheckError`.
     """
 
 
@@ -81,17 +93,34 @@ class OllamaProvider(ReviewProvider):
         )
 
     async def healthcheck(self) -> None:
-        """Verify the endpoint is reachable and speaks the OpenAI-compat API.
+        """Verify the endpoint is reachable and accepts our credentials.
 
-        Hits ``models.list`` which Ollama implements as a lightweight
-        "what models are available here" query. Raises on any transport
-        or auth failure.
+        Hits ``models.list`` — Ollama implements it as a lightweight
+        "what models are available here" query. Failures split into
+        three categories so agent boot can act on each:
+
+        - :class:`OllamaAuthError` — credentials rejected (cloud-hosted
+          Ollama typically). Caller should fix the API key.
+        - :class:`OllamaHealthcheckError` ``"not reachable"`` — transport
+          couldn't reach the server. Caller should check it's running
+          and the URL is right.
+        - :class:`OllamaHealthcheckError` ``"healthcheck failed"`` —
+          any other API error (bad request, rate limit, etc.). Caller
+          reads the message and investigates.
         """
         try:
             await self._client.models.list()
-        except openai.APIError as exc:
+        except openai.AuthenticationError as exc:
+            raise OllamaAuthError(
+                f"ollama endpoint at {self.config.base_url} rejected credentials: {exc}"
+            ) from exc
+        except openai.APIConnectionError as exc:
             raise OllamaHealthcheckError(
                 f"ollama endpoint not reachable at {self.config.base_url}: {exc}"
+            ) from exc
+        except openai.APIError as exc:
+            raise OllamaHealthcheckError(
+                f"ollama healthcheck failed at {self.config.base_url}: {exc}"
             ) from exc
 
     async def review(self, request: ReviewRequest) -> ReviewResult:
@@ -412,6 +441,7 @@ def _safe_int(val: Any) -> int:
 
 
 __all__ = [
+    "OllamaAuthError",
     "OllamaHealthcheckError",
     "OllamaProvider",
     "OllamaProviderConfig",

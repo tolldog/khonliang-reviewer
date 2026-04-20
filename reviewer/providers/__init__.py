@@ -14,6 +14,7 @@ from reviewer.providers.claude_cli import (
     ClaudeCliProviderConfig,
 )
 from reviewer.providers.ollama import (
+    OllamaAuthError,
     OllamaHealthcheckError,
     OllamaProvider,
     OllamaProviderConfig,
@@ -25,6 +26,7 @@ __all__ = [
     "ClaudeCliAuthError",
     "ClaudeCliProvider",
     "ClaudeCliProviderConfig",
+    "OllamaAuthError",
     "OllamaHealthcheckError",
     "OllamaProvider",
     "OllamaProviderConfig",
