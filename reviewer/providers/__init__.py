@@ -9,6 +9,7 @@ skill wiring and SQLite usage persistence live one layer up, in
 
 from reviewer.providers.claude_cli import (
     REVIEW_RESPONSE_SCHEMA,
+    ClaudeCliAuthError,
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
 )
@@ -16,6 +17,7 @@ from reviewer.providers.claude_cli import (
 
 __all__ = [
     "REVIEW_RESPONSE_SCHEMA",
+    "ClaudeCliAuthError",
     "ClaudeCliProvider",
     "ClaudeCliProviderConfig",
 ]

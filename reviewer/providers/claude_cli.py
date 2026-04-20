@@ -38,6 +38,17 @@ from khonliang_reviewer import (
 logger = logging.getLogger(__name__)
 
 
+class ClaudeCliAuthError(RuntimeError):
+    """Raised when ``claude auth status`` reports a logged-out state.
+
+    Distinct from generic :class:`RuntimeError` so agent boot can catch the
+    auth-specific case and surface it to operators without mixing it into
+    other startup failures. All ``review()`` error paths that can be
+    attributed to auth instead populate
+    ``ReviewResult.error_category="auth_not_provisioned"``.
+    """
+
+
 REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["summary"],
@@ -89,6 +100,56 @@ class ClaudeCliProvider(ReviewProvider):
     def __init__(self, config: ClaudeCliProviderConfig | None = None):
         self.config = config or ClaudeCliProviderConfig()
 
+    async def healthcheck(self) -> None:
+        """Verify the CLI is authenticated. Intended for agent boot.
+
+        Call once at startup; on success, subsequent ``review()`` calls
+        can assume auth is in place (OAuth tokens from
+        ``claude setup-token`` are long-lived). If auth is revoked
+        mid-session the regular ``review()`` error path still catches it
+        and surfaces the failure with ``error_category="backend_error"``
+        or ``"nonzero_exit"`` depending on how the CLI manifests it.
+
+        Raises:
+            FileNotFoundError: if the ``claude`` binary is not on PATH.
+            ClaudeCliAuthError: if the CLI reports logged-out.
+            RuntimeError: for other unexpected failures (non-zero exit,
+                malformed output).
+        """
+        proc = await asyncio.create_subprocess_exec(
+            self.config.binary,
+            "auth",
+            "status",
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError("claude auth status timed out after 15s")
+
+        if proc.returncode != 0:
+            stderr_text = stderr.decode(errors="replace").strip()[:500]
+            raise RuntimeError(
+                f"claude auth status exited with {proc.returncode}"
+                + (f": {stderr_text}" if stderr_text else "")
+            )
+
+        try:
+            info = json.loads(stdout.decode(errors="replace"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"claude auth status returned non-JSON: {exc}")
+
+        if not info.get("loggedIn"):
+            raise ClaudeCliAuthError(
+                "claude CLI is not authenticated; run `claude setup-token` "
+                "or `claude login` (CLAUDE_CODE_OAUTH_TOKEN) before using "
+                "the provider"
+            )
+
     async def review(self, request: ReviewRequest) -> ReviewResult:
         prompt = _build_prompt(request)
         started_wall = time.time()
@@ -115,6 +176,7 @@ class ClaudeCliProvider(ReviewProvider):
             return _errored(
                 request,
                 error=f"claude binary not found at {self.config.binary!r}",
+                error_category="binary_not_found",
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
             )
@@ -129,6 +191,7 @@ class ClaudeCliProvider(ReviewProvider):
             return _errored(
                 request,
                 error=f"claude -p timed out after {self.config.timeout_seconds}s",
+                error_category="subprocess_timeout",
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
             )
@@ -137,12 +200,18 @@ class ClaudeCliProvider(ReviewProvider):
 
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()[:500]
+            category = (
+                "auth_not_provisioned"
+                if _stderr_suggests_auth_failure(stderr_text)
+                else "nonzero_exit"
+            )
             return _errored(
                 request,
                 error=(
                     f"claude -p exited with {proc.returncode}"
                     + (f": {stderr_text}" if stderr_text else "")
                 ),
+                error_category=category,
                 started_wall=started_wall,
                 duration_ms=duration_ms,
             )
@@ -153,6 +222,7 @@ class ClaudeCliProvider(ReviewProvider):
             return _errored(
                 request,
                 error=f"claude -p returned non-JSON output: {exc}",
+                error_category="malformed_envelope",
                 started_wall=started_wall,
                 duration_ms=duration_ms,
             )
@@ -206,6 +276,7 @@ def _parse_envelope(
                 or envelope.get("result")
                 or "claude -p reported an error"
             ),
+            error_category="backend_error",
             started_wall=started_wall,
             duration_ms=int(envelope.get("duration_ms") or fallback_duration_ms),
             envelope=envelope,
@@ -221,6 +292,7 @@ def _parse_envelope(
         return _errored(
             request,
             error=f"claude -p result was not JSON: {exc}",
+            error_category="malformed_envelope",
             started_wall=started_wall,
             duration_ms=duration_ms,
             envelope=envelope,
@@ -288,6 +360,7 @@ def _build_usage(
     model: str,
     disposition: str,
     error: str = "",
+    error_category: str = "",
 ) -> UsageEvent:
     usage_raw = envelope.get("usage") or {}
     return UsageEvent(
@@ -305,6 +378,7 @@ def _build_usage(
         pr_number=_int_or_none(request.metadata.get("pr_number")),
         estimated_api_cost_usd=float(envelope.get("total_cost_usd") or 0.0),
         error=error,
+        error_category=error_category,
     )
 
 
@@ -312,6 +386,7 @@ def _errored(
     request: ReviewRequest,
     *,
     error: str,
+    error_category: str,
     started_wall: float,
     duration_ms: int,
     envelope: dict[str, Any] | None = None,
@@ -326,6 +401,7 @@ def _errored(
         model=model,
         disposition="errored",
         error=error,
+        error_category=error_category,
     )
     return ReviewResult(
         request_id=request.request_id,
@@ -333,11 +409,38 @@ def _errored(
         findings=[],
         disposition="errored",
         error=error,
+        error_category=error_category,
         usage=usage,
         backend=ClaudeCliProvider.name,
         model=model,
         created_at=started_wall,
     )
+
+
+_AUTH_FAILURE_HINTS = (
+    "not authenticated",
+    "not logged in",
+    "please log in",
+    "login required",
+    "authentication required",
+    "invalid token",
+    "expired token",
+    "unauthorized",
+)
+
+
+def _stderr_suggests_auth_failure(stderr_text: str) -> bool:
+    """Heuristic: does a non-zero-exit stderr look like an auth problem?
+
+    Used only when the CLI exits non-zero without a structured envelope,
+    so we can upgrade the default ``nonzero_exit`` category to the more
+    specific ``auth_not_provisioned``. Intentionally conservative — the
+    sanctioned path for detecting auth is :meth:`ClaudeCliProvider.healthcheck`
+    at agent boot; this is a best-effort fallback for mid-session
+    surprises.
+    """
+    lowered = stderr_text.lower()
+    return any(hint in lowered for hint in _AUTH_FAILURE_HINTS)
 
 
 def _elapsed_ms(started_mono: float) -> int:
@@ -355,6 +458,7 @@ def _int_or_none(val: Any) -> int | None:
 
 __all__ = [
     "REVIEW_RESPONSE_SCHEMA",
+    "ClaudeCliAuthError",
     "ClaudeCliProvider",
     "ClaudeCliProviderConfig",
 ]

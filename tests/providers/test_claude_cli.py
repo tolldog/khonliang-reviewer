@@ -16,6 +16,7 @@ import pytest
 from khonliang_reviewer import ReviewRequest
 from reviewer.providers import claude_cli
 from reviewer.providers.claude_cli import (
+    ClaudeCliAuthError,
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
 )
@@ -196,9 +197,11 @@ async def test_error_envelope_errored_disposition(monkeypatch):
     result = await ClaudeCliProvider().review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
     assert "rate_limited" in result.error
     assert result.usage is not None
     assert result.usage.disposition == "errored"
+    assert result.usage.error_category == "backend_error"
 
 
 async def test_non_zero_exit_code_errored(monkeypatch):
@@ -208,8 +211,24 @@ async def test_non_zero_exit_code_errored(monkeypatch):
     result = await ClaudeCliProvider().review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "nonzero_exit"
     assert "exited with 2" in result.error
     assert "kaboom" in result.error
+
+
+async def test_non_zero_exit_with_auth_hint_upgrades_category(monkeypatch):
+    """Mid-session auth revocation should be categorized specifically."""
+    proc = _FakeProc(
+        stdout=b"",
+        stderr=b"Error: not authenticated; please log in",
+        returncode=1,
+    )
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "auth_not_provisioned"
 
 
 async def test_non_json_stdout_errored(monkeypatch):
@@ -219,6 +238,7 @@ async def test_non_json_stdout_errored(monkeypatch):
     result = await ClaudeCliProvider().review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "malformed_envelope"
     assert "non-JSON output" in result.error
 
 
@@ -232,6 +252,7 @@ async def test_result_field_non_json_errored(monkeypatch):
     result = await ClaudeCliProvider().review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "malformed_envelope"
     assert "result was not JSON" in result.error
 
 
@@ -242,6 +263,7 @@ async def test_missing_binary_errored(monkeypatch):
     result = await provider.review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "binary_not_found"
     assert "claude-does-not-exist" in result.error
     assert "not found" in result.error
 
@@ -254,6 +276,7 @@ async def test_timeout_errored_and_kills_process(monkeypatch):
     result = await provider.review(_make_request())
 
     assert result.disposition == "errored"
+    assert result.error_category == "subprocess_timeout"
     assert "timed out" in result.error
     assert proc.killed is True
 
@@ -323,3 +346,81 @@ async def test_review_response_schema_shape():
     assert "summary" in schema["required"]
     severity = schema["properties"]["findings"]["items"]["properties"]["severity"]
     assert set(severity["enum"]) == {"nit", "comment", "concern"}
+
+
+# ---------------------------------------------------------------------------
+# healthcheck — startup auth pre-flight
+# ---------------------------------------------------------------------------
+
+
+async def test_healthcheck_logged_in_returns_quietly(monkeypatch):
+    proc = _FakeProc(
+        stdout=json.dumps(
+            {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "subscriptionType": "max",
+            }
+        ).encode()
+    )
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    await ClaudeCliProvider().healthcheck()
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[0] == "claude"
+    assert "auth" in argv
+    assert "status" in argv
+    assert "--json" in argv
+
+
+async def test_healthcheck_logged_out_raises_auth_error(monkeypatch):
+    proc = _FakeProc(
+        stdout=json.dumps({"loggedIn": False}).encode()
+    )
+    _install_fake_proc(monkeypatch, proc)
+
+    with pytest.raises(ClaudeCliAuthError) as excinfo:
+        await ClaudeCliProvider().healthcheck()
+
+    assert "not authenticated" in str(excinfo.value)
+    assert "claude setup-token" in str(excinfo.value)
+
+
+async def test_healthcheck_missing_binary_raises_filenotfound(monkeypatch):
+    _install_missing_binary(monkeypatch)
+    provider = ClaudeCliProvider(
+        ClaudeCliProviderConfig(binary="claude-does-not-exist")
+    )
+
+    with pytest.raises(FileNotFoundError):
+        await provider.healthcheck()
+
+
+async def test_healthcheck_non_zero_exit_raises_runtime(monkeypatch):
+    proc = _FakeProc(stdout=b"", stderr=b"boom", returncode=3)
+    _install_fake_proc(monkeypatch, proc)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ClaudeCliProvider().healthcheck()
+
+    assert "exited with 3" in str(excinfo.value)
+    # must not be the auth-specific subclass
+    assert not isinstance(excinfo.value, ClaudeCliAuthError)
+
+
+async def test_healthcheck_malformed_output_raises_runtime(monkeypatch):
+    proc = _FakeProc(stdout=b"not json")
+    _install_fake_proc(monkeypatch, proc)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ClaudeCliProvider().healthcheck()
+
+    assert "non-JSON" in str(excinfo.value)
+
+
+async def test_claude_cli_auth_error_is_runtime_error():
+    """Callers can catch RuntimeError to handle any healthcheck failure."""
+    assert issubclass(ClaudeCliAuthError, RuntimeError)
