@@ -164,11 +164,13 @@ class ClaudeCliProvider(ReviewProvider):
         ]
         if self.config.append_system_prompt:
             cmd += ["--append-system-prompt", self.config.append_system_prompt]
-        cmd.append(prompt)
+        # Prompt goes via stdin, not argv: diffs easily exceed OS ARG_MAX
+        # (~128KB on Linux) and argv is visible to other users via `ps`.
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -183,7 +185,8 @@ class ClaudeCliProvider(ReviewProvider):
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self.config.timeout_seconds
+                proc.communicate(prompt.encode()),
+                timeout=self.config.timeout_seconds,
             )
         except asyncio.TimeoutError:
             proc.kill()
@@ -227,12 +230,34 @@ class ClaudeCliProvider(ReviewProvider):
                 duration_ms=duration_ms,
             )
 
-        return _parse_envelope(
+        if not isinstance(envelope, dict):
+            return _errored(
+                request,
+                error=(
+                    "claude -p returned JSON that is not an object "
+                    f"(type={type(envelope).__name__})"
+                ),
+                error_category="malformed_envelope",
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+            )
+
+        result = _parse_envelope(
             envelope,
             request=request,
             started_wall=started_wall,
             fallback_duration_ms=duration_ms,
         )
+        logger.debug(
+            "claude_cli review done: disposition=%s category=%s model=%s tokens_in=%s tokens_out=%s duration_ms=%s",
+            result.disposition,
+            result.error_category or "-",
+            result.model,
+            result.usage.input_tokens if result.usage else 0,
+            result.usage.output_tokens if result.usage else 0,
+            result.usage.duration_ms if result.usage else 0,
+        )
+        return result
 
 
 def _build_prompt(request: ReviewRequest) -> str:
@@ -298,7 +323,23 @@ def _parse_envelope(
             envelope=envelope,
         )
 
+    if not isinstance(payload, dict):
+        return _errored(
+            request,
+            error=(
+                "claude -p result JSON is not an object "
+                f"(type={type(payload).__name__})"
+            ),
+            error_category="malformed_envelope",
+            started_wall=started_wall,
+            duration_ms=duration_ms,
+            envelope=envelope,
+        )
+
     summary = str(payload.get("summary", ""))
+    raw_findings = payload.get("findings") or []
+    if not isinstance(raw_findings, list):
+        raw_findings = []
     findings = [
         ReviewFinding(
             severity=item.get("severity", "comment"),
@@ -306,10 +347,11 @@ def _parse_envelope(
             body=str(item.get("body", "")),
             category=str(item.get("category", "")),
             path=item.get("path"),
-            line=item.get("line"),
+            line=_int_or_none(item.get("line")),
             suggestion=item.get("suggestion"),
         )
-        for item in (payload.get("findings") or [])
+        for item in raw_findings
+        if isinstance(item, dict)
     ]
 
     usage = _build_usage(
@@ -341,8 +383,9 @@ def _pick_primary_model(envelope: dict[str, Any]) -> str | None:
     best_name: str | None = None
     best_cost = -1.0
     for name, stats in model_usage.items():
+        stats_dict = stats if isinstance(stats, dict) else {}
         try:
-            cost = float((stats or {}).get("costUSD") or 0.0)
+            cost = float(stats_dict.get("costUSD") or 0.0)
         except (TypeError, ValueError):
             cost = 0.0
         if cost > best_cost:
@@ -362,21 +405,27 @@ def _build_usage(
     error: str = "",
     error_category: str = "",
 ) -> UsageEvent:
-    usage_raw = envelope.get("usage") or {}
+    usage_raw = envelope.get("usage")
+    if not isinstance(usage_raw, dict):
+        usage_raw = {}
+    try:
+        cost = float(envelope.get("total_cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
     return UsageEvent(
         timestamp=started_wall,
         backend=ClaudeCliProvider.name,
         model=model,
-        input_tokens=int(usage_raw.get("input_tokens") or 0),
-        output_tokens=int(usage_raw.get("output_tokens") or 0),
-        cache_read_tokens=int(usage_raw.get("cache_read_input_tokens") or 0),
-        cache_creation_tokens=int(usage_raw.get("cache_creation_input_tokens") or 0),
+        input_tokens=_safe_int(usage_raw.get("input_tokens")),
+        output_tokens=_safe_int(usage_raw.get("output_tokens")),
+        cache_read_tokens=_safe_int(usage_raw.get("cache_read_input_tokens")),
+        cache_creation_tokens=_safe_int(usage_raw.get("cache_creation_input_tokens")),
         duration_ms=duration_ms,
         disposition=disposition,  # type: ignore[arg-type]
         request_id=request.request_id,
         repo=str(request.metadata.get("repo", "")),
         pr_number=_int_or_none(request.metadata.get("pr_number")),
-        estimated_api_cost_usd=float(envelope.get("total_cost_usd") or 0.0),
+        estimated_api_cost_usd=cost,
         error=error,
         error_category=error_category,
     )
@@ -453,7 +502,22 @@ def _int_or_none(val: Any) -> int | None:
     try:
         return int(val)
     except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
         return None
+
+
+def _safe_int(val: Any) -> int:
+    """Coerce to int, returning 0 for anything that doesn't cleanly convert.
+
+    Handles ``"12"``, ``"12.0"``, ``12.0``, ``None``, arbitrary objects
+    (always returns 0 on failure). Used at the untrusted envelope
+    boundary so the provider never raises translating tokens.
+    """
+    result = _int_or_none(val)
+    return 0 if result is None else result
 
 
 __all__ = [

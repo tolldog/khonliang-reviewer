@@ -83,8 +83,10 @@ class _FakeProc:
         self.returncode = returncode
         self._hang = hang
         self.killed = False
+        self.stdin_received: bytes | None = None
 
-    async def communicate(self) -> tuple[bytes, bytes]:
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+        self.stdin_received = input
         if self._hang:
             await asyncio.sleep(60)
         return self._stdout, self._stderr
@@ -166,20 +168,45 @@ async def test_success_envelope_produces_posted_review(monkeypatch):
     assert "-p" in argv
     assert "--output-format=json" in argv
     assert "--json-schema" in argv
+    # prompt is NOT in argv — it's piped via stdin to avoid ARG_MAX and
+    # the `ps`-listing leak for diff content
+    assert not any("diff --git" in part for part in argv)
+    assert proc.stdin_received is not None
+    assert b"diff --git" in proc.stdin_received
 
 
 async def test_prompt_carries_instructions_and_context(monkeypatch):
     proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
-    calls = _install_fake_proc(monkeypatch, proc)
+    _install_fake_proc(monkeypatch, proc)
 
     await ClaudeCliProvider().review(_make_request())
 
-    prompt = calls[0][-1]  # last argv element is the positional prompt
+    # Prompt is piped via stdin, not argv
+    assert proc.stdin_received is not None
+    prompt = proc.stdin_received.decode()
     assert "Review for correctness." in prompt
     assert "python async bus service" in prompt
     assert "diff --git" in prompt
-    # Schema JSON is passed via --json-schema, not embedded in the prompt
+    # Schema JSON is passed via --json-schema flag, not embedded in the prompt
     assert '"severity"' not in prompt
+
+
+async def test_large_prompt_survives_via_stdin(monkeypatch):
+    """Prompts larger than typical ARG_MAX must not touch argv."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    # 150KB diff — comfortably above Linux's default 128KB ARG_MAX per arg
+    big_diff = "diff --git a/f b/f\n" + ("+line\n" * 30_000)
+    request = _make_request(content=big_diff)
+
+    await ClaudeCliProvider().review(request)
+
+    argv = calls[0]
+    # None of the argv entries contain the large diff content
+    assert all(len(part.encode()) < 50_000 for part in argv)
+    assert proc.stdin_received is not None
+    assert len(proc.stdin_received) > 100_000
 
 
 async def test_error_envelope_errored_disposition(monkeypatch):
@@ -346,6 +373,132 @@ async def test_review_response_schema_shape():
     assert "summary" in schema["required"]
     severity = schema["properties"]["findings"]["items"]["properties"]["severity"]
     assert set(severity["enum"]) == {"nit", "comment", "concern"}
+
+
+# ---------------------------------------------------------------------------
+# Defensive parsing at the untrusted subprocess boundary
+# ---------------------------------------------------------------------------
+
+
+async def test_envelope_non_dict_json_errored(monkeypatch):
+    """`json.loads(stdout)` returning an array must not crash the provider."""
+    proc = _FakeProc(stdout=json.dumps([1, 2, 3]).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "malformed_envelope"
+    assert "not an object" in result.error
+
+
+async def test_result_payload_non_dict_errored(monkeypatch):
+    """`result` field carries a JSON value that isn't an object."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["result"] = json.dumps(["not", "a", "review"])
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "malformed_envelope"
+    assert "not an object" in result.error
+
+
+async def test_findings_filters_non_dict_items(monkeypatch):
+    """Non-object items in the findings array must be skipped, not raised."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["result"] = json.dumps(
+        {
+            "summary": "mixed",
+            "findings": [
+                {"severity": "nit", "title": "keep me", "body": "ok"},
+                "rogue string",
+                None,
+                42,
+                {"severity": "comment", "title": "also keep", "body": "ok"},
+            ],
+        }
+    )
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert [f.title for f in result.findings] == ["keep me", "also keep"]
+
+
+async def test_usage_non_dict_safely_zeroed(monkeypatch):
+    """`usage` of the wrong type must not crash; token fields fall back to 0."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["usage"] = "not-a-dict"
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.usage is not None
+    assert result.usage.input_tokens == 0
+    assert result.usage.output_tokens == 0
+    assert result.usage.cache_read_tokens == 0
+    assert result.usage.cache_creation_tokens == 0
+
+
+async def test_usage_string_numbers_coerced_safely(monkeypatch):
+    """Token values arriving as strings like '12.0' must coerce, not raise."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["usage"] = {
+        "input_tokens": "10",
+        "output_tokens": "12.0",
+        "cache_read_input_tokens": "nonsense",
+        "cache_creation_input_tokens": None,
+    }
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.usage is not None
+    assert result.usage.input_tokens == 10
+    assert result.usage.output_tokens == 12
+    assert result.usage.cache_read_tokens == 0
+    assert result.usage.cache_creation_tokens == 0
+
+
+async def test_model_usage_non_dict_stats_entries_tolerated(monkeypatch):
+    """A non-dict entry in `modelUsage` must not raise; only valid entries score."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["modelUsage"] = {
+        "big-model": {"costUSD": 2.0},
+        "bogus": "not-a-dict",
+        "empty": None,
+        "medium-model": {"costUSD": 1.0},
+    }
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.model == "big-model"
+
+
+async def test_total_cost_usd_non_numeric_defaults_to_zero(monkeypatch):
+    """`total_cost_usd` of the wrong type must not crash the usage record."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["total_cost_usd"] = "nonsense"
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.usage is not None
+    assert result.usage.estimated_api_cost_usd == 0.0
 
 
 # ---------------------------------------------------------------------------
