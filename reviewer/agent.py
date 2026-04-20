@@ -39,6 +39,7 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
+from reviewer.rules import PolicyDecision, PolicyInput, decide
 from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
 
 
@@ -55,6 +56,45 @@ def _generate_request_id() -> str:
 def _as_dict(val: Any) -> dict[str, Any]:
     """Return ``val`` as a dict, or an empty dict when it isn't one."""
     return val if isinstance(val, dict) else {}
+
+
+def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
+    """Rough (line_count, file_count) for rule-table input.
+
+    Only non-zero for ``kind == "pr_diff"``. Cheap to compute and good
+    enough for coarse-grained routing; callers with authoritative
+    counts can pass them through ``context["diff_line_count"]`` /
+    ``context["diff_file_count"]`` to override.
+    """
+    if kind != "pr_diff":
+        return 0, 0
+    line_count = content.count("\n")
+    file_count = content.count("\ndiff --git")
+    if content.startswith("diff --git"):
+        file_count += 1
+    return line_count, file_count
+
+
+def _policy_input_for(
+    *, kind: str, content: str, context: dict[str, Any]
+) -> PolicyInput:
+    """Build a :class:`PolicyInput` from the pieces available in the handler.
+
+    Callers can supply authoritative ``diff_line_count`` /
+    ``diff_file_count`` / ``profile`` in ``context``; otherwise they're
+    estimated from ``content`` (for diffs) or left empty.
+    """
+    est_lines, est_files = _estimate_diff_size(content, kind)
+    return PolicyInput(
+        kind=kind,
+        diff_line_count=int(context.get("diff_line_count") or est_lines),
+        diff_file_count=int(context.get("diff_file_count") or est_files),
+        profile=(
+            context.get("profile")
+            if isinstance(context.get("profile"), dict)
+            else None
+        ),
+    )
 
 
 class ReviewerAgent(BaseAgent):
@@ -129,21 +169,42 @@ class ReviewerAgent(BaseAgent):
         if not isinstance(content, str) or not content:
             return {"error": "content is required and must be a non-empty string"}
 
-        backend = args.get("backend") or None
-        model = args.get("model") or None
+        caller_backend = args.get("backend") or None
+        caller_model = args.get("model") or None
+        context = _as_dict(args.get("context"))
 
         try:
             selector = self._ensure_selector()
-            provider, chosen_model = selector.select(backend=backend, model=model)
+            if caller_backend or caller_model:
+                provider, chosen_model = selector.select(
+                    backend=caller_backend, model=caller_model
+                )
+                selection_reason = "caller override"
+            else:
+                decision = decide(
+                    _policy_input_for(kind=kind, content=content, context=context)
+                )
+                provider, chosen_model = selector.select(
+                    backend=decision.backend, model=decision.model
+                )
+                selection_reason = f"rule-table: {decision.reason}"
         except UnknownBackendError as exc:
             return {"error": str(exc)}
+
+        logger.debug(
+            "reviewer.select: backend=%s model=%s reason=%s kind=%s",
+            provider.name,
+            chosen_model,
+            selection_reason,
+            kind,
+        )
 
         metadata = {**_as_dict(args.get("metadata")), "model": chosen_model}
         request = ReviewRequest(
             kind=kind,
             content=content,
             instructions=str(args.get("instructions") or ""),
-            context=_as_dict(args.get("context")),
+            context=context,
             metadata=metadata,
             request_id=str(args.get("request_id") or _generate_request_id()),
         )
@@ -201,7 +262,13 @@ class ReviewerAgent(BaseAgent):
         )
 
     def _load_config(self) -> dict[str, Any]:
-        """Load ``self.config_path`` as YAML, tolerating missing file / pyyaml."""
+        """Load ``self.config_path`` as YAML, tolerating missing file / pyyaml / parse or IO errors.
+
+        Every failure path falls back to an empty dict so the agent can
+        still start with defaults — useful for tests, first-run setups,
+        and operator misconfiguration that would otherwise crash the
+        first skill call.
+        """
         path = getattr(self, "config_path", "") or ""
         if not path:
             return {}
@@ -216,7 +283,27 @@ class ReviewerAgent(BaseAgent):
         except FileNotFoundError:
             logger.warning("reviewer config %s not found; using defaults", path)
             return {}
-        return loaded if isinstance(loaded, dict) else {}
+        except yaml.YAMLError as exc:
+            logger.warning(
+                "reviewer config %s failed to parse (%s); using defaults", path, exc
+            )
+            return {}
+        except OSError as exc:
+            # Covers PermissionError, IsADirectoryError, and other IO failures.
+            logger.warning(
+                "reviewer config %s not readable (%s); using defaults", path, exc
+            )
+            return {}
+        if isinstance(loaded, dict):
+            return loaded
+        if loaded is not None:
+            logger.warning(
+                "reviewer config %s must have a mapping at the YAML root; "
+                "got %s; using defaults",
+                path,
+                type(loaded).__name__,
+            )
+        return {}
 
 
 def create_reviewer_agent(

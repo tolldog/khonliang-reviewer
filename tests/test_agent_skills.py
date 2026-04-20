@@ -63,11 +63,21 @@ def _make_result(
 
 
 def _make_harness(
-    providers: dict[str, ReviewProvider],
+    providers: dict[str, ReviewProvider] | None = None,
     *,
-    default_backend: str = "fake",
-    default_model: str = "fake-model",
+    default_backend: str = "ollama",
+    default_model: str = "qwen3.5",
 ) -> AgentTestHarness:
+    """Build an AgentTestHarness with an injected :class:`ProviderSelector`.
+
+    The default provider map registers a single fake under ``"ollama"``
+    so the rule table's default fallback (``ollama`` / ``qwen3.5``)
+    resolves cleanly in tests that don't care about provider identity.
+    Tests that want multiple providers pass their own map; tests that
+    want caller-override pass ``backend=...`` explicitly.
+    """
+    if providers is None:
+        providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))}
     selector = ProviderSelector(
         providers,
         SelectorConfig(
@@ -83,15 +93,13 @@ def _make_harness(
 
 
 def test_expected_skills_registered():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    harness = _make_harness()
     assert "review_text" in harness.skill_names
     assert "review_diff" in harness.skill_names
 
 
 def test_skills_parameters_match_public_contract():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    harness = _make_harness()
     skill = next(s for s in harness.skills if s.name == "review_text")
     # contract: kind + content are required, everything else optional
     assert skill.parameters["kind"]["required"] is True
@@ -106,9 +114,10 @@ def test_skills_parameters_match_public_contract():
 # ---------------------------------------------------------------------------
 
 
-async def test_review_text_routes_to_default_backend():
-    fake = _RecordingProvider("fake", _make_result(model="fake-model"))
-    harness = _make_harness({"fake": fake})
+async def test_review_text_routes_to_rule_table_default_backend():
+    """Small content + pr_diff → rule table picks ollama/qwen3.5 (fallback)."""
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    harness = _make_harness({"ollama": fake})
 
     result = await harness.call(
         "review_text",
@@ -120,7 +129,7 @@ async def test_review_text_routes_to_default_backend():
     assert fake.last_request is not None
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
-    assert fake.last_request.metadata["model"] == "fake-model"
+    assert fake.last_request.metadata["model"] == "qwen3.5"
 
 
 async def test_review_text_caller_backend_override_picks_specific_provider():
@@ -138,9 +147,9 @@ async def test_review_text_caller_backend_override_picks_specific_provider():
 
 
 async def test_review_text_caller_model_override_threads_to_metadata():
-    """The selector doesn't construct providers; the model flows via request metadata."""
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    """Caller-supplied model forces caller-override path and lands in metadata."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call(
         "review_text",
@@ -152,8 +161,8 @@ async def test_review_text_caller_model_override_threads_to_metadata():
 
 
 async def test_review_text_forwards_instructions_and_context():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call(
         "review_text",
@@ -161,18 +170,18 @@ async def test_review_text_forwards_instructions_and_context():
             "kind": "spec",
             "content": "spec body",
             "instructions": "prioritize correctness",
-            "context": {"profile": "python-async"},
+            "context": {"repo_profile": "python-async"},
         },
     )
 
     assert fake.last_request is not None
     assert fake.last_request.instructions == "prioritize correctness"
-    assert fake.last_request.context == {"profile": "python-async"}
+    assert fake.last_request.context == {"repo_profile": "python-async"}
 
 
 async def test_review_text_generates_request_id_when_missing():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
 
@@ -181,8 +190,8 @@ async def test_review_text_generates_request_id_when_missing():
 
 
 async def test_review_text_honors_caller_request_id():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call(
         "review_text",
@@ -194,8 +203,8 @@ async def test_review_text_honors_caller_request_id():
 
 
 async def test_review_text_merges_caller_metadata_with_model():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call(
         "review_text",
@@ -210,8 +219,8 @@ async def test_review_text_merges_caller_metadata_with_model():
     # caller metadata preserved
     assert fake.last_request.metadata["repo"] == "tolldog/x"
     assert fake.last_request.metadata["pr_number"] == 7
-    # model injected alongside
-    assert fake.last_request.metadata["model"] == "fake-model"
+    # rule-table-chosen model injected alongside
+    assert fake.last_request.metadata["model"] == "qwen3.5"
 
 
 # ---------------------------------------------------------------------------
@@ -220,28 +229,28 @@ async def test_review_text_merges_caller_metadata_with_model():
 
 
 async def test_review_text_missing_kind_returns_error():
-    harness = _make_harness({"fake": _RecordingProvider("fake", _make_result())})
+    harness = _make_harness()
     result = await harness.call("review_text", {"content": "x"})
     assert "error" in result
     assert "kind" in result["error"]
 
 
 async def test_review_text_missing_content_returns_error():
-    harness = _make_harness({"fake": _RecordingProvider("fake", _make_result())})
+    harness = _make_harness()
     result = await harness.call("review_text", {"kind": "pr_diff"})
     assert "error" in result
     assert "content" in result["error"]
 
 
 async def test_review_text_content_not_string_returns_error():
-    harness = _make_harness({"fake": _RecordingProvider("fake", _make_result())})
+    harness = _make_harness()
     result = await harness.call("review_text", {"kind": "pr_diff", "content": 42})
     assert "error" in result
 
 
 async def test_review_text_unknown_backend_returns_error():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
     result = await harness.call(
         "review_text",
         {"kind": "pr_diff", "content": "x", "backend": "nope"},
@@ -257,8 +266,8 @@ async def test_review_text_unknown_backend_returns_error():
 
 
 async def test_review_diff_sets_kind_and_content_from_diff():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call("review_diff", {"diff": "diff --git a/x b/x"})
 
@@ -268,8 +277,8 @@ async def test_review_diff_sets_kind_and_content_from_diff():
 
 
 async def test_review_diff_forwards_other_kwargs():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
 
     await harness.call(
         "review_diff",
@@ -277,7 +286,7 @@ async def test_review_diff_forwards_other_kwargs():
             "diff": "x",
             "instructions": "careful",
             "context": {"k": "v"},
-            "backend": "fake",
+            "backend": "ollama",
             "model": "custom-model",
         },
     )
@@ -290,18 +299,108 @@ async def test_review_diff_forwards_other_kwargs():
 
 
 async def test_review_diff_missing_diff_returns_error():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
     result = await harness.call("review_diff", {})
     assert "error" in result
     assert fake.last_request is None
 
 
 async def test_review_diff_diff_not_string_returns_error():
-    fake = _RecordingProvider("fake", _make_result())
-    harness = _make_harness({"fake": fake})
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
     result = await harness.call("review_diff", {"diff": 123})
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Rule-table integration (no caller override → policy picks)
+# ---------------------------------------------------------------------------
+
+
+async def test_rule_table_routes_docs_kind_to_ollama():
+    """A spec / doc / fr review (no override) → ollama + qwen3.5 per rule table."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_text",
+        {"kind": "spec", "content": "# A small spec\n\nContent."},
+    )
+
+    assert ollama.last_request is not None
+    assert claude.last_request is None
+    assert ollama.last_request.metadata["model"] == "qwen3.5"
+
+
+async def test_rule_table_routes_large_diff_to_claude():
+    """≥2000 lines (or ≥20 files) → claude_cli per rule table."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli", model="claude"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    big_diff = "diff --git a/f b/f\n" + ("+line\n" * 2500)
+    await harness.call("review_diff", {"diff": big_diff})
+
+    assert ollama.last_request is None
+    assert claude.last_request is not None
+    assert claude.last_request.metadata["model"] == "claude"
+
+
+async def test_rule_table_long_context_routes_to_kimi():
+    """≥5000 lines AND ≥10 files → ollama + kimi-k2.5:cloud per rule table."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    # 12 file headers × ~500 lines each = ~6000 lines across 12 files
+    per_file = "diff --git a/x b/x\n" + ("+line\n" * 500)
+    big_multi_file_diff = per_file * 12
+    await harness.call("review_diff", {"diff": big_multi_file_diff})
+
+    assert ollama.last_request is not None
+    assert claude.last_request is None
+    assert ollama.last_request.metadata["model"] == "kimi-k2.5:cloud"
+
+
+async def test_caller_override_bypasses_rule_table():
+    """When caller specifies backend, rule table is NOT consulted."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    # Large diff would route to claude via rule table, but caller says ollama
+    big_diff = "diff --git a/f b/f\n" + ("+line\n" * 3000)
+    await harness.call(
+        "review_diff",
+        {"diff": big_diff, "backend": "ollama", "model": "qwen3.5"},
+    )
+
+    assert ollama.last_request is not None
+    assert claude.last_request is None
+
+
+async def test_context_diff_size_overrides_content_estimate():
+    """Caller-authoritative counts in context win over content estimation."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli", model="claude"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    # Tiny inline content — but context says it's actually a 5000-line, 15-file
+    # diff (maybe the caller passed a summary instead of the full body). Rule
+    # table should route based on the authoritative counts, not the estimate.
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "summary of large diff",
+            "context": {"diff_line_count": 6000, "diff_file_count": 15},
+        },
+    )
+
+    assert ollama.last_request is not None
+    assert ollama.last_request.metadata["model"] == "kimi-k2.5:cloud"
 
 
 # ---------------------------------------------------------------------------

@@ -78,11 +78,23 @@ Start the reviewer agent against the bus:
 ```
 
 The agent registers `review_text` and `review_diff` bus skills. Provider
-selection currently supports caller override (`backend` / `model` args)
-with a config-level default fallback. Rule-table-driven selection
-(`kind` + profile + diff size) wires in once `reviewer.rules` lands on
-main; until then callers either name the provider/model explicitly or
-get the config default.
+selection resolves in this order:
+
+1. Caller-supplied `backend` + `model` (on either skill) — always win.
+2. Rule table (`reviewer.rules.decide`) when the caller supplies neither
+   — picks `(backend, model)` from `(kind, diff_size)` + cached
+   `profile` (when available). Falls back to config defaults if no
+   rule matches.
+3. Config-level `default_provider` / `default_model` — the ultimate
+   fallback.
+
+The `model` argument is honored on both backends:
+
+- **Ollama** uses `model` directly in the `chat.completions.create`
+  call (any Ollama-served model id — `qwen3.5`, `kimi-k2.5:cloud`, etc.).
+- **Claude-via-CLI** threads `model` through as `claude -p --model
+  <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
+  `claude-opus-4-7`).
 
 `review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
 aggregation) are upcoming work units and not yet registered.
