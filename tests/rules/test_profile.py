@@ -69,7 +69,7 @@ async def test_get_returns_copy_not_shared_state():
 
     got = await cache.get_profile("reviewer")
     assert got is not None
-    got["languages"] = "tampered"
+    got["languages"]["python"] = 999
 
     again = await cache.get_profile("reviewer")
     assert again == {"languages": {"python": 100}}
@@ -81,7 +81,7 @@ async def test_put_stores_copy_not_shared_reference():
     profile = {"languages": {"python": 100}}
 
     cache.put_profile("reviewer", profile)
-    profile["languages"] = "tampered"
+    profile["languages"]["python"] = 999
 
     got = await cache.get_profile("reviewer")
     assert got == {"languages": {"python": 100}}

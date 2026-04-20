@@ -22,6 +22,7 @@ deterministic when callers pass ``"tolldog/khonliang-reviewer"`` vs
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -70,13 +71,13 @@ class InMemoryProfileCache:
 
     async def get_profile(self, repo: str) -> dict[str, Any] | None:
         key = profile_key(repo)
-        # Return a shallow copy so callers can't mutate stored state.
+        # Return a copy so callers can't mutate stored state.
         stored = self.entries.get(key)
-        return dict(stored) if stored is not None else None
+        return deepcopy(stored) if stored is not None else None
 
     def put_profile(self, repo: str, profile: dict[str, Any]) -> None:
         key = profile_key(repo)
-        self.entries[key] = dict(profile)
+        self.entries[key] = deepcopy(profile)
         self._inserted_at[key] = time.time()
 
     def invalidate(self, repo: str) -> None:
