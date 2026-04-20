@@ -33,6 +33,16 @@ subscription OAuth tokens, and using them from third-party SDKs violates
 the 2026 Consumer TOS. `claude -p` is the only sanctioned path for
 subscription-backed Claude usage.
 
+## Bus-Boundary Validation
+
+`khonliang-reviewer-lib` contracts use `Literal` types for fields like
+`severity` and `disposition`. Those are type-checker contracts — not
+runtime validation. Any time data crosses the bus (skill args, cached
+profile payloads, GitHub-sourced diffs) or an external API (HTTP responses,
+subprocess JSON envelopes), validate shape and enum membership explicitly
+before constructing the library dataclasses. Trust the library shape
+within this repo; validate at every untrusted boundary.
+
 ## Validation
 
 ```sh
