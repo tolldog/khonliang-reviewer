@@ -30,8 +30,8 @@ informs future iterations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
+from typing import Any, Callable
 
 
 #: Floor context window sizes, in input tokens. Matches the documented
@@ -53,7 +53,7 @@ class PolicyInput:
     kind: str = "pr_diff"
     diff_line_count: int = 0
     diff_file_count: int = 0
-    profile: dict | None = None
+    profile: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
