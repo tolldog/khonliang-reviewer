@@ -1,0 +1,23 @@
+[project]
+name = "khonliang-reviewer"
+version = "0.1.0"
+description = "Bus-native reviewer agent — pluggable review providers, usage accounting, subscription vs API cost comparison"
+requires-python = ">=3.11"
+dependencies = [
+    "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@main",
+    "khonliang-bus-lib",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+khonliang-reviewer = "reviewer.agent:main"
+
+[tool.setuptools.packages.find]
+include = ["reviewer*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

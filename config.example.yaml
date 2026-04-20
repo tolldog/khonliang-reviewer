@@ -1,0 +1,24 @@
+# khonliang-reviewer config — copy to config.yaml and edit locally.
+# config.yaml is git-ignored; machine-specific paths and tokens go here.
+
+# SQLite database for usage records + model pricing table.
+db_path: data/reviewer.db
+
+# Bus URL this agent registers with.
+bus_url: http://localhost:8787
+
+# Default provider used when the rule table has no better match.
+# Rule-table-driven selection lands in a later work unit; until then this
+# value is what the placeholder skill falls back to.
+default_provider: ollama
+default_model: qwen3.5
+
+# Provider-specific configuration. Each provider is implemented in a later
+# work unit; the keys below are placeholders documenting the eventual shape.
+providers:
+  ollama:
+    base_url: http://localhost:11434/v1
+  claude_cli:
+    # `claude` binary must be on PATH and `CLAUDE_CODE_OAUTH_TOKEN` must be
+    # provisioned per-machine via `claude setup-token`. See CLAUDE.md.
+    binary: claude
