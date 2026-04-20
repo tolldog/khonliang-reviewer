@@ -31,8 +31,14 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewRequest
+from khonliang_reviewer import ReviewFinding, ReviewRequest
 
+from reviewer.github_client import (
+    GithubClientError,
+    PRMetadata,
+    ReviewerGithubClient,
+    SubmittedReview,
+)
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
@@ -56,6 +62,83 @@ def _generate_request_id() -> str:
 def _as_dict(val: Any) -> dict[str, Any]:
     """Return ``val`` as a dict, or an empty dict when it isn't one."""
     return val if isinstance(val, dict) else {}
+
+
+_SEVERITY_LABELS = {
+    "nit": "🟢 Nit",
+    "comment": "🟡 Comment",
+    "concern": "🔴 Concern",
+}
+
+
+def _format_for_github(
+    review_result: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Translate a :class:`ReviewResult` dict into GitHub review shape.
+
+    Returns ``(summary_body, inline_comments)``:
+
+    - ``summary_body`` — top-level review body. Always carries the
+      review summary; summary-level findings (those without
+      ``path``/``line``) are appended as a short bullet list so they
+      don't get lost.
+    - ``inline_comments`` — list of GitHub inline-comment dicts
+      ``{"path", "line", "side": "RIGHT", "body"}``, one per finding
+      that carries ``path`` + ``line``. Body includes a severity
+      label, the finding title, its body, and an optional
+      ````suggestion```` block.
+    """
+    summary = str(review_result.get("summary") or "")
+    findings = review_result.get("findings") or []
+    if not isinstance(findings, list):
+        findings = []
+
+    inline_comments: list[dict[str, Any]] = []
+    summary_extras: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        title = str(finding.get("title") or "").strip()
+        body_text = str(finding.get("body") or "").strip()
+        severity = str(finding.get("severity") or "comment")
+        label = _SEVERITY_LABELS.get(severity, severity)
+        path = finding.get("path")
+        line = finding.get("line")
+        suggestion = finding.get("suggestion")
+
+        anchored = (
+            isinstance(path, str) and path and isinstance(line, int)
+        )
+        if anchored:
+            parts = [f"**{label} — {title}**" if title else f"**{label}**"]
+            if body_text:
+                parts.append(body_text)
+            if isinstance(suggestion, str) and suggestion:
+                parts.append(f"```suggestion\n{suggestion}\n```")
+            inline_comments.append(
+                {
+                    "path": path,
+                    "line": int(line),
+                    "side": "RIGHT",
+                    "body": "\n\n".join(parts),
+                }
+            )
+        else:
+            headline = f"- **{label}**"
+            if title:
+                headline += f" — {title}"
+            if body_text:
+                headline += f": {body_text}"
+            summary_extras.append(headline)
+
+    body = summary.strip()
+    if summary_extras:
+        if body:
+            body += "\n\n### Additional notes\n\n"
+        body += "\n".join(summary_extras)
+    if not body:
+        body = "No findings."
+    return body, inline_comments
 
 
 def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
@@ -118,11 +201,14 @@ class ReviewerAgent(BaseAgent):
         self,
         *,
         selector: ProviderSelector | None = None,
+        github_client: ReviewerGithubClient | None = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self._injected_selector = selector
         self._cached_selector: ProviderSelector | None = None
+        self._injected_github = github_client
+        self._cached_github: ReviewerGithubClient | None = None
 
     # -- skill surface -------------------------------------------------
 
@@ -154,6 +240,23 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
+                },
+                since="0.1.0",
+            ),
+            Skill(
+                "review_pr",
+                "Fetch a GitHub PR diff + metadata, run review_text over it, "
+                "and post the result as a GitHub PR review. Returns the "
+                "ReviewResult augmented with the posted-review info (or a "
+                "dry-run payload when dry_run=true).",
+                {
+                    "repo": {"type": "string", "required": True},
+                    "pr_number": {"type": "integer", "required": True},
+                    "instructions": {"type": "string", "default": ""},
+                    "backend": {"type": "string", "default": ""},
+                    "model": {"type": "string", "default": ""},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "event": {"type": "string", "default": "COMMENT"},
                 },
                 since="0.1.0",
             ),
@@ -224,6 +327,99 @@ class ReviewerAgent(BaseAgent):
         forwarded["content"] = diff
         return await self.handle_review_text(forwarded)
 
+    @handler("review_pr")
+    async def handle_review_pr(self, args: dict[str, Any]) -> dict[str, Any]:
+        """End-to-end: fetch PR, review via review_text, post back to GitHub.
+
+        ``event`` defaults to ``"COMMENT"`` and is the only value the
+        reviewer actually uses today — approval authority stays human
+        per the FR. Callers can still pass it explicitly for future
+        expansion (``"REQUEST_CHANGES"`` when a concern-level finding
+        merits blocking, etc.).
+        """
+        repo = str(args.get("repo") or "").strip()
+        if not repo:
+            return {"error": "repo is required (owner/name form)"}
+        pr_raw = args.get("pr_number")
+        try:
+            pr_number = int(pr_raw)
+        except (TypeError, ValueError):
+            return {"error": "pr_number is required and must be an integer"}
+        if pr_number <= 0:
+            return {"error": "pr_number must be positive"}
+
+        dry_run = bool(args.get("dry_run", False))
+        event = str(args.get("event") or "COMMENT")
+
+        github = self._ensure_github_client()
+        try:
+            metadata = await github.get_pr_metadata(repo, pr_number)
+            diff = await github.get_pr_diff(repo, pr_number)
+        except GithubClientError as exc:
+            return {"error": f"github fetch failed: {exc}"}
+
+        # Feed the diff into review_text via the shared path so selector,
+        # rule table, and (WU5b-landed) usage recording all run exactly
+        # once per review, regardless of which entry skill was called.
+        review_args: dict[str, Any] = {
+            "kind": "pr_diff",
+            "content": diff,
+            "instructions": str(args.get("instructions") or ""),
+            "context": {
+                "pr": metadata.to_dict(),
+            },
+            "backend": args.get("backend") or "",
+            "model": args.get("model") or "",
+            "metadata": {"repo": repo, "pr_number": pr_number},
+        }
+        review_result = await self.handle_review_text(review_args)
+        # ReviewResult.to_dict() always carries an ``error`` key (empty
+        # string when the review succeeded). Early-return only on a
+        # truthy error message.
+        if review_result.get("error"):
+            return review_result
+
+        posted_body, posted_comments = _format_for_github(review_result)
+
+        if dry_run:
+            return {
+                **review_result,
+                "pr": metadata.to_dict(),
+                "github": {
+                    "dry_run": True,
+                    "body": posted_body,
+                    "comments": posted_comments,
+                    "event": event,
+                },
+            }
+
+        try:
+            submitted = await github.submit_review(
+                repo,
+                pr_number,
+                body=posted_body,
+                comments=posted_comments,
+                event=event,
+                commit_sha=metadata.head_sha or None,
+            )
+        except GithubClientError as exc:
+            return {
+                **review_result,
+                "pr": metadata.to_dict(),
+                "error": f"github post failed: {exc}",
+            }
+
+        return {
+            **review_result,
+            "pr": metadata.to_dict(),
+            "github": {
+                "dry_run": False,
+                "review": submitted.to_dict(),
+                "inline_comments_posted": len(posted_comments),
+                "event": event,
+            },
+        }
+
     # -- internals -----------------------------------------------------
 
     def _ensure_selector(self) -> ProviderSelector:
@@ -232,6 +428,13 @@ class ReviewerAgent(BaseAgent):
         if self._cached_selector is None:
             self._cached_selector = self._build_default_selector()
         return self._cached_selector
+
+    def _ensure_github_client(self) -> ReviewerGithubClient:
+        if self._injected_github is not None:
+            return self._injected_github
+        if self._cached_github is None:
+            self._cached_github = ReviewerGithubClient()
+        return self._cached_github
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()

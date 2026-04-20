@@ -8,6 +8,7 @@ dependencies = [
     "khonliang-bus-lib",
     "pyyaml>=6.0",
     "openai>=1.40",
+    "githubkit>=0.11",
 ]
 
 [project.optional-dependencies]
