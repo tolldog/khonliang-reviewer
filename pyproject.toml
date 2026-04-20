@@ -7,6 +7,7 @@ dependencies = [
     "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@main",
     "khonliang-bus-lib",
     "pyyaml>=6.0",
+    "openai>=1.40",
 ]
 
 [project.optional-dependencies]

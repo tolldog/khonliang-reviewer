@@ -34,6 +34,8 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
+from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,34 +49,6 @@ class ClaudeCliAuthError(RuntimeError):
     attributed to auth instead populate
     ``ReviewResult.error_category="auth_not_provisioned"``.
     """
-
-
-REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "required": ["summary"],
-    "properties": {
-        "summary": {"type": "string"},
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["severity", "title", "body"],
-                "properties": {
-                    "severity": {
-                        "type": "string",
-                        "enum": ["nit", "comment", "concern"],
-                    },
-                    "category": {"type": "string"},
-                    "title": {"type": "string"},
-                    "body": {"type": "string"},
-                    "path": {"type": ["string", "null"]},
-                    "line": {"type": ["integer", "null"]},
-                    "suggestion": {"type": ["string", "null"]},
-                },
-            },
-        },
-    },
-}
 
 
 @dataclass
@@ -151,7 +125,7 @@ class ClaudeCliProvider(ReviewProvider):
             )
 
     async def review(self, request: ReviewRequest) -> ReviewResult:
-        prompt = _build_prompt(request)
+        prompt = build_review_prompt(request, include_schema=False)
         started_wall = time.time()
         started_mono = time.monotonic()
 
@@ -258,31 +232,6 @@ class ClaudeCliProvider(ReviewProvider):
             result.usage.duration_ms if result.usage else 0,
         )
         return result
-
-
-def _build_prompt(request: ReviewRequest) -> str:
-    """Assemble the positional prompt argument from a :class:`ReviewRequest`.
-
-    The prompt instructs Claude to return ONLY the JSON matching the
-    schema; the ``--json-schema`` flag additionally enforces validation.
-    """
-    lines = [
-        f"You are a code reviewer for the khonliang ecosystem. Read the {request.kind!r}",
-        "content below and return ONLY a JSON object matching the schema you were",
-        "given. No prose outside the JSON.",
-        "",
-    ]
-    if request.instructions:
-        lines += ["## Review Instructions", "", request.instructions, ""]
-    if request.context:
-        lines += [
-            "## Context",
-            "",
-            json.dumps(request.context, indent=2, sort_keys=True),
-            "",
-        ]
-    lines += ["## Content", "", request.content]
-    return "\n".join(lines)
 
 
 def _parse_envelope(

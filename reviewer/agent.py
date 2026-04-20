@@ -40,6 +40,7 @@ class ReviewerAgent(BaseAgent):
 
     agent_id = "reviewer-primary"
     agent_type = "reviewer"
+    module_name = "reviewer.agent"
 
     def register_skills(self) -> list[Any]:
         return []
@@ -76,7 +77,7 @@ def main() -> None:
     )
 
     if args.command in ("install", "uninstall"):
-        BaseAgent.from_cli(
+        ReviewerAgent.from_cli(
             [
                 args.command,
                 "--id", args.id,

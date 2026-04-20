@@ -7,11 +7,17 @@ skill wiring and SQLite usage persistence live one layer up, in
 ``reviewer.agent``.
 """
 
+from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
 from reviewer.providers.claude_cli import (
-    REVIEW_RESPONSE_SCHEMA,
     ClaudeCliAuthError,
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
+)
+from reviewer.providers.ollama import (
+    OllamaAuthError,
+    OllamaHealthcheckError,
+    OllamaProvider,
+    OllamaProviderConfig,
 )
 
 
@@ -20,4 +26,9 @@ __all__ = [
     "ClaudeCliAuthError",
     "ClaudeCliProvider",
     "ClaudeCliProviderConfig",
+    "OllamaAuthError",
+    "OllamaHealthcheckError",
+    "OllamaProvider",
+    "OllamaProviderConfig",
+    "build_review_prompt",
 ]
