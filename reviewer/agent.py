@@ -31,7 +31,7 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewRequest, ReviewResult, UsageEvent
+from khonliang_reviewer import ReviewRequest, ReviewResult
 
 from reviewer.providers import (
     ClaudeCliProvider,
@@ -144,6 +144,24 @@ class ReviewerAgent(BaseAgent):
         self._cached_selector: ProviderSelector | None = None
         self._injected_store = usage_store
         self._cached_store: UsageStore | None = None
+
+    async def start(self) -> None:
+        """Eager-init the usage store so the SQLite file lands on launch.
+
+        Operators rely on seeing ``data/reviewer.db`` appear as soon as
+        the agent boots (for tailing, backups, monitoring) rather than
+        waiting for the first skill call to create it lazily. The
+        selector stays lazy — provider construction can be expensive
+        (Ollama HTTP client, Claude CLI probe) and is only worth
+        paying for when a review actually runs.
+        """
+        # _ensure_usage_store is idempotent; tests that inject an
+        # in-memory store skip the filesystem touch entirely.
+        try:
+            self._ensure_usage_store()
+        except Exception as exc:
+            logger.warning("reviewer usage store init failed at start(): %s", exc)
+        await super().start()
 
     # -- skill surface -------------------------------------------------
 

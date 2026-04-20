@@ -284,14 +284,49 @@ class UsageStore:
         Returns the number of rows inserted. Idempotent across restarts —
         subsequent invocations see a non-empty table and no-op, so manual
         edits to the table aren't overwritten on agent boot.
+
+        All inserts land in a single transaction so agent startup pays
+        one fsync regardless of how many rows the seed ships.
         """
         if self.pricing_count() > 0:
             return 0
-        inserted = 0
-        for entry in entries:
-            self.put_pricing(entry)
-            inserted += 1
-        return inserted
+        rows = [
+            (
+                entry.backend,
+                entry.model,
+                float(entry.input_per_mtoken_usd),
+                float(entry.output_per_mtoken_usd),
+                float(entry.cache_read_per_mtoken_usd),
+                float(entry.cache_creation_per_mtoken_usd),
+                entry.currency,
+                entry.source_url,
+                entry.as_of,
+            )
+            for entry in entries
+        ]
+        if not rows:
+            return 0
+        self._conn.executemany(
+            """
+            INSERT INTO model_pricing (
+                backend, model,
+                input_per_mtoken_usd, output_per_mtoken_usd,
+                cache_read_per_mtoken_usd, cache_creation_per_mtoken_usd,
+                currency, source_url, as_of
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(backend, model) DO UPDATE SET
+                input_per_mtoken_usd = excluded.input_per_mtoken_usd,
+                output_per_mtoken_usd = excluded.output_per_mtoken_usd,
+                cache_read_per_mtoken_usd = excluded.cache_read_per_mtoken_usd,
+                cache_creation_per_mtoken_usd = excluded.cache_creation_per_mtoken_usd,
+                currency = excluded.currency,
+                source_url = excluded.source_url,
+                as_of = excluded.as_of
+            """,
+            rows,
+        )
+        self._conn.commit()
+        return len(rows)
 
     # -- cost back-fill ------------------------------------------------
 
@@ -341,13 +376,22 @@ class UsageStore:
 def open_usage_store(db_path: str) -> UsageStore:
     """Open (or create) the SQLite DB at ``db_path`` and run migrations.
 
-    Ensures the parent directory exists (so `data/reviewer.db` works
-    without a preparatory ``mkdir``). ``:memory:`` paths bypass the
-    mkdir — useful for tests.
+    The database file is created on first call if it doesn't exist
+    (this is sqlite3.connect() default behavior). The parent directory
+    is auto-created so defaults like ``data/reviewer.db`` or
+    ``~/reviewer.db`` work without a preparatory ``mkdir``.
+
+    ``:memory:`` bypasses filesystem handling — useful for tests. Any
+    other path is resolved through :meth:`~pathlib.Path.expanduser` so
+    ``~`` shorthand reaches the same file on both the mkdir and the
+    :func:`sqlite3.connect` call.
     """
-    if db_path != ":memory:":
-        Path(db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    if db_path == ":memory:":
+        resolved = ":memory:"
+    else:
+        resolved = str(Path(db_path).expanduser())
+        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(resolved, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON")
     _apply_schema(conn)
     return UsageStore(conn)

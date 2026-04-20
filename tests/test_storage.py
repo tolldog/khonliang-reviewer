@@ -46,16 +46,20 @@ def _event(
 # ---------------------------------------------------------------------------
 
 
-def test_open_is_idempotent_and_migrations_run_twice():
-    """Opening a store twice against the same DB must not fail."""
-    store = open_usage_store(":memory:")
-    # apply_schema runs on open — a second call on the same conn via re-apply
-    # should be a no-op (CREATE TABLE IF NOT EXISTS).
-    # Proxy via the public surface: we can still write + read.
-    store.write_usage(_event())
-    summaries = store.summarize()
-    assert summaries[0].rows == 1
-    store.close()
+def test_open_is_idempotent_across_reopens(tmp_path):
+    """Two successive opens against the same file must not fail or drop data."""
+    db = tmp_path / "reviewer.db"
+    store1 = open_usage_store(str(db))
+    store1.write_usage(_event())
+    store1.close()
+    # Re-open the same file — schema-apply must be idempotent and
+    # existing rows must survive.
+    store2 = open_usage_store(str(db))
+    try:
+        summaries = store2.summarize()
+        assert summaries[0].rows == 1
+    finally:
+        store2.close()
 
 
 def test_open_creates_parent_dir(tmp_path):
@@ -64,6 +68,25 @@ def test_open_creates_parent_dir(tmp_path):
     store = open_usage_store(str(db))
     assert db.exists()
     store.close()
+
+
+def test_open_expands_tilde_consistently(tmp_path, monkeypatch):
+    """``~/reviewer.db`` must expand to the same path for mkdir and connect.
+
+    Regression test: early code expanded ~ only for the parent mkdir
+    and passed the unexpanded path to sqlite3.connect, producing a
+    file literally named with ~ in the process cwd.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    db_path = "~/nested/reviewer.db"
+    store = open_usage_store(db_path)
+    try:
+        expanded = tmp_path / "nested" / "reviewer.db"
+        assert expanded.exists()
+        # No literal ~ file created anywhere under tmp_path
+        assert not list(tmp_path.glob("~*"))
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------

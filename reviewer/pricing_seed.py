@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from importlib import resources
-from typing import Any, Iterable
+from typing import Any
 
 from khonliang_reviewer import ModelPricing
 
