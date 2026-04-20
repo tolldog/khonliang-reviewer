@@ -67,10 +67,12 @@ _SEVERITY_LABELS = {
 
 
 #: GitHub-supported values for the ``event`` parameter on a review
-#: submission. The reviewer agent validates ``review_pr``'s ``event``
-#: against this set before touching GitHub so typos surface as a
-#: structured bus error rather than a 4xx later.
-_VALID_REVIEW_EVENTS = frozenset({"COMMENT", "APPROVE", "REQUEST_CHANGES", "PENDING"})
+#: submission the reviewer agent is allowed to use. ``APPROVE`` is
+#: deliberately excluded: FR fr_developer_e72d8835 pins approval
+#: authority to humans. If a future FR ever grants machine approval,
+#: it should add the value here behind an explicit opt-in flag rather
+#: than being broadly accepted on the ``event`` arg.
+_VALID_REVIEW_EVENTS = frozenset({"COMMENT", "REQUEST_CHANGES", "PENDING"})
 
 
 def _format_for_github(
@@ -365,8 +367,12 @@ class ReviewerAgent(BaseAgent):
 
         github = self._ensure_github_client()
         try:
-            metadata = await github.get_pr_metadata(repo, pr_number)
-            diff = await github.get_pr_diff(repo, pr_number)
+            # Fetches are independent; run them concurrently to halve
+            # end-to-end latency on high-latency GitHub API links.
+            metadata, diff = await asyncio.gather(
+                github.get_pr_metadata(repo, pr_number),
+                github.get_pr_diff(repo, pr_number),
+            )
         except GithubClientError as exc:
             return {"error": f"github fetch failed: {exc}"}
 

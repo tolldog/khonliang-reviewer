@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
 from khonliang_bus.testing import AgentTestHarness
 
 from khonliang_reviewer import (
@@ -433,6 +432,24 @@ async def test_review_pr_rejects_unsupported_event():
     # GitHub surface never touched
     assert github.submit_calls == []
     # Provider also not invoked (validation happens before the review)
+    assert provider.last_request is None
+
+
+async def test_review_pr_rejects_approve_event():
+    """Approval authority is human-only per FR; the skill must refuse APPROVE."""
+    provider = _RecordingProvider("ollama", _make_result())
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    result = await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "event": "APPROVE"},
+    )
+
+    assert "error" in result
+    assert "APPROVE" in result["error"]
+    # Provider + GitHub never touched
+    assert github.submit_calls == []
     assert provider.last_request is None
 
 
