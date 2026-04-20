@@ -286,15 +286,26 @@ class UsageStore:
     def seed_pricing_if_empty(self, entries: Iterable[ModelPricing]) -> int:
         """Populate ``model_pricing`` from ``entries`` iff the table is empty.
 
-        Returns the number of rows inserted. Idempotent across restarts —
-        subsequent invocations see a non-empty table and no-op, so manual
-        edits to the table aren't overwritten on agent boot.
+        Returns the number of distinct rows inserted. Idempotent across
+        restarts — subsequent invocations see a non-empty table and
+        no-op, so manual edits aren't overwritten on agent boot.
+
+        Entries are de-duplicated by ``(backend, model)`` before insert
+        so the return count reflects actual insertions rather than
+        ``len(entries)`` (which would over-report when the caller
+        supplies duplicate keys that would have collapsed under the
+        ``ON CONFLICT`` path).
 
         All inserts land in a single transaction so agent startup pays
         one fsync regardless of how many rows the seed ships.
         """
         if self.pricing_count() > 0:
             return 0
+        dedup: dict[tuple[str, str], ModelPricing] = {}
+        for entry in entries:
+            # Last-wins on duplicate keys, matching the ON CONFLICT
+            # behavior if duplicates were allowed through.
+            dedup[(entry.backend, entry.model)] = entry
         rows = [
             (
                 entry.backend,
@@ -307,7 +318,7 @@ class UsageStore:
                 entry.source_url,
                 entry.as_of,
             )
-            for entry in entries
+            for entry in dedup.values()
         ]
         if not rows:
             return 0

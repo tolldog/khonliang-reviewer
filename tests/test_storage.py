@@ -216,6 +216,29 @@ def test_seed_pricing_if_empty_populates_on_empty():
     assert store.pricing_count() == 2
 
 
+def test_seed_pricing_dedups_entries_before_insert():
+    """Duplicate (backend, model) keys in the seed list collapse to one row.
+
+    Return count reflects distinct keys, not input length. Last-wins on
+    duplicates so callers can layer "defaults then overrides" in a single
+    list without bespoke merging.
+    """
+    store = _open_store()
+    entries = [
+        ModelPricing(backend="ollama", model="qwen3.5", input_per_mtoken_usd=1.0),
+        ModelPricing(backend="ollama", model="qwen3.5", input_per_mtoken_usd=2.0),
+        ModelPricing(backend="claude_cli", model="claude-opus-4-7"),
+    ]
+    inserted = store.seed_pricing_if_empty(entries)
+
+    assert inserted == 2
+    assert store.pricing_count() == 2
+    # last-wins resolution for the duplicate
+    assert (
+        store.get_pricing("ollama", "qwen3.5").input_per_mtoken_usd == 2.0
+    )
+
+
 def test_seed_pricing_if_empty_is_idempotent_once_populated():
     """Subsequent seeds must not overwrite manual edits."""
     store = _open_store()
