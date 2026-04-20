@@ -283,6 +283,60 @@ async def test_result_field_non_json_errored(monkeypatch):
     assert "result was not JSON" in result.error
 
 
+async def test_structured_output_is_preferred_over_result(monkeypatch):
+    """With --json-schema the CLI fills structured_output; result is empty."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["result"] = ""
+    envelope["structured_output"] = {
+        "summary": "Structured summary.",
+        "findings": [
+            {
+                "severity": "nit",
+                "title": "From schema",
+                "body": "x",
+                "path": "a.py",
+                "line": 5,
+            }
+        ],
+    }
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == "Structured summary."
+    assert len(result.findings) == 1
+    assert result.findings[0].title == "From schema"
+
+
+async def test_structured_output_takes_precedence_when_both_populated(monkeypatch):
+    """Belt-and-suspenders: if both fields are present, structured_output wins."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["structured_output"] = {"summary": "from schema", "findings": []}
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == "from schema"
+
+
+async def test_non_dict_structured_output_falls_back_to_result(monkeypatch):
+    """Malformed structured_output falls back to parsing the result string."""
+    envelope = dict(SUCCESS_ENVELOPE)
+    envelope["structured_output"] = ["not", "a", "dict"]
+    proc = _FakeProc(stdout=json.dumps(envelope).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    # SUCCESS_ENVELOPE's result is valid JSON; fallback succeeds.
+    assert result.disposition == "posted"
+    assert result.summary == "Two findings."
+
+
 async def test_missing_binary_errored(monkeypatch):
     _install_missing_binary(monkeypatch)
     provider = ClaudeCliProvider(ClaudeCliProviderConfig(binary="claude-does-not-exist"))

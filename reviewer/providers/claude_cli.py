@@ -264,32 +264,42 @@ def _parse_envelope(
 
     duration_ms = int(envelope.get("duration_ms") or fallback_duration_ms)
     model = _pick_primary_model(envelope) or "claude"
-    result_text = envelope.get("result") or ""
 
-    try:
-        payload = json.loads(result_text)
-    except json.JSONDecodeError as exc:
-        return _errored(
-            request,
-            error=f"claude -p result was not JSON: {exc}",
-            error_category="malformed_envelope",
-            started_wall=started_wall,
-            duration_ms=duration_ms,
-            envelope=envelope,
-        )
-
-    if not isinstance(payload, dict):
-        return _errored(
-            request,
-            error=(
-                "claude -p result JSON is not an object "
-                f"(type={type(payload).__name__})"
-            ),
-            error_category="malformed_envelope",
-            started_wall=started_wall,
-            duration_ms=duration_ms,
-            envelope=envelope,
-        )
+    # When ``claude -p`` is invoked with ``--json-schema``, the CLI
+    # validates the model's response against the schema and returns the
+    # parsed object in ``structured_output`` — the ``result`` field is
+    # left empty in that mode. Prefer ``structured_output`` when it's
+    # present and dict-shaped; fall back to parsing ``result`` as JSON
+    # for plain (non-schema) invocations.
+    structured = envelope.get("structured_output")
+    if isinstance(structured, dict):
+        payload: dict[str, Any] = structured
+    else:
+        result_text = envelope.get("result") or ""
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError as exc:
+            return _errored(
+                request,
+                error=f"claude -p result was not JSON: {exc}",
+                error_category="malformed_envelope",
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                envelope=envelope,
+            )
+        if not isinstance(parsed, dict):
+            return _errored(
+                request,
+                error=(
+                    "claude -p result JSON is not an object "
+                    f"(type={type(parsed).__name__})"
+                ),
+                error_category="malformed_envelope",
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                envelope=envelope,
+            )
+        payload = parsed
 
     summary = str(payload.get("summary", ""))
     raw_findings = payload.get("findings") or []
