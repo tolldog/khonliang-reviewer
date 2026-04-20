@@ -19,6 +19,9 @@ khonliang-reviewer = "reviewer.agent:main"
 [tool.setuptools.packages.find]
 include = ["reviewer*"]
 
+[tool.setuptools.package-data]
+"reviewer.data" = ["*.yaml"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
