@@ -16,7 +16,6 @@ Token discovery order mirrors developer's:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,11 +103,13 @@ class ReviewerGithubClient:
         *,
         gh_client: Any | None = None,
     ):
-        self._token = (
-            token
-            or os.environ.get("GITHUB_TOKEN")
-            or os.environ.get("GH_TOKEN")
-        )
+        # Credential discovery lives in reviewer.credentials so this
+        # repo never grows its own keyring / file-reading logic. An
+        # explicit ``token`` kwarg still wins; otherwise we ask the
+        # credentials module which in turn chains env vars + gh's CLI.
+        from reviewer.credentials import get_github_token
+
+        self._token = token or get_github_token()
         self._gh: Any = gh_client
 
     def _client(self) -> Any:

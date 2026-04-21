@@ -33,6 +33,22 @@ subscription OAuth tokens, and using them from third-party SDKs violates
 the 2026 Consumer TOS. `claude -p` is the only sanctioned path for
 subscription-backed Claude usage.
 
+## Credentials
+
+`reviewer/credentials.py` is the single entry point for every secret the
+agent needs. **Nothing in the repo carries a real token** — discovery
+delegates to external stores: env vars, `gh`'s keyring (via `gh auth
+token`), eventually Claude's keyring and others. No caching, no file
+writes inside the repo, no logging of token bodies. Tokens are
+re-discovered on each call so rotation Just Works.
+
+For generic unix portability the module delegates to each tool's own
+CLI rather than cracking platform-specific keyrings directly — the
+CLIs already know how to find their own credentials on Linux /
+macOS / BSD. If a credential type grows a second consumer beyond
+reviewer, promote the module to `khonliang-credentials-lib` (scoped in
+a dedicated FR).
+
 ## Bus-Boundary Validation
 
 `khonliang-reviewer-lib` contracts use `Literal` types for fields like
