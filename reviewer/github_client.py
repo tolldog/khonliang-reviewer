@@ -7,16 +7,15 @@ functional-boundary rule: reviewer owns its own review posting, and
 the only cross-agent link to developer is through bus events + review
 ingestion on the consumer side.
 
-Token discovery order mirrors developer's:
+Token discovery order:
     1. explicit ``token`` kwarg
-    2. ``GITHUB_TOKEN`` env var
-    3. ``GH_TOKEN`` env var (matches the ``gh`` CLI convention)
-    4. unauthenticated read (public repos only; review posting will 401)
+    2. ``reviewer.credentials.get_github_token()`` chain
+       (``GITHUB_TOKEN`` -> ``GH_TOKEN`` -> ``gh auth token``)
+    3. unauthenticated read (public repos only; review posting will 401)
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,11 +103,13 @@ class ReviewerGithubClient:
         *,
         gh_client: Any | None = None,
     ):
-        self._token = (
-            token
-            or os.environ.get("GITHUB_TOKEN")
-            or os.environ.get("GH_TOKEN")
-        )
+        # Credential discovery lives in reviewer.credentials so this
+        # repo never grows its own keyring / file-reading logic. An
+        # explicit ``token`` kwarg still wins; otherwise we ask the
+        # credentials module which in turn chains env vars + gh's CLI.
+        from reviewer.credentials import get_github_token
+
+        self._token = token or get_github_token()
         self._gh: Any = gh_client
 
     def _client(self) -> Any:

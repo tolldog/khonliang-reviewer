@@ -1,6 +1,6 @@
 [project]
 name = "khonliang-reviewer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bus-native reviewer agent — pluggable review providers, usage accounting, subscription vs API cost comparison"
 requires-python = ">=3.11"
 dependencies = [
