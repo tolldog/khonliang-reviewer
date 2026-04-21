@@ -10,8 +10,6 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-import pytest
-
 from reviewer import credentials
 from reviewer.credentials import get_github_token
 
@@ -160,3 +158,50 @@ def test_rotation_picked_up_on_each_call(monkeypatch):
     assert get_github_token() == "rotated-v1"
     monkeypatch.setenv("GITHUB_TOKEN", "rotated-v2")
     assert get_github_token() == "rotated-v2"
+
+
+# ---------------------------------------------------------------------------
+# Subprocess env sanitization — whitespace-only vars stripped before gh
+# ---------------------------------------------------------------------------
+
+
+def test_blank_env_vars_are_stripped_before_gh_subprocess(monkeypatch):
+    """gh auth token must NOT inherit a whitespace-only GITHUB_TOKEN.
+
+    Otherwise gh treats the blank value as "authenticated with this
+    token" and skips its keyring lookup, defeating the whitespace
+    fallback this module promises.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "  ")
+    monkeypatch.setenv("GH_TOKEN", "\n\t ")
+    monkeypatch.setenv("SOME_OTHER_VAR", "keep-me")
+    captured_env: dict[str, str] = {}
+
+    def fake_run(cmd, **kwargs: Any):
+        captured_env.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(cmd, 0, stdout="test-token-keyring\n", stderr="")
+
+    monkeypatch.setattr(credentials.subprocess, "run", fake_run)
+
+    assert get_github_token() == "test-token-keyring"
+    # The two github-token env vars must be gone from the child env...
+    assert "GITHUB_TOKEN" not in captured_env
+    assert "GH_TOKEN" not in captured_env
+    # ...but the rest of the parent env passes through unchanged
+    assert captured_env.get("SOME_OTHER_VAR") == "keep-me"
+
+
+def test_unrelated_env_vars_preserved_in_subprocess(monkeypatch):
+    """Only blank GITHUB_TOKEN / GH_TOKEN are stripped; everything else stays."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("UNRELATED", "preserve-me")
+    captured_env: dict[str, str] = {}
+
+    def fake_run(cmd, **kwargs: Any):
+        captured_env.update(kwargs.get("env") or {})
+        return subprocess.CompletedProcess(cmd, 0, stdout="x\n", stderr="")
+
+    monkeypatch.setattr(credentials.subprocess, "run", fake_run)
+    get_github_token()
+    assert captured_env.get("UNRELATED") == "preserve-me"

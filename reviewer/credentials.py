@@ -79,6 +79,12 @@ def _gh_auth_token() -> str | None:
     installed, the user is logged out, or the subprocess fails for any
     reason. Silence is intentional — callers decide whether to treat
     "no token" as an error.
+
+    Runs with a **sanitized copy** of the parent env: whitespace-only
+    ``GITHUB_TOKEN`` / ``GH_TOKEN`` values are stripped before gh sees
+    them. Without this, gh reads the blank value as "explicitly set"
+    and skips its keyring — defeating the whitespace fallback
+    :func:`get_github_token` promises.
     """
     try:
         proc = subprocess.run(
@@ -87,6 +93,7 @@ def _gh_auth_token() -> str | None:
             text=True,
             check=False,
             timeout=10,
+            env=_sanitized_subprocess_env(),
         )
     except FileNotFoundError:
         logger.debug("gh CLI not installed; skipping gh auth token lookup")
@@ -106,3 +113,20 @@ def _gh_auth_token() -> str | None:
 
     token = proc.stdout.strip()
     return token or None
+
+
+def _sanitized_subprocess_env() -> dict[str, str]:
+    """Return a copy of ``os.environ`` with whitespace-only GitHub token
+    variables removed.
+
+    Prevents gh from seeing a blank ``GITHUB_TOKEN`` / ``GH_TOKEN``
+    (inherited from the parent) as "already authenticated" and
+    skipping its keyring fallback. Other env vars pass through
+    unchanged.
+    """
+    env = dict(os.environ)
+    for name in _GITHUB_ENV_VARS:
+        value = env.get(name)
+        if value is not None and not value.strip():
+            env.pop(name, None)
+    return env
