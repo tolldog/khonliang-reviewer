@@ -706,7 +706,13 @@ def create_reviewer_agent(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="khonliang-reviewer bus agent")
+    from khonliang_bus import add_version_flag
+
+    parser = argparse.ArgumentParser(
+        prog="reviewer.agent",
+        description="khonliang-reviewer bus agent",
+    )
+    add_version_flag(parser)
     parser.add_argument(
         "command",
         nargs="?",
