@@ -7,11 +7,11 @@ functional-boundary rule: reviewer owns its own review posting, and
 the only cross-agent link to developer is through bus events + review
 ingestion on the consumer side.
 
-Token discovery order mirrors developer's:
+Token discovery order:
     1. explicit ``token`` kwarg
-    2. ``GITHUB_TOKEN`` env var
-    3. ``GH_TOKEN`` env var (matches the ``gh`` CLI convention)
-    4. unauthenticated read (public repos only; review posting will 401)
+    2. ``reviewer.credentials.get_github_token()`` chain
+       (``GITHUB_TOKEN`` -> ``GH_TOKEN`` -> ``gh auth token``)
+    3. unauthenticated read (public repos only; review posting will 401)
 """
 
 from __future__ import annotations
