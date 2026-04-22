@@ -417,29 +417,42 @@ def open_usage_store(db_path: str) -> UsageStore:
     return UsageStore(conn)
 
 
-#: Additive, best-effort migrations for databases created before a
-#: given column existed. SQLite's ``ADD COLUMN`` raises
-#: ``OperationalError`` when the column already exists; we swallow that
-#: specific case so :func:`_apply_schema` stays idempotent across boots.
-#: Anything else (syntax error, broken DB) re-raises so the operator
-#: sees it during startup.
-_ADDITIVE_MIGRATIONS: tuple[str, ...] = (
-    "ALTER TABLE reviewer_usage "
-    "ADD COLUMN findings_filtered_count INTEGER NOT NULL DEFAULT 0",
+#: Additive column migrations for tables created before a given column
+#: existed. Each entry is ``(table, column, ddl)``: we check
+#: ``PRAGMA table_info`` first and only run ``ddl`` when ``column`` is
+#: absent. That avoids (a) the fresh-DB exception-on-every-boot path
+#: that existed when we caught ``sqlite3.OperationalError`` and
+#: substring-matched "duplicate column name", and (b) brittleness
+#: against error-message variations across SQLite versions/builds.
+_ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "reviewer_usage",
+        "findings_filtered_count",
+        "ALTER TABLE reviewer_usage "
+        "ADD COLUMN findings_filtered_count INTEGER NOT NULL DEFAULT 0",
+    ),
 )
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Return True when ``table.column`` is present per ``PRAGMA table_info``.
+
+    Uses a parameterized PRAGMA only on the column name comparison;
+    the table name is interpolated since SQLite's PRAGMA syntax doesn't
+    accept bound parameters for identifiers. All callers pass literal
+    table names from ``_ADDITIVE_COLUMN_MIGRATIONS``, not user input.
+    """
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    # Row shape: (cid, name, type, notnull, dflt_value, pk).
+    return any(row[1] == column for row in cursor.fetchall())
 
 
 def _apply_schema(conn: sqlite3.Connection) -> None:
     for stmt in _DDL_STATEMENTS:
         conn.execute(stmt)
-    for stmt in _ADDITIVE_MIGRATIONS:
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError as exc:
-            # "duplicate column name" means the migration already ran;
-            # anything else is a real failure and should surface.
-            if "duplicate column name" not in str(exc).lower():
-                raise
+    for table, column, ddl in _ADDITIVE_COLUMN_MIGRATIONS:
+        if not _column_exists(conn, table, column):
+            conn.execute(ddl)
     conn.commit()
 
 
