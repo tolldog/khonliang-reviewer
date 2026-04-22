@@ -1051,3 +1051,131 @@ async def test_severity_floor_emitted_via_reviewer_usage_event(monkeypatch):
     assert len(published) == 1
     _, payload = published[0]
     assert payload["findings_filtered_count"] == 1
+
+
+async def test_severity_floor_invalid_config_is_lenient(tmp_path, caplog):
+    """Config-layer invalid severity_floor must NOT hard-fail the review.
+
+    Round-3 Copilot finding: a ``.reviewer/config.yaml`` typo like
+    ``review.severity_floor: CRITICAL`` used to raise and surface as
+    ``{error: ...}`` without running the provider. Correct behavior:
+    log a warning + fall back to the built-in default so the review
+    still completes.
+    """
+    import logging as stdlib_logging
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, env=env)
+    (tmp_path / ".reviewer").mkdir()
+    (tmp_path / ".reviewer" / "config.yaml").write_text(
+        "review:\n  severity_floor: BOGUS\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "seed"], cwd=tmp_path, check=True, env=env
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    with caplog.at_level(stdlib_logging.WARNING, logger="reviewer.agent"):
+        result = await harness.call(
+            "review_text",
+            {
+                "kind": "pr_diff",
+                "content": "x",
+                "context": {"repo_root": str(tmp_path), "base_sha": sha},
+            },
+        )
+
+    # Review completed — provider ran, findings returned. The result
+    # dict always carries an ``error`` key (empty string on success);
+    # assert the body is empty rather than the key absent.
+    assert not result.get("error")
+    assert fake.last_request is not None
+    # Bad config → default "nit" floor → everything kept.
+    assert len(result["findings"]) == 3
+    # Warning emitted naming the bad value + config path hint.
+    warnings = [r for r in caplog.records if r.levelno == stdlib_logging.WARNING]
+    assert any(
+        "BOGUS" in r.getMessage() and "config.yaml" in r.getMessage()
+        for r in warnings
+    ), f"expected warning mentioning 'BOGUS' and 'config.yaml'; got {[r.getMessage() for r in warnings]}"
+
+
+async def test_severity_floor_invalid_skill_arg_still_hard_fails():
+    """Skill-arg invalid severity_floor stays strict (caller-bug semantics).
+
+    Companion to the lenient-config test: the two layers validate
+    asymmetrically on purpose. This re-asserts the strict path after
+    the split so a future refactor doesn't accidentally lenient-ify
+    the skill-arg layer too.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "CRITICAL"},
+    )
+
+    assert "error" in result
+    assert "severity_floor" in result["error"]
+    assert fake.last_request is None
+
+
+async def test_strip_dropped_from_summary_uses_word_boundary():
+    """Round-3 Copilot finding: short/common titles must not match fragments.
+
+    A dropped title ``"race"`` should NOT cause ``"embrace"`` on a
+    summary line to be stripped. Word-boundary anchoring is the fix.
+    """
+    findings = [
+        # "race" gets dropped at floor=concern.
+        ReviewFinding(severity="nit", title="race", body=""),
+        ReviewFinding(severity="concern", title="real issue", body=""),
+    ]
+    # "embrace" contains the substring "race"; the old substring-match
+    # implementation would have nuked this line. Must survive.
+    summary = (
+        "Overall we should embrace the new pattern.\n"
+        "- race\n"
+        "- real issue\n"
+    )
+    fake = _RecordingProvider(
+        "ollama", _result_with_findings(findings, summary=summary)
+    )
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    out = result["summary"]
+    # Word-boundary match: the literal "- race" bullet is removed...
+    assert "- race" not in out
+    # ...but the "embrace" line (which merely contains "race" as a
+    # fragment) is preserved.
+    assert "embrace the new pattern" in out
+    # Retained finding's line stays.
+    assert "real issue" in out

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import sys
 import uuid
 from typing import Any
@@ -198,12 +199,19 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     remaining prose reads cleanly. Lines that don't match any dropped
     finding pass through untouched.
 
-    Conservative: matches titles as literal substrings on a per-line
-    basis. Doesn't touch paragraph-style mentions that aren't on their
-    own line — a future FR can tighten this with a structured prompt
-    that keeps summary and findings orthogonal. Anchoring by line
-    prevents collateral damage (dropping a paragraph that happens to
-    contain a finding title in passing).
+    Matches each title as a whole-word token (``\b<title>\b``) per line
+    rather than as a bare substring. Word-boundary anchoring is what
+    keeps short / common-word titles from collaterally nuking unrelated
+    prose — a dropped title ``"race"`` must not remove a summary line
+    that just happens to contain ``"embrace"``, and ``"a"`` must not
+    match every indefinite article in sight. Multi-word titles work
+    because ``\b`` triggers at each space boundary.
+
+    Doesn't touch paragraph-style mentions that aren't on their own
+    line — a future FR can tighten this with a structured prompt that
+    keeps summary and findings orthogonal. Anchoring by line prevents
+    collateral damage (dropping a paragraph that happens to contain a
+    finding title in passing).
     """
     if not summary or not dropped:
         return summary
@@ -215,10 +223,15 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     drop_titles = [t for t in drop_titles if t]
     if not drop_titles:
         return summary
+    # Precompile once — summaries have O(N_lines) scans and we'd
+    # otherwise recompile per line.
+    drop_patterns = [
+        re.compile(rf"\b{re.escape(title)}\b") for title in drop_titles
+    ]
     kept_lines: list[str] = []
     for line in summary.splitlines():
         stripped = line.strip()
-        if stripped and any(title in stripped for title in drop_titles):
+        if stripped and any(p.search(stripped) for p in drop_patterns):
             continue
         kept_lines.append(line)
     # Collapse 2+ consecutive blank lines (from stripped content) down
@@ -574,15 +587,24 @@ class ReviewerAgent(BaseAgent):
 
         High-to-low:
 
-        1. Skill-arg ``severity_floor`` (non-empty string).
+        1. Skill-arg ``severity_floor`` (non-empty string) — **strict**.
+           A bad value here is a caller bug; raise
+           :class:`SeverityFloorError` so the review fails fast with a
+           message the caller can act on.
         2. ``review.severity_floor`` / ``checks.severity_floor`` in
-           ``.reviewer/config.yaml`` — only consulted when the context
-           supplies ``repo_root`` + ``base_sha`` hints.
+           ``.reviewer/config.yaml`` — **lenient**. Only consulted when
+           the context supplies ``repo_root`` + ``base_sha`` hints. A bad
+           value in YAML shouldn't nuke every review for that repo — log
+           a warning naming the offending value and fall through to the
+           built-in default. Reviewing is more important than config-layer
+           correctness.
         3. :data:`_DEFAULT_SEVERITY_FLOOR` (``"nit"`` — no filtering).
 
-        Validates each layer at the moment we accept it. The skill-arg
-        and config-file layers cross untrusted boundaries (caller input,
-        operator YAML); the default is trusted.
+        Rationale for asymmetric validation: the skill-arg path is a
+        programmatic caller (another agent, a test, an orchestrator) —
+        strict failure is the correct feedback channel. The config-layer
+        path is a human-edited YAML file on a repo; a typo there
+        shouldn't silently wedge CI.
         """
         arg_value = args.get("severity_floor")
         if isinstance(arg_value, str) and arg_value:
@@ -590,9 +612,19 @@ class ReviewerAgent(BaseAgent):
 
         config_value = _resolve_repo_severity_floor(context)
         if isinstance(config_value, str) and config_value:
-            return _validate_severity_floor(
-                config_value, source=".reviewer/config.yaml"
-            )
+            try:
+                return _validate_severity_floor(
+                    config_value, source=".reviewer/config.yaml"
+                )
+            except SeverityFloorError as exc:
+                logger.warning(
+                    "reviewer: ignoring invalid .reviewer/config.yaml "
+                    "review.severity_floor=%r; falling back to default %r (%s)",
+                    config_value,
+                    _DEFAULT_SEVERITY_FLOOR,
+                    exc,
+                )
+                return _DEFAULT_SEVERITY_FLOOR
 
         return _DEFAULT_SEVERITY_FLOOR
 
