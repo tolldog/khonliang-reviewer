@@ -1226,3 +1226,57 @@ async def test_strip_dropped_from_summary_skips_ultra_short_titles():
     assert "- a" in out
     # The above-threshold title still strips as expected.
     assert "real issue" in out
+
+
+async def test_strip_dropped_from_summary_preserves_prose_mid_sentence():
+    """Copilot round-5 finding: docstring promised prose-safe behavior.
+
+    The prior implementation removed any summary line whose text
+    matched a dropped title token, including prose paragraphs that
+    merely mentioned the title in passing. The docstring claimed
+    paragraph-style mentions "aren't on their own line" would not be
+    touched — this test nails that promise to only the three
+    recognized shapes (bullet / title-colon / standalone).
+
+    A prose sentence mentioning ``"race"`` mid-paragraph must survive;
+    a bullet ``"- race: ..."`` with the same title must be stripped.
+    """
+    findings = [
+        # "race" gets dropped at floor=concern.
+        ReviewFinding(severity="nit", title="race", body=""),
+        ReviewFinding(severity="concern", title="real issue", body=""),
+    ]
+    summary = (
+        # Mid-prose mention of the dropped title — must be preserved.
+        "The race condition is a concern worth documenting later.\n"
+        # Bullet shape — must be stripped.
+        "- race: missing lock around shared counter\n"
+        # Title-colon prose shape — must be stripped.
+        "race: another occurrence of the same pattern\n"
+        # Standalone title line — must be stripped.
+        "race\n"
+        # Retained finding bullet.
+        "- real issue\n"
+    )
+    fake = _RecordingProvider(
+        "ollama", _result_with_findings(findings, summary=summary)
+    )
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    out = result["summary"]
+    # Prose mention survives — the docstring's promise.
+    assert "The race condition is a concern worth documenting later." in out
+    # All three strip-eligible shapes are removed.
+    assert "- race: missing lock around shared counter" not in out
+    assert "race: another occurrence of the same pattern" not in out
+    # The standalone "race" line is gone (but the word still appears
+    # in the preserved prose sentence above — assert absence of the
+    # bare-title shape specifically).
+    assert "\nrace\n" not in "\n" + out + "\n"
+    # Retained finding's line stays.
+    assert "real issue" in out

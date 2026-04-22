@@ -195,30 +195,43 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
 
     Some providers enumerate findings inside the summary itself
     (markdown bullet list, numbered section). If a dropped finding's
-    title appears as a line in the summary, strip that line so the
-    remaining prose reads cleanly. Lines that don't match any dropped
-    finding pass through untouched.
+    title appears on a line **in one of three recognized shapes**,
+    strip that line so the remaining prose reads cleanly. Lines that
+    don't match any of the three shapes pass through untouched — even
+    if the title happens to appear mid-sentence as prose.
 
-    Matches each title as a whole-word token (``\b<title>\b``) per line
-    rather than as a bare substring. Word-boundary anchoring keeps
-    dropped title ``"race"`` from collaterally nuking a line that just
-    happens to contain ``"embrace"``. Multi-word titles work because
-    ``\b`` triggers at each space boundary.
+    The three strip-eligible shapes (per line, after ``line.strip()``):
+
+    1. **Bullet list item** — ``^[-*+]\\s+<title>\\b``
+       (e.g. ``"- race condition: ..."``).
+    2. **Title-colon prose** — ``^<title>\\s*:`` (e.g.
+       ``"Missing docstring: ..."``).
+    3. **Standalone title line** — ``^<title>\\s*$`` (just the title,
+       nothing else).
+
+    Any other occurrence of the title (mid-sentence, inside a paragraph
+    that also says other things) is left alone. This matches the
+    docstring's stated intent: only the obviously-enumerated shapes
+    are collateral-damage-free to drop; prose paragraphs that mention
+    a title in passing may carry information that has nothing to do
+    with the dropped finding, so we don't touch them.
+
+    Matches each title as a whole-word token (``\\b<title>\\b``) at
+    the start position — word-boundary anchoring keeps dropped title
+    ``"race"`` from matching ``"embrace"`` even when ``"embrace"``
+    appears right after a bullet marker. Multi-word titles work
+    because ``\\b`` triggers at each space boundary.
 
     **Ultra-short titles (``len(title.strip()) < 3``) are not
     strip-eligible.** Single-letter and two-character titles like
     ``"a"``, ``"if"``, ``"or"`` would match every indefinite article
-    or conjunction in prose even with ``\b`` anchoring — the
+    or conjunction in prose even with ``\\b`` anchoring — the
     word-boundary guard isn't enough on its own. Skipping these titles
     means the caller keeps a slightly-noisier summary (the bullet for
     the dropped "a" finding survives), which is strictly safer than
     shredding unrelated summary lines. A future FR with a structured
     prompt that keeps summary and findings orthogonal would remove the
     need for this heuristic entirely.
-
-    Doesn't touch paragraph-style mentions that aren't on their own
-    line — anchoring by line prevents collateral damage (dropping a
-    paragraph that happens to contain a finding title in passing).
     """
     if not summary or not dropped:
         return summary
@@ -235,10 +248,23 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     drop_titles = [t for t in drop_titles if len(t) >= 3]
     if not drop_titles:
         return summary
-    # Precompile once — summaries have O(N_lines) scans and we'd
-    # otherwise recompile per line.
+    # Precompile one pattern per title covering all three shapes in a
+    # single alternation. ``re.IGNORECASE`` isn't used — provider
+    # summaries and titles come from the same generation so casing
+    # is consistent; case-insensitive would broaden matches without
+    # catching a realistic failure mode.
+    #
+    # Shape anchors (applied to ``line.strip()``):
+    #   1. bullet:         ^[-*+]\s+<title>\b
+    #   2. title-colon:    ^<title>\s*:
+    #   3. standalone:     ^<title>\s*$
     drop_patterns = [
-        re.compile(rf"\b{re.escape(title)}\b") for title in drop_titles
+        re.compile(
+            rf"(?:^[-*+]\s+{re.escape(title)}\b)"
+            rf"|(?:^{re.escape(title)}\s*:)"
+            rf"|(?:^{re.escape(title)}\s*$)"
+        )
+        for title in drop_titles
     ]
     kept_lines: list[str] = []
     for line in summary.splitlines():
