@@ -475,3 +475,71 @@ def test_load_accepts_string_repo_root(git_repo: Path) -> None:
     sha = _commit_all(git_repo)
     config = load(os.fspath(git_repo), base_sha=sha)
     assert config.repo_yaml["temperature"] == 0.3
+
+
+# ---------------------------------------------------------------------------
+# severity_floor accessor (FR fr_reviewer_dfd27582)
+# ---------------------------------------------------------------------------
+
+
+def test_severity_floor_reads_review_section(git_repo: Path) -> None:
+    """``review.severity_floor`` is the preferred key and lands first."""
+    _write(
+        git_repo / ".reviewer" / "config.yaml",
+        "review:\n  severity_floor: concern\n",
+    )
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor == "concern"
+
+
+def test_severity_floor_falls_back_to_checks_section(git_repo: Path) -> None:
+    """``checks.severity_floor`` is accepted for forward-compat with FR text."""
+    _write(
+        git_repo / ".reviewer" / "config.yaml",
+        "checks:\n  severity_floor: comment\n",
+    )
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor == "comment"
+
+
+def test_severity_floor_prefers_review_over_checks(git_repo: Path) -> None:
+    """When both keys are set, ``review.*`` wins."""
+    _write(
+        git_repo / ".reviewer" / "config.yaml",
+        "review:\n  severity_floor: concern\nchecks:\n  severity_floor: nit\n",
+    )
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor == "concern"
+
+
+def test_severity_floor_returns_none_when_unset(git_repo: Path) -> None:
+    """Missing key → ``None`` (distinct from empty string)."""
+    _write(git_repo / ".reviewer" / "config.yaml", "temperature: 0.3\n")
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor is None
+
+
+def test_severity_floor_returns_none_when_section_is_not_mapping(git_repo: Path) -> None:
+    """``review: [foo]`` or ``checks: "oops"`` shouldn't crash the accessor."""
+    _write(
+        git_repo / ".reviewer" / "config.yaml",
+        'review: "oops"\nchecks: 3\n',
+    )
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor is None
+
+
+def test_severity_floor_returns_none_when_value_is_not_string(git_repo: Path) -> None:
+    """``severity_floor: 3`` shouldn't be treated as a valid floor."""
+    _write(
+        git_repo / ".reviewer" / "config.yaml",
+        "review:\n  severity_floor: 3\n",
+    )
+    sha = _commit_all(git_repo)
+    config = load(git_repo, base_sha=sha)
+    assert config.severity_floor is None

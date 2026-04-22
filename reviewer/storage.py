@@ -57,7 +57,8 @@ _DDL_STATEMENTS: tuple[str, ...] = (
         pr_number INTEGER,
         estimated_api_cost_usd REAL NOT NULL DEFAULT 0.0,
         error TEXT NOT NULL DEFAULT '',
-        error_category TEXT NOT NULL DEFAULT ''
+        error_category TEXT NOT NULL DEFAULT '',
+        findings_filtered_count INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -136,8 +137,9 @@ class UsageStore:
                 duration_ms, disposition,
                 request_id, repo, pr_number,
                 estimated_api_cost_usd,
-                error, error_category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error, error_category,
+                findings_filtered_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 float(event.timestamp),
@@ -155,6 +157,7 @@ class UsageStore:
                 float(event.estimated_api_cost_usd),
                 str(event.error),
                 str(event.error_category),
+                int(event.findings_filtered_count),
             ),
         )
         self._conn.commit()
@@ -386,6 +389,7 @@ class UsageStore:
             estimated_api_cost_usd=cost,
             error=event.error,
             error_category=event.error_category,
+            findings_filtered_count=event.findings_filtered_count,
         )
 
 
@@ -413,9 +417,53 @@ def open_usage_store(db_path: str) -> UsageStore:
     return UsageStore(conn)
 
 
+#: Additive column migrations for tables created before a given column
+#: existed. Each entry is ``(table, column, ddl)``: we check
+#: ``PRAGMA table_info`` first and only run ``ddl`` when ``column`` is
+#: absent. That avoids (a) the fresh-DB exception-on-every-boot path
+#: that existed when we caught ``sqlite3.OperationalError`` and
+#: substring-matched "duplicate column name", and (b) brittleness
+#: against error-message variations across SQLite versions/builds.
+_ADDITIVE_COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "reviewer_usage",
+        "findings_filtered_count",
+        "ALTER TABLE reviewer_usage "
+        "ADD COLUMN findings_filtered_count INTEGER NOT NULL DEFAULT 0",
+    ),
+)
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Return True when ``table.column`` is present per ``PRAGMA table_info``.
+
+    Uses a parameterized PRAGMA only on the column name comparison;
+    the table name is interpolated since SQLite's PRAGMA syntax doesn't
+    accept bound parameters for identifiers. All callers pass literal
+    table names from ``_ADDITIVE_COLUMN_MIGRATIONS``, not user input.
+    """
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    # Row shape: (cid, name, type, notnull, dflt_value, pk).
+    return any(row[1] == column for row in cursor.fetchall())
+
+
 def _apply_schema(conn: sqlite3.Connection) -> None:
     for stmt in _DDL_STATEMENTS:
         conn.execute(stmt)
+    for table, column, ddl in _ADDITIVE_COLUMN_MIGRATIONS:
+        if _column_exists(conn, table, column):
+            continue
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            # Race-safety: two reviewer processes starting against the
+            # same DB can both pass the PRAGMA probe, then one succeeds
+            # at ALTER and the other gets "duplicate column name". Fall
+            # through silently only when the column now exists — anything
+            # else is a real migration failure and must surface.
+            if _column_exists(conn, table, column):
+                continue
+            raise
     conn.commit()
 
 

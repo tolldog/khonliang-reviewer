@@ -177,6 +177,38 @@ class RepoConfig:
     #: don't have to re-plumb it.
     base_sha: str = ""
 
+    @property
+    def severity_floor(self) -> str | None:
+        """Return the repo-declared severity floor, or ``None`` when unset.
+
+        Reads ``review.severity_floor`` first, falling back to
+        ``checks.severity_floor`` for forward-compat with the FR's
+        original naming. The ``review.*`` form is preferred: the floor
+        is a review-output knob, not a check-definition knob (checks
+        live under their own config namespace). Either key returns the
+        same string; the two-way lookup is just so an early adopter who
+        wrote ``checks.severity_floor`` doesn't silently get the
+        default.
+
+        Returns ``None`` when the key is absent, the value isn't a
+        string, or the value is the empty string. Empty string is
+        treated as "unset" at this layer — a config file with
+        ``severity_floor: ""`` is semantically "no value", and the
+        precedence chain can then fall through to the next layer (skill
+        arg, built-in default) exactly as if the key were missing.
+        Collapsing explicit-empty and unset into a single ``None`` keeps
+        the accessor's contract simple and matches YAML intuition (an
+        empty scalar is not a meaningful floor).
+        """
+        for key in ("review", "checks"):
+            section = self.repo_yaml.get(key)
+            if not isinstance(section, dict):
+                continue
+            floor = section.get("severity_floor")
+            if isinstance(floor, str) and floor:
+                return floor
+        return None
+
     def resolve(self, kind: str, vendor: str, model: str) -> ResolvedConfig:
         """Apply the override chain for a concrete ``(kind, vendor, model)``.
 

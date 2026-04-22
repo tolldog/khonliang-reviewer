@@ -26,13 +26,25 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import re
 import sys
 import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, handler
-from khonliang_reviewer import ReviewRequest, ReviewResult
+from khonliang_reviewer import (
+    SEVERITY_ORDER,
+    ReviewFinding,
+    ReviewRequest,
+    ReviewResult,
+    severity_rank,
+)
 
+from reviewer.config.repo import (
+    RepoConfig,
+    RepoConfigUnreachableError,
+    load as load_repo_config,
+)
 from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
@@ -75,6 +87,223 @@ _SEVERITY_LABELS = {
 #: it should add the value here behind an explicit opt-in flag rather
 #: than being broadly accepted on the ``event`` arg.
 _VALID_REVIEW_EVENTS = frozenset({"COMMENT", "REQUEST_CHANGES", "PENDING"})
+
+
+#: Built-in default severity floor. ``"nit"`` means "keep everything" —
+#: noise reduction is strictly opt-in so adding severity_floor to the
+#: agent can't silently change the review output of repos that haven't
+#: configured it. Matches the FR's precedence tail.
+_DEFAULT_SEVERITY_FLOOR = "nit"
+
+
+class SeverityFloorError(ValueError):
+    """Raised when a caller-supplied ``severity_floor`` isn't a known value.
+
+    Subclass of :class:`ValueError` so existing ``except ValueError``
+    blocks catch it, but distinct enough that callers wanting to branch
+    on "validation error vs. other ValueError" can key on the class.
+    """
+
+
+def _validate_severity_floor(value: str, *, source: str) -> str:
+    """Validate ``value`` is a known severity string; return it unchanged.
+
+    Empty string is rejected by the caller (it's the "not set" sentinel
+    at the skill-arg layer; callers resolve precedence before calling
+    here). Unknown values raise :class:`SeverityFloorError` with a
+    message naming ``source`` so operators can tell whether a skill
+    arg or a config file is to blame.
+    """
+    if value not in SEVERITY_ORDER:
+        raise SeverityFloorError(
+            f"{source}: severity_floor={value!r} is not valid; "
+            f"expected one of {list(SEVERITY_ORDER)}"
+        )
+    return value
+
+
+def _resolve_repo_severity_floor(context: dict[str, Any]) -> str | None:
+    """Best-effort read of ``review.severity_floor`` from ``.reviewer/config.yaml``.
+
+    Activates only when the caller threads ``repo_root`` + ``base_sha``
+    through ``context`` — ``review_text`` as a bus skill has no local
+    filesystem assumption, so the caller (orchestrator with a local
+    clone) opts in by providing those hints. Orchestrators without a
+    local clone (``review_pr`` today) will skip this layer and fall
+    straight to the built-in default unless the caller passed
+    ``severity_floor`` on the skill args.
+
+    Returns ``None`` when the layer is not applicable (hints missing,
+    config file absent, value unset). Infrastructure failures
+    (shallow clone, git error) are logged at warning and collapse to
+    ``None`` — the reviewer still runs, just without the config-layer
+    floor. The skill-arg layer is still honored because it was resolved
+    first.
+    """
+    repo_root = context.get("repo_root")
+    base_sha = context.get("base_sha")
+    if not isinstance(repo_root, str) or not repo_root:
+        return None
+    if not isinstance(base_sha, str) or not base_sha:
+        return None
+    try:
+        cfg: RepoConfig = load_repo_config(repo_root, base_sha=base_sha)
+    except RepoConfigUnreachableError as exc:
+        logger.warning("severity_floor config read skipped: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("severity_floor config read failed: %s", exc)
+        return None
+    return cfg.severity_floor
+
+
+def _filter_findings_by_floor(
+    findings: list[dict[str, Any]], floor: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split ``findings`` into (kept, dropped) by severity rank.
+
+    A finding is kept when its severity rank is ``>= rank(floor)``.
+    Findings whose severity doesn't parse (corrupt provider output,
+    unknown severity string) are **kept** — the filter's contract is
+    noise reduction, not correctness enforcement; discarding an
+    unparseable finding would silently hide real signal. A malformed
+    finding is the provider's bug to fix, not the filter's data to
+    drop.
+    """
+    floor_rank = severity_rank(floor)
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for finding in findings:
+        severity = finding.get("severity") if isinstance(finding, dict) else None
+        if not isinstance(severity, str):
+            kept.append(finding)
+            continue
+        try:
+            rank = severity_rank(severity)
+        except ValueError:
+            kept.append(finding)
+            continue
+        if rank >= floor_rank:
+            kept.append(finding)
+        else:
+            dropped.append(finding)
+    return kept, dropped
+
+
+def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> str:
+    """Remove references to dropped findings from the ``summary`` prose.
+
+    Some providers enumerate findings inside the summary itself
+    (markdown bullet list, numbered section). If a dropped finding's
+    title appears on a line **in one of three recognized shapes**,
+    strip that line so the remaining prose reads cleanly. Lines that
+    don't match any of the three shapes pass through untouched — even
+    if the title happens to appear mid-sentence as prose.
+
+    The three strip-eligible shapes (per line, after ``line.strip()``):
+
+    1. **Bullet list item** — ``^[-*+]\\s+<title>(?=\\s|[:.,;)!?]|$)``
+       (e.g. ``"- race condition: ..."`` or ``"- foo(): ..."``).
+    2. **Title-colon prose** — ``^<title>\\s*:`` (e.g.
+       ``"Missing docstring: ..."``).
+    3. **Standalone title line** — ``^<title>\\s*$`` (just the title,
+       nothing else).
+
+    Any other occurrence of the title (mid-sentence, inside a paragraph
+    that also says other things) is left alone. This matches the
+    docstring's stated intent: only the obviously-enumerated shapes
+    are collateral-damage-free to drop; prose paragraphs that mention
+    a title in passing may carry information that has nothing to do
+    with the dropped finding, so we don't touch them.
+
+    Mid-word collisions (dropped title ``"race"`` vs summary word
+    ``"embrace"``) are prevented by **start-of-line anchoring + exact
+    escaped title**, not by ``\\b`` word-boundary. All three shapes
+    start with either ``^`` (line start, after ``line.strip()``) or a
+    bullet-marker prefix; that pins ``<title>`` to the beginning of a
+    meaningful position in the line, so ``"embrace"`` never aligns
+    with the escaped ``"race"`` pattern. The bullet shape's trailing
+    ``(?=\\s|[:.,;)!?]|$)`` lookahead prevents a longer title like
+    ``"race-condition-handler"`` from being partially matched by a
+    dropped ``"race"`` finding — and critically, the explicit
+    character-class trailer handles titles ending in non-word chars
+    (e.g. ``"foo()"``) that a bare ``\\b`` would silently skip.
+
+    **Ultra-short titles (``len(title.strip()) < 3``) are not
+    strip-eligible.** Single-letter and two-character titles like
+    ``"a"``, ``"if"``, ``"or"`` would match every indefinite article
+    or conjunction in prose even with start-anchoring — the bullet
+    shape ``"- a ..."`` is a legitimate construction. Skipping these
+    titles means the caller keeps a slightly-noisier summary (the
+    bullet for a dropped ``"a"`` finding survives), which is strictly
+    safer than shredding unrelated summary lines. A future FR with a
+    structured prompt that keeps summary and findings orthogonal
+    would remove the need for this heuristic entirely.
+    """
+    if not summary or not dropped:
+        return summary
+    drop_titles = [
+        str(f.get("title") or "").strip()
+        for f in dropped
+        if isinstance(f, dict)
+    ]
+    # Guard against ultra-short titles that would match common words
+    # (``"a"`` / ``"if"`` / ``"or"``) even under start-anchoring — a
+    # bullet line like ``"- a common issue"`` would otherwise have
+    # the leading ``"a "`` stripped by a dropped ``"a"`` finding.
+    # 3 chars is the minimum that empirically avoids the English
+    # function-word collisions we've hit; shorter titles pass through
+    # untouched rather than risk shredding unrelated summary prose.
+    drop_titles = [t for t in drop_titles if len(t) >= 3]
+    if not drop_titles:
+        return summary
+    # Precompile one pattern per title covering all three shapes in a
+    # single alternation. ``re.IGNORECASE`` isn't used — provider
+    # summaries and titles come from the same generation so casing
+    # is consistent; case-insensitive would broaden matches without
+    # catching a realistic failure mode.
+    #
+    # Shape anchors (applied to ``line.strip()``):
+    #   1. bullet:         ^[-*+]\s+<title>(?=\s|[:.,;)!?]|$)
+    #   2. title-colon:    ^<title>\s*:
+    #   3. standalone:     ^<title>\s*$
+    #
+    # The bullet shape uses a character-class lookahead rather than
+    # ``\b`` so titles ending in non-word characters still match. A
+    # bare ``\b`` after the escaped title fails silently when the
+    # title ends with e.g. ``"foo()"`` — ``\b`` only fires at a
+    # word↔non-word transition, and two non-word chars in a row
+    # (``) `` + whitespace) don't satisfy it. The explicit class
+    # ``[:.,;)!?]`` + whitespace + end-of-line covers the realistic
+    # summary-line trailers without false-positives.
+    drop_patterns = [
+        re.compile(
+            rf"(?:^[-*+]\s+{re.escape(title)}(?=\s|[:.,;)!?]|$))"
+            rf"|(?:^{re.escape(title)}\s*:)"
+            rf"|(?:^{re.escape(title)}\s*$)"
+        )
+        for title in drop_titles
+    ]
+    kept_lines: list[str] = []
+    for line in summary.splitlines():
+        stripped = line.strip()
+        if stripped and any(p.search(stripped) for p in drop_patterns):
+            continue
+        kept_lines.append(line)
+    # Collapse 2+ consecutive blank lines (from stripped content) down
+    # to a single blank line so the output doesn't end up visually
+    # gap-ridden. Cheap — summaries are small.
+    collapsed: list[str] = []
+    blank_run = 0
+    for line in kept_lines:
+        if not line.strip():
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        collapsed.append(line)
+    return "\n".join(collapsed).rstrip()
 
 
 def _format_for_github(
@@ -280,6 +509,11 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
+                    # severity_floor: drop findings below this severity
+                    # from the returned result. "" = no skill-arg
+                    # override (fall through to config then default
+                    # "nit"). Valid values: "nit"|"comment"|"concern".
+                    "severity_floor": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -294,6 +528,7 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
+                    "severity_floor": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -311,6 +546,7 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "dry_run": {"type": "boolean", "default": False},
                     "event": {"type": "string", "default": "COMMENT"},
+                    "severity_floor": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -342,6 +578,17 @@ class ReviewerAgent(BaseAgent):
         caller_backend = args.get("backend") or None
         caller_model = args.get("model") or None
         context = _as_dict(args.get("context"))
+
+        # Resolve severity_floor precedence up-front so a validation
+        # error surfaces before we spend a provider call. Order matches
+        # the FR (skill arg → .reviewer/config.yaml → built-in default).
+        # The ``skill_arg`` step validates eagerly because the caller
+        # typo'd; the config-layer step validates because operators
+        # can typo their YAML too. Default is trusted (module constant).
+        try:
+            effective_floor = self._resolve_severity_floor(args, context)
+        except SeverityFloorError as exc:
+            return {"error": str(exc)}
 
         try:
             selector = self._ensure_selector()
@@ -380,8 +627,126 @@ class ReviewerAgent(BaseAgent):
         )
 
         result = await provider.review(request)
+        # Apply the severity_floor post-filter at the edge of the return
+        # path, AFTER the provider returns but BEFORE usage recording.
+        # The usage event gets the filtered count so downstream
+        # analytics can correlate (backend, model, floor) → noise
+        # reduction without re-running the review.
+        self._apply_severity_floor(result, effective_floor)
         await self._record_usage(result)
         return result.to_dict()
+
+    def _resolve_severity_floor(
+        self, args: dict[str, Any], context: dict[str, Any]
+    ) -> str:
+        """Resolve the effective severity_floor per the FR precedence chain.
+
+        High-to-low:
+
+        1. Skill-arg ``severity_floor`` (non-empty string) — **strict**.
+           A bad value here is a caller bug; raise
+           :class:`SeverityFloorError` so the review fails fast with a
+           message the caller can act on.
+        2. ``review.severity_floor`` / ``checks.severity_floor`` in
+           ``.reviewer/config.yaml`` — **lenient**. Only consulted when
+           the context supplies ``repo_root`` + ``base_sha`` hints. A bad
+           value in YAML shouldn't nuke every review for that repo — log
+           a warning naming the offending value and fall through to the
+           built-in default. Reviewing is more important than config-layer
+           correctness.
+        3. :data:`_DEFAULT_SEVERITY_FLOOR` (``"nit"`` — no filtering).
+
+        Rationale for asymmetric validation: the skill-arg path is a
+        programmatic caller (another agent, a test, an orchestrator) —
+        strict failure is the correct feedback channel. The config-layer
+        path is a human-edited YAML file on a repo; a typo there
+        shouldn't silently wedge CI.
+        """
+        arg_value = args.get("severity_floor")
+        if isinstance(arg_value, str) and arg_value:
+            return _validate_severity_floor(arg_value, source="skill arg")
+
+        config_value = _resolve_repo_severity_floor(context)
+        if isinstance(config_value, str) and config_value:
+            try:
+                return _validate_severity_floor(
+                    config_value, source=".reviewer/config.yaml"
+                )
+            except SeverityFloorError as exc:
+                # RepoConfig.severity_floor reads review.severity_floor
+                # first, falling back to checks.severity_floor — the
+                # warning names the resolved key generically so operators
+                # aren't misled about which key actually carried the bad
+                # value.
+                logger.warning(
+                    "reviewer: ignoring invalid .reviewer/config.yaml "
+                    "severity_floor=%r (checked review.severity_floor "
+                    "and checks.severity_floor); falling back to "
+                    "default %r (%s)",
+                    config_value,
+                    _DEFAULT_SEVERITY_FLOOR,
+                    exc,
+                )
+                return _DEFAULT_SEVERITY_FLOOR
+
+        return _DEFAULT_SEVERITY_FLOOR
+
+    def _apply_severity_floor(
+        self, result: ReviewResult, floor: str
+    ) -> None:
+        """Drop sub-floor findings from ``result`` in place + record the count.
+
+        Mutates ``result.findings`` (which is what the caller will see
+        via ``result.to_dict()``), strips references to dropped findings
+        from ``result.summary``, and bumps ``result.usage.findings_filtered_count``
+        so the usage record reflects the filter outcome.
+
+        When ``floor == _DEFAULT_SEVERITY_FLOOR`` and the default is the
+        lowest rank (``"nit"``), the filter is a no-op — the rank
+        comparison keeps every finding unchanged. We still run through
+        so the ``findings_filtered_count`` field is written to the
+        SQLite usage row with an explicit zero so new rows written
+        after this code lands always carry a value.
+
+        Important caveat for analytics: the SQLite migration adds the
+        column with ``NOT NULL DEFAULT 0``, which back-fills existing
+        rows from before the severity_floor feature to 0 as well.
+        That means ``findings_filtered_count = 0`` is ambiguous —
+        it can mean either "filter ran, dropped nothing" OR "row
+        predates the severity_floor feature entirely". The two cases
+        are NOT distinguishable from the SQLite column alone; a
+        downstream analytic that cares about the distinction needs a
+        separate signal (e.g. a row-creation timestamp compared
+        against the feature's rollout date, or a dedicated
+        ``severity_floor_applied: bool`` column in a future migration).
+
+        Note on the bus-event payload: ``UsageEvent.to_dict()`` omits
+        ``findings_filtered_count`` when the value is 0 (wire-shape
+        preservation — see khonliang-reviewer-lib#4). Bus-subscriber
+        consumers that want to know the filter ran at all must infer
+        from the absence / presence of the field plus review-handler
+        timing, not from a value comparison.
+        """
+        original = [
+            f.to_dict() if isinstance(f, ReviewFinding) else f
+            for f in (result.findings or [])
+        ]
+        kept_dicts, dropped_dicts = _filter_findings_by_floor(original, floor)
+
+        # Rebuild the findings list as ReviewFinding objects so the
+        # dataclass shape is preserved — to_dict() handles both, but
+        # downstream code that peeks at result.findings sees the
+        # typed form.
+        result.findings = [
+            ReviewFinding.from_dict(f) if isinstance(f, dict) else f
+            for f in kept_dicts
+        ]
+        if dropped_dicts:
+            result.summary = _strip_dropped_from_summary(
+                result.summary, dropped_dicts
+            )
+        if result.usage is not None:
+            result.usage.findings_filtered_count = len(dropped_dicts)
 
     @handler("review_diff")
     async def handle_review_diff(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -454,8 +819,8 @@ class ReviewerAgent(BaseAgent):
             return {"error": f"github fetch failed: {exc}"}
 
         # Feed the diff into review_text via the shared path so selector,
-        # rule table, and usage recording all run exactly once per
-        # review, regardless of which entry skill was called.
+        # rule table, severity_floor, and usage recording all run exactly
+        # once per review, regardless of which entry skill was called.
         review_args: dict[str, Any] = {
             "kind": "pr_diff",
             "content": diff,
@@ -466,6 +831,12 @@ class ReviewerAgent(BaseAgent):
             "backend": args.get("backend") or "",
             "model": args.get("model") or "",
             "metadata": {"repo": repo, "pr_number": pr_number},
+            # review_pr fetches via API (no local clone), so the
+            # ``.reviewer/config.yaml`` layer can't activate here —
+            # callers who want a config-layer floor should call
+            # ``review_text`` directly with repo_root/base_sha in
+            # context. Pass through the skill-arg floor only.
+            "severity_floor": args.get("severity_floor") or "",
         }
         review_result = await self.handle_review_text(review_args)
         # ReviewResult.to_dict() always carries an ``error`` key (empty
