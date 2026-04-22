@@ -164,11 +164,12 @@ class RepoConfig:
 
     #: Paths (repo-relative) under ``.reviewer/checks/``. Directory
     #: contents are enumerated but **not opened** — the checks loader
-    #: is a separate FR. Empty list when the directory is absent.
+    #: is a separate FR. Empty tuple when the directory is absent.
     custom_checks_paths: tuple[str, ...] = ()
 
     #: Paths (repo-relative) under ``.reviewer/baselines/``. Same
     #: contract as ``custom_checks_paths``: enumerated, not opened.
+    #: Empty tuple when the directory is absent.
     baseline_paths: tuple[str, ...] = ()
 
     #: Base SHA this snapshot was loaded from. Kept for diagnostics +
@@ -508,7 +509,7 @@ def _enumerate_reserved_dir(
 def _parse_yaml_mapping(raw: str | None, *, label: str) -> dict[str, Any]:
     """Parse ``raw`` as a YAML mapping, returning ``{}`` on absence/error.
 
-    Three collapse-to-empty cases, all silent:
+    Four collapse-to-empty cases, all silent:
 
     - ``raw is None`` — file absent at base SHA.
     - Empty / whitespace-only / ``null`` YAML — present but opted-out.
