@@ -4,7 +4,12 @@ version = "0.3.0"
 description = "Bus-native reviewer agent — pluggable review providers, usage accounting, subscription vs API cost comparison"
 requires-python = ">=3.11"
 dependencies = [
-    "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@main",
+    # TEMPORARY: pinned to fr-reviewer-dfd27582-filtered-count while the lib
+    # PR (khonliang-reviewer-lib#4 — UsageEvent.findings_filtered_count +
+    # SEVERITY_ORDER/severity_rank) is in review. Revert to `@main` after that
+    # PR merges. Without this pin, the reviewer import chain fails on
+    # `SEVERITY_ORDER`, `severity_rank`, and `UsageEvent.findings_filtered_count`.
+    "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@fr-reviewer-dfd27582-filtered-count",
     "khonliang-bus-lib",
     "pyyaml>=6.0",
     "openai>=1.40",

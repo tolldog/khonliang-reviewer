@@ -177,6 +177,34 @@ class RepoConfig:
     #: don't have to re-plumb it.
     base_sha: str = ""
 
+    @property
+    def severity_floor(self) -> str | None:
+        """Return the repo-declared severity floor, or ``None`` when unset.
+
+        Reads ``review.severity_floor`` first, falling back to
+        ``checks.severity_floor`` for forward-compat with the FR's
+        original naming. The ``review.*`` form is preferred: the floor
+        is a review-output knob, not a check-definition knob (checks
+        live under their own config namespace). Either key returns the
+        same string; the two-way lookup is just so an early adopter who
+        wrote ``checks.severity_floor`` doesn't silently get the
+        default.
+
+        Returns ``None`` (not the empty string) when the key is absent
+        or the value isn't a string — the reviewer's precedence chain
+        distinguishes "no repo-level override" from "repo-level override
+        is the empty string (fall through to default)", so a single
+        falsy sentinel would collapse those cases together.
+        """
+        for key in ("review", "checks"):
+            section = self.repo_yaml.get(key)
+            if not isinstance(section, dict):
+                continue
+            floor = section.get("severity_floor")
+            if isinstance(floor, str) and floor:
+                return floor
+        return None
+
     def resolve(self, kind: str, vendor: str, model: str) -> ResolvedConfig:
         """Apply the override chain for a concrete ``(kind, vendor, model)``.
 

@@ -9,6 +9,7 @@ assert routing + arg-forwarding end-to-end.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pytest
@@ -678,3 +679,375 @@ def test_default_selector_honors_config_yaml(tmp_path):
     selector = agent._ensure_selector()
     assert selector.config.default_backend == "claude_cli"
     assert selector.config.default_model == "claude-opus-4-7"
+
+
+# ---------------------------------------------------------------------------
+# severity_floor post-filter (FR fr_reviewer_dfd27582)
+# ---------------------------------------------------------------------------
+
+
+def _result_with_findings(findings: list[ReviewFinding], *, summary: str = "ok") -> ReviewResult:
+    """Build a :class:`ReviewResult` with caller-specified findings.
+
+    Usage event is always populated — the filter lands the
+    ``findings_filtered_count`` value on it, so tests that assert the
+    field need it present.
+    """
+    return ReviewResult(
+        request_id="test-req",
+        summary=summary,
+        findings=findings,
+        disposition="posted",
+        backend="ollama",
+        model="qwen3.5",
+        usage=UsageEvent(
+            timestamp=1.0,
+            backend="ollama",
+            model="qwen3.5",
+            input_tokens=10,
+            output_tokens=5,
+        ),
+    )
+
+
+async def test_severity_floor_drops_nits_when_floor_is_comment():
+    findings = [
+        ReviewFinding(severity="nit", title="trailing ws", body="strip"),
+        ReviewFinding(severity="comment", title="naming", body="rename"),
+        ReviewFinding(severity="concern", title="race", body="fix lock"),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "comment"},
+    )
+
+    returned = [f["severity"] for f in result["findings"]]
+    assert returned == ["comment", "concern"]
+    assert result["usage"]["findings_filtered_count"] == 1
+
+
+async def test_severity_floor_concern_keeps_only_concerns():
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    returned = [f["severity"] for f in result["findings"]]
+    assert returned == ["concern"]
+    assert result["usage"]["findings_filtered_count"] == 2
+
+
+async def test_severity_floor_concern_drops_all_when_no_concerns():
+    """AC: floor=concern on a review with only nits/comments → zero findings, count>0."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    assert result["findings"] == []
+    assert result["usage"]["findings_filtered_count"] == 2
+
+
+async def test_severity_floor_nit_is_no_op():
+    """AC: floor=nit (default) keeps everything; filtered_count == 0."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "nit"},
+    )
+
+    assert len(result["findings"]) == 2
+    assert result["usage"]["findings_filtered_count"] == 0
+
+
+async def test_severity_floor_default_no_filtering_when_unset():
+    """AC: no severity_floor in args or config → identical to today."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert len(result["findings"]) == 3
+    assert result["usage"]["findings_filtered_count"] == 0
+
+
+async def test_severity_floor_invalid_value_returns_error():
+    """Bad skill-arg severity_floor surfaces as a validation error early."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "CRITICAL"},
+    )
+
+    assert "error" in result
+    assert "severity_floor" in result["error"]
+    # Provider never ran — validation is pre-provider.
+    assert fake.last_request is None
+
+
+async def test_severity_floor_strips_dropped_finding_title_from_summary():
+    """Dropped finding titles that appear as summary lines are stripped."""
+    findings = [
+        ReviewFinding(severity="nit", title="trailing whitespace", body=""),
+        ReviewFinding(severity="concern", title="null-deref", body=""),
+    ]
+    summary = (
+        "Overall looks OK.\n"
+        "- trailing whitespace\n"
+        "- null-deref\n"
+    )
+    fake = _RecordingProvider(
+        "ollama", _result_with_findings(findings, summary=summary)
+    )
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    assert "trailing whitespace" not in result["summary"]
+    # Retained finding's line stays.
+    assert "null-deref" in result["summary"]
+
+
+async def test_severity_floor_config_layer_via_context_hints(tmp_path):
+    """Config-layer read activates when context supplies repo_root + base_sha."""
+    import subprocess
+
+    # Build a tiny git repo with .reviewer/config.yaml on main branch.
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, env=env)
+    reviewer_dir = tmp_path / ".reviewer"
+    reviewer_dir.mkdir()
+    (reviewer_dir / "config.yaml").write_text("review:\n  severity_floor: concern\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "seed"], cwd=tmp_path, check=True, env=env
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "context": {"repo_root": str(tmp_path), "base_sha": sha},
+        },
+    )
+
+    # Config layer raised floor to "concern" → 2 dropped.
+    assert [f["severity"] for f in result["findings"]] == ["concern"]
+    assert result["usage"]["findings_filtered_count"] == 2
+
+
+async def test_severity_floor_skill_arg_wins_over_config(tmp_path):
+    """Precedence: skill arg overrides ``.reviewer/config.yaml`` floor."""
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e",
+    }
+    subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, env=env)
+    (tmp_path / ".reviewer").mkdir()
+    (tmp_path / ".reviewer" / "config.yaml").write_text(
+        "review:\n  severity_floor: concern\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "seed"], cwd=tmp_path, check=True, env=env
+    )
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    # Skill arg "nit" overrides config "concern" → nothing filtered.
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "severity_floor": "nit",
+            "context": {"repo_root": str(tmp_path), "base_sha": sha},
+        },
+    )
+
+    assert len(result["findings"]) == 3
+    assert result["usage"]["findings_filtered_count"] == 0
+
+
+async def test_severity_floor_forwarded_through_review_diff():
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"diff": "diff --git a/x b/x\n", "severity_floor": "comment"},
+    )
+
+    assert [f["severity"] for f in result["findings"]] == ["concern"]
+    assert result["usage"]["findings_filtered_count"] == 1
+
+
+async def test_severity_floor_unknown_severity_in_finding_is_preserved():
+    """Corrupt provider output (unknown severity) shouldn't be silently dropped."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        # Construct via from_dict to bypass the Literal type-check and
+        # simulate a malformed upstream finding reaching the filter.
+        ReviewFinding.from_dict(
+            {"severity": "BOGUS", "title": "huh", "body": "", "category": ""}
+        ),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    returned = [f["severity"] for f in result["findings"]]
+    # Unknown severity preserved (kept-by-default); "nit" filtered out.
+    assert "BOGUS" in returned
+    assert "concern" in returned
+    assert "nit" not in returned
+
+
+async def test_findings_filtered_count_persists_to_usage_store():
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="comment", title="b", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+    store = harness.agent._injected_store
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "comment"},
+    )
+
+    rows = store._conn.execute(
+        "SELECT findings_filtered_count FROM reviewer_usage"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == 1
+
+
+async def test_severity_floor_empty_string_falls_through_to_default():
+    """Empty string on the skill arg means "not set"; use config/default."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": ""},
+    )
+
+    # No filtering — default is "nit".
+    assert len(result["findings"]) == 2
+    assert result["usage"]["findings_filtered_count"] == 0
+
+
+async def test_severity_floor_emitted_via_reviewer_usage_event(monkeypatch):
+    """Bus payload carries findings_filtered_count for downstream observers."""
+    findings = [
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="concern", title="c", body=""),
+    ]
+    fake = _RecordingProvider("ollama", _result_with_findings(findings))
+    harness = _make_harness({"ollama": fake})
+
+    published: list[tuple[str, dict]] = []
+
+    async def fake_publish(topic: str, payload: dict) -> None:
+        published.append((topic, payload))
+
+    monkeypatch.setattr(harness.agent, "publish", fake_publish)
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    assert len(published) == 1
+    _, payload = published[0]
+    assert payload["findings_filtered_count"] == 1

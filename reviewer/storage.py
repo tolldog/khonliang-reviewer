@@ -57,7 +57,8 @@ _DDL_STATEMENTS: tuple[str, ...] = (
         pr_number INTEGER,
         estimated_api_cost_usd REAL NOT NULL DEFAULT 0.0,
         error TEXT NOT NULL DEFAULT '',
-        error_category TEXT NOT NULL DEFAULT ''
+        error_category TEXT NOT NULL DEFAULT '',
+        findings_filtered_count INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -136,8 +137,9 @@ class UsageStore:
                 duration_ms, disposition,
                 request_id, repo, pr_number,
                 estimated_api_cost_usd,
-                error, error_category
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error, error_category,
+                findings_filtered_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 float(event.timestamp),
@@ -155,6 +157,7 @@ class UsageStore:
                 float(event.estimated_api_cost_usd),
                 str(event.error),
                 str(event.error_category),
+                int(event.findings_filtered_count),
             ),
         )
         self._conn.commit()
@@ -386,6 +389,7 @@ class UsageStore:
             estimated_api_cost_usd=cost,
             error=event.error,
             error_category=event.error_category,
+            findings_filtered_count=event.findings_filtered_count,
         )
 
 
@@ -413,9 +417,29 @@ def open_usage_store(db_path: str) -> UsageStore:
     return UsageStore(conn)
 
 
+#: Additive, best-effort migrations for databases created before a
+#: given column existed. SQLite's ``ADD COLUMN`` raises
+#: ``OperationalError`` when the column already exists; we swallow that
+#: specific case so :func:`_apply_schema` stays idempotent across boots.
+#: Anything else (syntax error, broken DB) re-raises so the operator
+#: sees it during startup.
+_ADDITIVE_MIGRATIONS: tuple[str, ...] = (
+    "ALTER TABLE reviewer_usage "
+    "ADD COLUMN findings_filtered_count INTEGER NOT NULL DEFAULT 0",
+)
+
+
 def _apply_schema(conn: sqlite3.Connection) -> None:
     for stmt in _DDL_STATEMENTS:
         conn.execute(stmt)
+    for stmt in _ADDITIVE_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            # "duplicate column name" means the migration already ran;
+            # anything else is a real failure and should surface.
+            if "duplicate column name" not in str(exc).lower():
+                raise
     conn.commit()
 
 
