@@ -190,11 +190,15 @@ class RepoConfig:
         wrote ``checks.severity_floor`` doesn't silently get the
         default.
 
-        Returns ``None`` (not the empty string) when the key is absent
-        or the value isn't a string — the reviewer's precedence chain
-        distinguishes "no repo-level override" from "repo-level override
-        is the empty string (fall through to default)", so a single
-        falsy sentinel would collapse those cases together.
+        Returns ``None`` when the key is absent, the value isn't a
+        string, or the value is the empty string. Empty string is
+        treated as "unset" at this layer — a config file with
+        ``severity_floor: ""`` is semantically "no value", and the
+        precedence chain can then fall through to the next layer (skill
+        arg, built-in default) exactly as if the key were missing.
+        Collapsing explicit-empty and unset into a single ``None`` keeps
+        the accessor's contract simple and matches YAML intuition (an
+        empty scalar is not a meaningful floor).
         """
         for key in ("review", "checks"):
             section = self.repo_yaml.get(key)

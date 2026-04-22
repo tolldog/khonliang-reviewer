@@ -221,7 +221,7 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
         if stripped and any(title in stripped for title in drop_titles):
             continue
         kept_lines.append(line)
-    # Collapse 3+ consecutive blank lines (from stripped content) down
+    # Collapse 2+ consecutive blank lines (from stripped content) down
     # to a single blank line so the output doesn't end up visually
     # gap-ridden. Cheap — summaries are small.
     collapsed: list[str] = []
