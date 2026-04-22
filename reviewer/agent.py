@@ -687,16 +687,27 @@ class ReviewerAgent(BaseAgent):
         lowest rank (``"nit"``), the filter is a no-op — the rank
         comparison keeps every finding unchanged. We still run through
         so the ``findings_filtered_count`` field is written to the
-        SQLite usage row with an explicit zero, giving analytics a
-        stable column for "filter ran, dropped nothing" vs runs that
-        predate the filter (NULL / absent).
+        SQLite usage row with an explicit zero so new rows written
+        after this code lands always carry a value.
+
+        Important caveat for analytics: the SQLite migration adds the
+        column with ``NOT NULL DEFAULT 0``, which back-fills existing
+        rows from before the severity_floor feature to 0 as well.
+        That means ``findings_filtered_count = 0`` is ambiguous —
+        it can mean either "filter ran, dropped nothing" OR "row
+        predates the severity_floor feature entirely". The two cases
+        are NOT distinguishable from the SQLite column alone; a
+        downstream analytic that cares about the distinction needs a
+        separate signal (e.g. a row-creation timestamp compared
+        against the feature's rollout date, or a dedicated
+        ``severity_floor_applied: bool`` column in a future migration).
 
         Note on the bus-event payload: ``UsageEvent.to_dict()`` omits
         ``findings_filtered_count`` when the value is 0 (wire-shape
-        preservation — see khonliang-reviewer-lib#4). Consumers that
-        need to distinguish "filter ran, 0 dropped" from "filter
-        didn't run" should read from the SQLite row rather than the
-        bus payload.
+        preservation — see khonliang-reviewer-lib#4). Bus-subscriber
+        consumers that want to know the filter ran at all must infer
+        from the absence / presence of the field plus review-handler
+        timing, not from a value comparison.
         """
         original = [
             f.to_dict() if isinstance(f, ReviewFinding) else f
