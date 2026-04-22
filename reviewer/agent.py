@@ -655,9 +655,16 @@ class ReviewerAgent(BaseAgent):
                     config_value, source=".reviewer/config.yaml"
                 )
             except SeverityFloorError as exc:
+                # RepoConfig.severity_floor reads review.severity_floor
+                # first, falling back to checks.severity_floor — the
+                # warning names the resolved key generically so operators
+                # aren't misled about which key actually carried the bad
+                # value.
                 logger.warning(
                     "reviewer: ignoring invalid .reviewer/config.yaml "
-                    "review.severity_floor=%r; falling back to default %r (%s)",
+                    "severity_floor=%r (checked review.severity_floor "
+                    "and checks.severity_floor); falling back to "
+                    "default %r (%s)",
                     config_value,
                     _DEFAULT_SEVERITY_FLOOR,
                     exc,
@@ -679,10 +686,17 @@ class ReviewerAgent(BaseAgent):
         When ``floor == _DEFAULT_SEVERITY_FLOOR`` and the default is the
         lowest rank (``"nit"``), the filter is a no-op — the rank
         comparison keeps every finding unchanged. We still run through
-        so the ``findings_filtered_count`` field lands on the usage
-        event even when no filtering occurred (value 0) — downstream
-        analytics can't distinguish "filter ran, dropped nothing" from
-        "filter didn't run" without an explicit zero.
+        so the ``findings_filtered_count`` field is written to the
+        SQLite usage row with an explicit zero, giving analytics a
+        stable column for "filter ran, dropped nothing" vs runs that
+        predate the filter (NULL / absent).
+
+        Note on the bus-event payload: ``UsageEvent.to_dict()`` omits
+        ``findings_filtered_count`` when the value is 0 (wire-shape
+        preservation — see khonliang-reviewer-lib#4). Consumers that
+        need to distinguish "filter ran, 0 dropped" from "filter
+        didn't run" should read from the SQLite row rather than the
+        bus payload.
         """
         original = [
             f.to_dict() if isinstance(f, ReviewFinding) else f
