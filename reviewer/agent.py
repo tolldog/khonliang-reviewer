@@ -255,12 +255,21 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     # catching a realistic failure mode.
     #
     # Shape anchors (applied to ``line.strip()``):
-    #   1. bullet:         ^[-*+]\s+<title>\b
+    #   1. bullet:         ^[-*+]\s+<title>(?=\s|[:.,;)!?]|$)
     #   2. title-colon:    ^<title>\s*:
     #   3. standalone:     ^<title>\s*$
+    #
+    # The bullet shape uses a character-class lookahead rather than
+    # ``\b`` so titles ending in non-word characters still match. A
+    # bare ``\b`` after the escaped title fails silently when the
+    # title ends with e.g. ``"foo()"`` — ``\b`` only fires at a
+    # word↔non-word transition, and two non-word chars in a row
+    # (``) `` + whitespace) don't satisfy it. The explicit class
+    # ``[:.,;)!?]`` + whitespace + end-of-line covers the realistic
+    # summary-line trailers without false-positives.
     drop_patterns = [
         re.compile(
-            rf"(?:^[-*+]\s+{re.escape(title)}\b)"
+            rf"(?:^[-*+]\s+{re.escape(title)}(?=\s|[:.,;)!?]|$))"
             rf"|(?:^{re.escape(title)}\s*:)"
             rf"|(?:^{re.escape(title)}\s*$)"
         )

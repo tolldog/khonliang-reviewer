@@ -451,8 +451,19 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
     for stmt in _DDL_STATEMENTS:
         conn.execute(stmt)
     for table, column, ddl in _ADDITIVE_COLUMN_MIGRATIONS:
-        if not _column_exists(conn, table, column):
+        if _column_exists(conn, table, column):
+            continue
+        try:
             conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            # Race-safety: two reviewer processes starting against the
+            # same DB can both pass the PRAGMA probe, then one succeeds
+            # at ALTER and the other gets "duplicate column name". Fall
+            # through silently only when the column now exists — anything
+            # else is a real migration failure and must surface.
+            if _column_exists(conn, table, column):
+                continue
+            raise
     conn.commit()
 
 

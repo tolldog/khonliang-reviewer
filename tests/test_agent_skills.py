@@ -1280,3 +1280,51 @@ async def test_strip_dropped_from_summary_preserves_prose_mid_sentence():
     assert "\nrace\n" not in "\n" + out + "\n"
     # Retained finding's line stays.
     assert "real issue" in out
+
+
+@pytest.mark.asyncio
+async def test_strip_dropped_from_summary_handles_non_word_char_titles():
+    """Copilot round-8 finding: bullet regex used ``\\b`` after the title.
+
+    ``\\b`` only fires at a word↔non-word transition. For a title like
+    ``"foo()"`` that already ends in a non-word char, the pattern
+    ``<title>\\b`` doesn't trigger — the closing ``)`` + following
+    whitespace are two non-word chars in a row. The bullet line
+    silently survives filtering, opposite of the intended behavior.
+
+    This test nails the fix: a title ending in ``)`` strips its bullet
+    line while a prose mention of the same title stays intact.
+    """
+    findings = [
+        # Title ends in ``)`` — the specific failure mode Copilot flagged.
+        ReviewFinding(severity="nit", title="foo()", body=""),
+        ReviewFinding(severity="concern", title="a real issue", body=""),
+    ]
+    summary = (
+        # Prose mention — must be preserved.
+        "The function foo() was slow under contention.\n"
+        # Bullet shape with non-word-char-trailing title — MUST be stripped.
+        "- foo(): profile showed 40% time in lock\n"
+        # Title-colon shape — also stripped.
+        "foo(): another occurrence here\n"
+        # Retained finding bullet.
+        "- a real issue\n"
+    )
+    fake = _RecordingProvider(
+        "ollama", _result_with_findings(findings, summary=summary)
+    )
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    out = result["summary"]
+    # Prose mention survives.
+    assert "The function foo() was slow under contention." in out
+    # Both strip-eligible shapes removed.
+    assert "- foo(): profile showed 40% time in lock" not in out
+    assert "foo(): another occurrence here" not in out
+    # Retained finding's line stays.
+    assert "a real issue" in out
