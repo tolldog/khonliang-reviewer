@@ -202,8 +202,8 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
 
     The three strip-eligible shapes (per line, after ``line.strip()``):
 
-    1. **Bullet list item** — ``^[-*+]\\s+<title>\\b``
-       (e.g. ``"- race condition: ..."``).
+    1. **Bullet list item** — ``^[-*+]\\s+<title>(?=\\s|[:.,;)!?]|$)``
+       (e.g. ``"- race condition: ..."`` or ``"- foo(): ..."``).
     2. **Title-colon prose** — ``^<title>\\s*:`` (e.g.
        ``"Missing docstring: ..."``).
     3. **Standalone title line** — ``^<title>\\s*$`` (just the title,
@@ -216,22 +216,29 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     a title in passing may carry information that has nothing to do
     with the dropped finding, so we don't touch them.
 
-    Matches each title as a whole-word token (``\\b<title>\\b``) at
-    the start position — word-boundary anchoring keeps dropped title
-    ``"race"`` from matching ``"embrace"`` even when ``"embrace"``
-    appears right after a bullet marker. Multi-word titles work
-    because ``\\b`` triggers at each space boundary.
+    Mid-word collisions (dropped title ``"race"`` vs summary word
+    ``"embrace"``) are prevented by **start-of-line anchoring + exact
+    escaped title**, not by ``\\b`` word-boundary. All three shapes
+    start with either ``^`` (line start, after ``line.strip()``) or a
+    bullet-marker prefix; that pins ``<title>`` to the beginning of a
+    meaningful position in the line, so ``"embrace"`` never aligns
+    with the escaped ``"race"`` pattern. The bullet shape's trailing
+    ``(?=\\s|[:.,;)!?]|$)`` lookahead prevents a longer title like
+    ``"race-condition-handler"`` from being partially matched by a
+    dropped ``"race"`` finding — and critically, the explicit
+    character-class trailer handles titles ending in non-word chars
+    (e.g. ``"foo()"``) that a bare ``\\b`` would silently skip.
 
     **Ultra-short titles (``len(title.strip()) < 3``) are not
     strip-eligible.** Single-letter and two-character titles like
     ``"a"``, ``"if"``, ``"or"`` would match every indefinite article
-    or conjunction in prose even with ``\\b`` anchoring — the
-    word-boundary guard isn't enough on its own. Skipping these titles
-    means the caller keeps a slightly-noisier summary (the bullet for
-    the dropped "a" finding survives), which is strictly safer than
-    shredding unrelated summary lines. A future FR with a structured
-    prompt that keeps summary and findings orthogonal would remove the
-    need for this heuristic entirely.
+    or conjunction in prose even with start-anchoring — the bullet
+    shape ``"- a ..."`` is a legitimate construction. Skipping these
+    titles means the caller keeps a slightly-noisier summary (the
+    bullet for a dropped ``"a"`` finding survives), which is strictly
+    safer than shredding unrelated summary lines. A future FR with a
+    structured prompt that keeps summary and findings orthogonal
+    would remove the need for this heuristic entirely.
     """
     if not summary or not dropped:
         return summary
@@ -241,7 +248,9 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
         if isinstance(f, dict)
     ]
     # Guard against ultra-short titles that would match common words
-    # (``"a"`` / ``"if"`` / ``"or"``) even under ``\b`` anchoring.
+    # (``"a"`` / ``"if"`` / ``"or"``) even under start-anchoring — a
+    # bullet line like ``"- a common issue"`` would otherwise have
+    # the leading ``"a "`` stripped by a dropped ``"a"`` finding.
     # 3 chars is the minimum that empirically avoids the English
     # function-word collisions we've hit; shorter titles pass through
     # untouched rather than risk shredding unrelated summary prose.
