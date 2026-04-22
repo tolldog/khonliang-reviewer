@@ -781,7 +781,8 @@ async def test_severity_floor_nit_is_no_op():
     )
 
     assert len(result["findings"]) == 2
-    assert result["usage"]["findings_filtered_count"] == 0
+    # UsageEvent.to_dict() omits findings_filtered_count when 0 (wire-shape preservation)
+    assert result["usage"].get("findings_filtered_count", 0) == 0
 
 
 async def test_severity_floor_default_no_filtering_when_unset():
@@ -797,7 +798,8 @@ async def test_severity_floor_default_no_filtering_when_unset():
     result = await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
 
     assert len(result["findings"]) == 3
-    assert result["usage"]["findings_filtered_count"] == 0
+    # UsageEvent.to_dict() omits findings_filtered_count when 0 (wire-shape preservation)
+    assert result["usage"].get("findings_filtered_count", 0) == 0
 
 
 async def test_severity_floor_invalid_value_returns_error():
@@ -940,7 +942,8 @@ async def test_severity_floor_skill_arg_wins_over_config(tmp_path):
     )
 
     assert len(result["findings"]) == 3
-    assert result["usage"]["findings_filtered_count"] == 0
+    # UsageEvent.to_dict() omits findings_filtered_count when 0 (wire-shape preservation)
+    assert result["usage"].get("findings_filtered_count", 0) == 0
 
 
 async def test_severity_floor_forwarded_through_review_diff():
@@ -1024,7 +1027,8 @@ async def test_severity_floor_empty_string_falls_through_to_default():
 
     # No filtering — default is "nit".
     assert len(result["findings"]) == 2
-    assert result["usage"]["findings_filtered_count"] == 0
+    # UsageEvent.to_dict() omits findings_filtered_count when 0 (wire-shape preservation)
+    assert result["usage"].get("findings_filtered_count", 0) == 0
 
 
 async def test_severity_floor_emitted_via_reviewer_usage_event(monkeypatch):
