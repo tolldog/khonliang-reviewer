@@ -200,18 +200,25 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
     finding pass through untouched.
 
     Matches each title as a whole-word token (``\b<title>\b``) per line
-    rather than as a bare substring. Word-boundary anchoring is what
-    keeps short / common-word titles from collaterally nuking unrelated
-    prose — a dropped title ``"race"`` must not remove a summary line
-    that just happens to contain ``"embrace"``, and ``"a"`` must not
-    match every indefinite article in sight. Multi-word titles work
-    because ``\b`` triggers at each space boundary.
+    rather than as a bare substring. Word-boundary anchoring keeps
+    dropped title ``"race"`` from collaterally nuking a line that just
+    happens to contain ``"embrace"``. Multi-word titles work because
+    ``\b`` triggers at each space boundary.
+
+    **Ultra-short titles (``len(title.strip()) < 3``) are not
+    strip-eligible.** Single-letter and two-character titles like
+    ``"a"``, ``"if"``, ``"or"`` would match every indefinite article
+    or conjunction in prose even with ``\b`` anchoring — the
+    word-boundary guard isn't enough on its own. Skipping these titles
+    means the caller keeps a slightly-noisier summary (the bullet for
+    the dropped "a" finding survives), which is strictly safer than
+    shredding unrelated summary lines. A future FR with a structured
+    prompt that keeps summary and findings orthogonal would remove the
+    need for this heuristic entirely.
 
     Doesn't touch paragraph-style mentions that aren't on their own
-    line — a future FR can tighten this with a structured prompt that
-    keeps summary and findings orthogonal. Anchoring by line prevents
-    collateral damage (dropping a paragraph that happens to contain a
-    finding title in passing).
+    line — anchoring by line prevents collateral damage (dropping a
+    paragraph that happens to contain a finding title in passing).
     """
     if not summary or not dropped:
         return summary
@@ -220,7 +227,12 @@ def _strip_dropped_from_summary(summary: str, dropped: list[dict[str, Any]]) -> 
         for f in dropped
         if isinstance(f, dict)
     ]
-    drop_titles = [t for t in drop_titles if t]
+    # Guard against ultra-short titles that would match common words
+    # (``"a"`` / ``"if"`` / ``"or"``) even under ``\b`` anchoring.
+    # 3 chars is the minimum that empirically avoids the English
+    # function-word collisions we've hit; shorter titles pass through
+    # untouched rather than risk shredding unrelated summary prose.
+    drop_titles = [t for t in drop_titles if len(t) >= 3]
     if not drop_titles:
         return summary
     # Precompile once — summaries have O(N_lines) scans and we'd

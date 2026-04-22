@@ -1183,3 +1183,46 @@ async def test_strip_dropped_from_summary_uses_word_boundary():
     assert "embrace the new pattern" in out
     # Retained finding's line stays.
     assert "real issue" in out
+
+
+async def test_strip_dropped_from_summary_skips_ultra_short_titles():
+    """Copilot round-4 finding: ``\\b<title>\\b`` still matches short words.
+
+    A dropped finding with title ``"a"`` would match every indefinite
+    article in a summary line even under word-boundary anchoring. The
+    minimum-length guard (``len(title.strip()) < 3`` → skip) prevents
+    that shredding. The line mentioning the dropped title survives —
+    strictly safer than nuking unrelated prose.
+    """
+    findings = [
+        # Title "a" gets dropped at floor=concern. Under a pure
+        # ``\ba\b`` regex this would match every bare "a" in the
+        # summary prose below.
+        ReviewFinding(severity="nit", title="a", body=""),
+        ReviewFinding(severity="concern", title="real issue", body=""),
+    ]
+    summary = (
+        "This is a well-structured change overall.\n"
+        "There is a subtle bug in the lock handling.\n"
+        "- a\n"
+        "- real issue\n"
+    )
+    fake = _RecordingProvider(
+        "ollama", _result_with_findings(findings, summary=summary)
+    )
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "severity_floor": "concern"},
+    )
+
+    out = result["summary"]
+    # Ultra-short title "a" is not strip-eligible: every line
+    # containing the word "a" must survive.
+    assert "This is a well-structured change overall." in out
+    assert "There is a subtle bug in the lock handling." in out
+    # The bullet itself stays too — safer than shredding prose.
+    assert "- a" in out
+    # The above-threshold title still strips as expected.
+    assert "real issue" in out
