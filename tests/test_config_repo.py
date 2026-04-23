@@ -20,6 +20,7 @@ from reviewer.config.repo import (
     RepoConfig,
     RepoConfigUnreachableError,
     load,
+    provider_to_vendor,
 )
 
 
@@ -543,3 +544,35 @@ def test_severity_floor_returns_none_when_value_is_not_string(git_repo: Path) ->
     sha = _commit_all(git_repo)
     config = load(git_repo, base_sha=sha)
     assert config.severity_floor is None
+
+
+# -- provider → vendor translation --------------------------------------
+
+
+def test_provider_to_vendor_maps_claude_cli_to_anthropic() -> None:
+    """``ClaudeCliProvider.name`` → ``.reviewer/models/anthropic/`` key.
+
+    Regression guard for PR #14 Copilot R3: the transport identifier
+    ``claude_cli`` diverges from the on-disk vendor-dir name
+    ``anthropic``. Without this mapping, Claude-backed reviews would
+    look under a non-existent ``claude_cli/`` subdir and silently fall
+    back to the markdown example-wrapping default, even when the repo
+    declared ``anthropic/_default.yaml: example_format: xml``.
+    """
+    assert provider_to_vendor("claude_cli") == "anthropic"
+
+
+def test_provider_to_vendor_identity_for_ollama() -> None:
+    """``ollama`` is the canonical identity case — transport == vendor dir."""
+    assert provider_to_vendor("ollama") == "ollama"
+
+
+def test_provider_to_vendor_identity_for_unknown_provider() -> None:
+    """Unknown provider names fall through identity.
+
+    Intentional: adding a new provider whose transport name already
+    matches its vendor dir (the common case) shouldn't require
+    touching this map. Only providers whose transport name diverges
+    from the upstream model family need an explicit entry.
+    """
+    assert provider_to_vendor("future-provider") == "future-provider"

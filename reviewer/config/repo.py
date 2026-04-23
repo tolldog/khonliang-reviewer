@@ -69,6 +69,7 @@ __all__ = [
     "RepoConfigUnreachableError",
     "ResolvedConfig",
     "load",
+    "provider_to_vendor",
 ]
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,38 @@ logger = logging.getLogger(__name__)
 # the override-chain merge logic, the enumerator, and the tests all
 # reference the same string.
 _VENDOR_DEFAULT_STEM = "_default"
+
+
+# Map from :attr:`ReviewProvider.name` to the upstream-vendor directory
+# name used under ``.reviewer/models/<vendor>/``. The two identifiers
+# diverge for Claude: the provider name ``"claude_cli"`` flags the
+# *transport* (subprocess around the ``claude`` CLI, per the
+# subscription-OAuth TOS constraint) while the vendor dir name
+# ``"anthropic"`` flags the *model family* that produces the output.
+# Repo configs key on model family — a repo declaring "my reviews want
+# XML-wrapped examples when the model is Anthropic" doesn't care which
+# transport the reviewer uses to call Anthropic.
+#
+# Providers not in this map fall through identity (provider.name used
+# verbatim as the vendor dir). ``ollama`` is the canonical identity
+# case — the transport runs local models and the vendor dir
+# ``ollama/`` is the natural place to key them.
+_PROVIDER_TO_VENDOR: dict[str, str] = {
+    "claude_cli": "anthropic",
+}
+
+
+def provider_to_vendor(provider_name: str) -> str:
+    """Translate :attr:`ReviewProvider.name` into the vendor-dir name.
+
+    Used by config resolvers that look up ``.reviewer/models/<vendor>/``
+    entries — those are keyed on upstream model family, not on the
+    provider-transport identifier. Identity when no explicit mapping
+    is registered, so adding a new provider whose transport identifier
+    already matches its vendor dir (the common case) requires no change
+    here.
+    """
+    return _PROVIDER_TO_VENDOR.get(provider_name, provider_name)
 
 
 class RepoConfigUnreachableError(RuntimeError):
