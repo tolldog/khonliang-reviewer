@@ -48,6 +48,7 @@ from reviewer.config.repo import (
     RepoConfig,
     RepoConfigUnreachableError,
     load as load_repo_config,
+    provider_to_vendor,
 )
 from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
@@ -793,10 +794,17 @@ class ReviewerAgent(BaseAgent):
         # ``repo_root``/``base_sha``, both helpers return ``None`` and
         # providers fall back to the built-in prompt bytes.
         repo_prompts = _load_repo_prompts_from_context(context)
+        # ``provider.name`` is the transport identifier (``ollama`` /
+        # ``claude_cli``). ``.reviewer/models/<vendor>/`` is keyed on the
+        # upstream model family (``ollama`` / ``anthropic``). Translate
+        # so a repo's ``anthropic/_default.yaml: example_format: xml``
+        # actually reaches Claude-backed reviews. Without this step the
+        # resolver looks under ``claude_cli/`` (which will never exist)
+        # and silently falls back to the markdown default.
         example_format = _resolve_example_format_from_config(
             repo_cfg,
             kind=kind,
-            vendor=provider.name,
+            vendor=provider_to_vendor(provider.name),
             model=chosen_model,
         )
         if repo_prompts is not None:

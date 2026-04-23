@@ -1754,6 +1754,65 @@ async def test_vendor_json_wrapping_from_model_config(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_vendor_xml_wrapping_resolves_claude_cli_to_anthropic(tmp_path):
+    """AC: ``claude_cli`` provider reads ``.reviewer/models/anthropic/`` configs.
+
+    Regression guard for PR #14 Copilot R3: ``ClaudeCliProvider.name``
+    is ``"claude_cli"`` (transport identifier) but ``.reviewer/`` keys
+    model configs under the upstream vendor dir name (``"anthropic"``).
+    Before the fix, the example-format resolver looked under
+    ``claude_cli/`` — which never exists — so Claude reviews silently
+    fell back to the markdown default even when a repo declared
+    ``anthropic/_default.yaml: example_format: xml``.
+
+    This test exercises the full resolver path with a provider whose
+    ``.name`` is the realistic ``claude_cli`` value (not ``anthropic``
+    as the existing prompt-assembly unit tests use). Without the
+    ``provider_to_vendor`` translation step, the XML wrapping
+    assertion fails and the fallback markdown framing shows up
+    instead.
+    """
+    sha = _seed_git_repo_with_prompts(
+        tmp_path,
+        examples={("pr_diff", "concern"): "RACE_COND_CLAUDE\n"},
+        model_yaml={"anthropic": "example_format: xml\n"},
+    )
+    # Provider reports ``name="claude_cli"`` — the transport identifier,
+    # not the vendor dir name. The harness routes backend=``claude_cli``
+    # to this provider; the agent is responsible for translating to
+    # vendor=``anthropic`` when consulting the repo config.
+    fake = _PromptCapturingProvider(name="claude_cli")
+    harness = _make_harness(
+        {"claude_cli": fake},
+        default_backend="claude_cli",
+        default_model="claude-opus-4-7",
+    )
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "context": {"repo_root": str(tmp_path), "base_sha": sha},
+            # Force claude_cli backend to pin the selector path — no
+            # rule-table-driven routing lottery inside this regression
+            # test.
+            "backend": "claude_cli",
+            "model": "claude-opus-4-7",
+        },
+    )
+
+    # The load-bearing assertions: XML framing wins (not markdown
+    # ``### concern`` + ``` fences). This is what proves the
+    # claude_cli → anthropic translation happens.
+    assert '<example severity="concern">' in fake.last_prompt
+    assert "</example>" in fake.last_prompt
+    assert "RACE_COND_CLAUDE" in fake.last_prompt
+    # Sanity — markdown fallback framing must NOT leak in.
+    assert "### concern" not in fake.last_prompt
+
+
+@pytest.mark.asyncio
 async def test_vendor_markdown_default_without_model_config(tmp_path):
     """AC: no model_yaml → markdown fence framing (tokenization-neutral default)."""
     sha = _seed_git_repo_with_prompts(
