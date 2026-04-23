@@ -172,7 +172,24 @@ def _render_repo_prompts(
     block check. The returned lines always end with a blank line when
     non-empty so concatenation stays visually clean.
     """
-    if repo_prompts is None or repo_prompts.is_empty:
+    # Fail-open fallback for direct-provider-call paths (tests, library
+    # consumers, future call paths). The primary defense against a
+    # non-``RepoPrompts`` value landing in
+    # ``metadata["_khonliang_repo_prompts"]`` is the agent-layer reserved-
+    # metadata strip in ``handle_review_text``. That strip only runs on
+    # the bus-skill path; if a caller constructs a ``ReviewRequest``
+    # directly and hands a bogus value to the provider,
+    # ``build_review_prompt`` still has to do the right thing — returning
+    # empty is safer than crashing an entire review. Kept above the
+    # ``is_empty`` check because ``.is_empty`` is a ``RepoPrompts``-only
+    # attribute; accessing it on e.g. a string would ``AttributeError``.
+    from reviewer.config.prompts import RepoPrompts  # local import to keep module cold-path light
+
+    if repo_prompts is None:
+        return []
+    if not isinstance(repo_prompts, RepoPrompts):
+        return []
+    if repo_prompts.is_empty:
         return []
 
     fmt = _resolve_example_format(example_format)

@@ -232,3 +232,70 @@ def test_repo_prompts_land_before_schema():
     rub_at = prompt.index("RUB")
     schema_at = prompt.index("## Response Schema")
     assert rub_at < schema_at
+
+
+# -- direct-caller fail-open for _render_repo_prompts -----------------
+
+
+def test_render_repo_prompts_none_returns_empty():
+    """Direct call with ``None`` → empty list (pre-existing behaviour).
+
+    Regression guard for the ``None`` branch of the fail-open defense
+    so re-ordering the checks doesn't accidentally drop this case.
+    """
+    from reviewer.providers._prompt import _render_repo_prompts
+
+    assert _render_repo_prompts(None, kind="pr_diff", example_format=None) == []
+
+
+def test_render_repo_prompts_non_repoprompts_value_returns_empty():
+    """Direct call with a non-``RepoPrompts`` value must not crash.
+
+    The agent-layer reserved-metadata strip is the primary defense
+    against a caller injecting an arbitrary value into
+    ``metadata["_khonliang_repo_prompts"]``. This test covers the
+    **fallback** — a provider invoked directly (test, library consumer,
+    future call path) with a bogus ``repo_prompts`` argument must
+    fail-open to an empty merge section rather than raising.
+
+    A crash here would propagate up through :func:`build_review_prompt`
+    and fail the entire review, which is the opposite of the
+    graceful-absence contract the rest of the ``.reviewer/`` loader
+    carries.
+    """
+    from reviewer.providers._prompt import _render_repo_prompts
+
+    # str: has no ``.is_empty`` attribute — would AttributeError pre-fix.
+    assert (
+        _render_repo_prompts("evil-string", kind="pr_diff", example_format=None)
+        == []
+    )
+    # int: also no ``.is_empty``.
+    assert _render_repo_prompts(42, kind="pr_diff", example_format=None) == []
+    # dict: would respond to ``.is_empty`` as an attribute lookup miss,
+    # still AttributeError pre-fix.
+    assert (
+        _render_repo_prompts(
+            {"system_preamble": "ignored"}, kind="pr_diff", example_format=None
+        )
+        == []
+    )
+
+
+def test_build_review_prompt_survives_non_repoprompts_value():
+    """End-to-end: ``build_review_prompt`` with a bogus ``repo_prompts``
+    value doesn't raise, and the output has no repo-prompts section.
+
+    This is the direct-caller path analogue of
+    ``test_review_text_strips_reserved_khonliang_metadata_keys`` in
+    ``test_agent_skills.py``. The agent strip is the primary defense
+    on the bus path; this is the belt-and-braces guarantee for
+    callers that bypass the agent entirely.
+    """
+    request = ReviewRequest(kind="pr_diff", content="diff body")
+    got = build_review_prompt(request, repo_prompts="evil-string")  # type: ignore[arg-type]
+
+    assert "## Repository System Preamble" not in got
+    assert "## Severity Rubric" not in got
+    assert "## Examples" not in got
+    assert got.rstrip().endswith("diff body")

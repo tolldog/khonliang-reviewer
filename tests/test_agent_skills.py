@@ -299,6 +299,99 @@ def test_strip_reserved_metadata_helper_is_pure_copy():
     assert _strip_reserved_metadata({}) == {}
 
 
+async def test_review_text_loads_repo_config_only_once(monkeypatch):
+    """``handle_review_text`` must load ``.reviewer/config.yaml`` at most
+    once per invocation.
+
+    Regression guard for Copilot R2 on PR #14: ``_resolve_repo_severity_floor``
+    and ``_resolve_example_format_from_config`` used to each call
+    :func:`load_repo_config` independently, doubling the ``git show`` +
+    YAML-parse cost. The fix threads a single pre-loaded
+    :class:`RepoConfig` through both helpers.
+
+    Spy approach: monkeypatch :func:`reviewer.agent.load_repo_config`
+    with a counter-wrapped stand-in that returns a synthetic
+    :class:`RepoConfig`. After one ``review_text`` call with
+    ``repo_root`` + ``base_sha`` hints, the counter must read exactly
+    ``1`` — not ``2`` (the pre-fix cost) and not ``0`` (the context
+    must activate the load path, else the spy never fires).
+    """
+    from reviewer import agent as agent_mod
+    from reviewer.config.repo import RepoConfig
+
+    call_count = 0
+
+    def _spy(repo_root: str, *, base_sha: str) -> RepoConfig:
+        nonlocal call_count
+        call_count += 1
+        return RepoConfig(base_sha=base_sha)
+
+    monkeypatch.setattr(agent_mod, "load_repo_config", _spy)
+
+    # Also neutralise the prompts loader so it doesn't hit git for real.
+    # That loader goes through a separate path (``load_repo_prompts``)
+    # and is NOT part of this spy — this test is about config loading
+    # only. Returning ``None`` is the graceful-absence signal the
+    # ``_load_repo_prompts_from_context`` helper already respects.
+    monkeypatch.setattr(
+        agent_mod, "_load_repo_prompts_from_context", lambda _ctx: None
+    )
+
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "context": {
+                "repo_root": "/tmp/fake-repo",
+                "base_sha": "deadbeef",
+            },
+        },
+    )
+
+    # Exactly one load per review. If the resolvers ever revert to
+    # loading independently, this will read 2.
+    assert call_count == 1, (
+        f"expected load_repo_config called exactly 1 time, got {call_count}"
+    )
+
+
+async def test_review_text_skips_repo_config_when_context_hints_absent(monkeypatch):
+    """Graceful-absence guard: without ``repo_root``/``base_sha``, the
+    config loader must not fire at all.
+
+    Regression guard for the asymmetric case: the fix consolidated the
+    load into a single helper, but that helper still has to respect
+    the "no hints → no load" contract. Otherwise every review without
+    repo hints would start paying a ``load_repo_config`` call (which
+    would immediately hit the missing-hints branch, but the call itself
+    is unnecessary work).
+    """
+    from reviewer import agent as agent_mod
+
+    call_count = 0
+
+    def _spy(*args, **kwargs):  # pragma: no cover — must not be called
+        nonlocal call_count
+        call_count += 1
+        raise AssertionError("load_repo_config must not fire without hints")
+
+    monkeypatch.setattr(agent_mod, "load_repo_config", _spy)
+
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    # No context → no hints → no load.
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x"},
+    )
+    assert call_count == 0
+
+
 # ---------------------------------------------------------------------------
 # review_text error paths
 # ---------------------------------------------------------------------------

@@ -222,23 +222,23 @@ def _load_repo_prompts_from_context(
     return prompts
 
 
-def _resolve_example_format_from_config(
+def _load_repo_config_from_context(
     context: dict[str, Any],
-    *,
-    kind: str,
-    vendor: str,
-    model: str,
-) -> str | None:
-    """Consult ``.reviewer/models/<vendor>/<model>.yaml`` for ``example_format``.
+) -> RepoConfig | None:
+    """Best-effort load of ``.reviewer/config.yaml`` from context hints.
 
-    Returns the string value verbatim when present and a string; any
-    other value (missing file, wrong type, empty) returns ``None`` so
-    the caller falls through to the markdown default inside
-    :func:`build_review_prompt`.
+    Consolidates the git-plumbing + YAML-parse path that was previously
+    duplicated inside :func:`_resolve_repo_severity_floor` and
+    :func:`_resolve_example_format_from_config`. Callers that need the
+    config for multiple resolutions (e.g. ``handle_review_text`` resolves
+    both the severity floor and the model-config example_format) should
+    invoke this helper once and thread the result into each resolver —
+    otherwise every resolver re-runs ``git show`` and re-parses the YAML.
 
-    Like :func:`_load_repo_prompts_from_context`, this is best-effort —
-    infrastructure failures log at warning and return ``None`` rather
-    than propagating. Model-config issues shouldn't block a review.
+    Returns ``None`` when the context lacks ``repo_root`` / ``base_sha``
+    hints, or when the config is unreachable / fails to load. The
+    graceful-absence contract is preserved: a config-loader failure
+    never fails the review.
     """
     repo_root = context.get("repo_root")
     base_sha = context.get("base_sha")
@@ -247,12 +247,37 @@ def _resolve_example_format_from_config(
     if not isinstance(base_sha, str) or not base_sha:
         return None
     try:
-        cfg: RepoConfig = load_repo_config(repo_root, base_sha=base_sha)
+        return load_repo_config(repo_root, base_sha=base_sha)
     except RepoConfigUnreachableError as exc:
-        logger.warning("example_format config read skipped: %s", exc)
+        logger.warning("repo config read skipped: %s", exc)
         return None
     except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("example_format config read failed: %s", exc)
+        logger.warning("repo config read failed: %s", exc)
+        return None
+
+
+def _resolve_example_format_from_config(
+    cfg: RepoConfig | None,
+    *,
+    kind: str,
+    vendor: str,
+    model: str,
+) -> str | None:
+    """Consult ``.reviewer/models/<vendor>/<model>.yaml`` for ``example_format``.
+
+    Accepts a pre-loaded :class:`RepoConfig` (or ``None`` when the
+    context didn't yield one) rather than re-loading from
+    ``repo_root``/``base_sha`` — the caller is expected to have obtained
+    the config via :func:`_load_repo_config_from_context` and pass it in
+    so the underlying ``git show`` + YAML parse happens once per
+    ``handle_review_text`` invocation.
+
+    Returns the string value verbatim when present and a string; any
+    other value (missing file, wrong type, empty) returns ``None`` so
+    the caller falls through to the markdown default inside
+    :func:`build_review_prompt`.
+    """
+    if cfg is None:
         return None
     resolved = cfg.resolve(kind=kind, vendor=vendor, model=model)
     value = resolved.get("example_format")
@@ -261,37 +286,22 @@ def _resolve_example_format_from_config(
     return None
 
 
-def _resolve_repo_severity_floor(context: dict[str, Any]) -> str | None:
+def _resolve_repo_severity_floor(cfg: RepoConfig | None) -> str | None:
     """Best-effort read of ``review.severity_floor`` from ``.reviewer/config.yaml``.
 
-    Activates only when the caller threads ``repo_root`` + ``base_sha``
-    through ``context`` — ``review_text`` as a bus skill has no local
-    filesystem assumption, so the caller (orchestrator with a local
-    clone) opts in by providing those hints. Orchestrators without a
-    local clone (``review_pr`` today) will skip this layer and fall
-    straight to the built-in default unless the caller passed
-    ``severity_floor`` on the skill args.
+    Accepts a pre-loaded :class:`RepoConfig` (or ``None``) rather than
+    re-loading from context — the caller is expected to obtain the config
+    once via :func:`_load_repo_config_from_context` and thread it into
+    both this helper and
+    :func:`_resolve_example_format_from_config`. This prevents the
+    duplicate git-plumbing + YAML-parse that would otherwise fire per
+    ``handle_review_text`` invocation.
 
-    Returns ``None`` when the layer is not applicable (hints missing,
-    config file absent, value unset). Infrastructure failures
-    (shallow clone, git error) are logged at warning and collapse to
-    ``None`` — the reviewer still runs, just without the config-layer
-    floor. The skill-arg layer is still honored because it was resolved
-    first.
+    Returns ``None`` when the layer is not applicable (config absent /
+    value unset). The skill-arg layer is still honored by the caller
+    because it's resolved first.
     """
-    repo_root = context.get("repo_root")
-    base_sha = context.get("base_sha")
-    if not isinstance(repo_root, str) or not repo_root:
-        return None
-    if not isinstance(base_sha, str) or not base_sha:
-        return None
-    try:
-        cfg: RepoConfig = load_repo_config(repo_root, base_sha=base_sha)
-    except RepoConfigUnreachableError as exc:
-        logger.warning("severity_floor config read skipped: %s", exc)
-        return None
-    except Exception as exc:  # pragma: no cover — defensive
-        logger.warning("severity_floor config read failed: %s", exc)
+    if cfg is None:
         return None
     return cfg.severity_floor
 
@@ -718,6 +728,15 @@ class ReviewerAgent(BaseAgent):
         caller_model = args.get("model") or None
         context = _as_dict(args.get("context"))
 
+        # Load ``.reviewer/config.yaml`` **once** per review. Both the
+        # severity_floor resolver and the example_format resolver
+        # consult the same file via the same git-show plumbing; loading
+        # independently would double the ``git show`` + YAML-parse cost
+        # on every review with ``repo_root``/``base_sha`` hints.
+        # ``None`` when context lacks hints OR the config is unreachable —
+        # the resolvers handle that case by falling through to defaults.
+        repo_cfg = _load_repo_config_from_context(context)
+
         # Resolve severity_floor precedence up-front so a validation
         # error surfaces before we spend a provider call. Order matches
         # the FR (skill arg → .reviewer/config.yaml → built-in default).
@@ -725,7 +744,7 @@ class ReviewerAgent(BaseAgent):
         # typo'd; the config-layer step validates because operators
         # can typo their YAML too. Default is trusted (module constant).
         try:
-            effective_floor = self._resolve_severity_floor(args, context)
+            effective_floor = self._resolve_severity_floor(args, repo_cfg)
         except SeverityFloorError as exc:
             return {"error": str(exc)}
 
@@ -775,7 +794,7 @@ class ReviewerAgent(BaseAgent):
         # providers fall back to the built-in prompt bytes.
         repo_prompts = _load_repo_prompts_from_context(context)
         example_format = _resolve_example_format_from_config(
-            context,
+            repo_cfg,
             kind=kind,
             vendor=provider.name,
             model=chosen_model,
@@ -805,7 +824,7 @@ class ReviewerAgent(BaseAgent):
         return result.to_dict()
 
     def _resolve_severity_floor(
-        self, args: dict[str, Any], context: dict[str, Any]
+        self, args: dict[str, Any], cfg: RepoConfig | None
     ) -> str:
         """Resolve the effective severity_floor per the FR precedence chain.
 
@@ -817,11 +836,12 @@ class ReviewerAgent(BaseAgent):
            message the caller can act on.
         2. ``review.severity_floor`` / ``checks.severity_floor`` in
            ``.reviewer/config.yaml`` — **lenient**. Only consulted when
-           the context supplies ``repo_root`` + ``base_sha`` hints. A bad
-           value in YAML shouldn't nuke every review for that repo — log
-           a warning naming the offending value and fall through to the
-           built-in default. Reviewing is more important than config-layer
-           correctness.
+           the caller passes a pre-loaded :class:`RepoConfig` (obtained
+           via :func:`_load_repo_config_from_context`). A bad value in
+           YAML shouldn't nuke every review for that repo — log a
+           warning naming the offending value and fall through to the
+           built-in default. Reviewing is more important than
+           config-layer correctness.
         3. :data:`_DEFAULT_SEVERITY_FLOOR` (``"nit"`` — no filtering).
 
         Rationale for asymmetric validation: the skill-arg path is a
@@ -829,12 +849,16 @@ class ReviewerAgent(BaseAgent):
         strict failure is the correct feedback channel. The config-layer
         path is a human-edited YAML file on a repo; a typo there
         shouldn't silently wedge CI.
+
+        Note: ``cfg`` is threaded in (rather than re-loaded here) so that
+        ``handle_review_text`` loads the config exactly once per review
+        and shares it with :func:`_resolve_example_format_from_config`.
         """
         arg_value = args.get("severity_floor")
         if isinstance(arg_value, str) and arg_value:
             return _validate_severity_floor(arg_value, source="skill arg")
 
-        config_value = _resolve_repo_severity_floor(context)
+        config_value = _resolve_repo_severity_floor(cfg)
         if isinstance(config_value, str) and config_value:
             try:
                 return _validate_severity_floor(
