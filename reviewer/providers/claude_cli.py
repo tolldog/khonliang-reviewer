@@ -125,7 +125,18 @@ class ClaudeCliProvider(ReviewProvider):
             )
 
     async def review(self, request: ReviewRequest) -> ReviewResult:
-        prompt = build_review_prompt(request, include_schema=False)
+        # ``_khonliang_repo_prompts`` / ``_khonliang_example_format`` are
+        # in-process-only passthrough metadata (see reviewer.agent).
+        # Absent keys or wrong types collapse to the pre-FR behavior —
+        # a plain built-in prompt with no repo-side merge.
+        repo_prompts = request.metadata.get("_khonliang_repo_prompts")
+        example_format = request.metadata.get("_khonliang_example_format")
+        prompt = build_review_prompt(
+            request,
+            include_schema=False,
+            repo_prompts=repo_prompts,
+            example_format=example_format if isinstance(example_format, str) else None,
+        )
         started_wall = time.time()
         started_mono = time.monotonic()
 

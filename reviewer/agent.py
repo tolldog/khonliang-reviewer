@@ -40,6 +40,10 @@ from khonliang_reviewer import (
     severity_rank,
 )
 
+from reviewer.config.prompts import (
+    RepoPrompts,
+    load_repo_prompts,
+)
 from reviewer.config.repo import (
     RepoConfig,
     RepoConfigUnreachableError,
@@ -96,6 +100,26 @@ _VALID_REVIEW_EVENTS = frozenset({"COMMENT", "REQUEST_CHANGES", "PENDING"})
 _DEFAULT_SEVERITY_FLOOR = "nit"
 
 
+#: In-process-only passthrough keys on :attr:`ReviewRequest.metadata`.
+#:
+#: ``_khonliang_repo_prompts`` carries a :class:`RepoPrompts` snapshot
+#: into providers so they can merge repo-side calibration material into
+#: the LLM prompt. ``_khonliang_example_format`` carries the active
+#: model config's ``example_format`` string (``xml`` | ``json`` |
+#: ``markdown``) so the wrapping layer knows which vendor framing to
+#: use for example blocks.
+#:
+#: Underscore-prefixed convention signals to anything reading metadata
+#: naively (GitHub logs, serializers, bus event consumers) that these
+#: keys are implementation detail — skip them if you don't know what
+#: they mean. The usage event construction in both providers reads
+#: specific named fields (``repo``, ``pr_number``), not the whole
+#: metadata dict, so these non-JSON-serializable values never leave
+#: the in-process path.
+_METADATA_REPO_PROMPTS_KEY = "_khonliang_repo_prompts"
+_METADATA_EXAMPLE_FORMAT_KEY = "_khonliang_example_format"
+
+
 class SeverityFloorError(ValueError):
     """Raised when a caller-supplied ``severity_floor`` isn't a known value.
 
@@ -120,6 +144,86 @@ def _validate_severity_floor(value: str, *, source: str) -> str:
             f"expected one of {list(SEVERITY_ORDER)}"
         )
     return value
+
+
+def _load_repo_prompts_from_context(
+    context: dict[str, Any],
+) -> RepoPrompts | None:
+    """Best-effort load of ``.reviewer/prompts/`` from context hints.
+
+    Symmetric with :func:`_resolve_repo_severity_floor`: activates only
+    when the caller threads ``repo_root`` + ``base_sha`` through
+    ``context``. Orchestrators without a local clone (``review_pr``
+    today, which fetches via the GitHub API) skip this layer and the
+    review falls back to the built-in prompt only.
+
+    Returns ``None`` — not an empty :class:`RepoPrompts` — when the
+    layer is not applicable. Infrastructure failures (shallow clone,
+    git subsystem error) log at warning and collapse to ``None``; the
+    reviewer still runs, just without the repo-side prompt additions.
+    A hard failure here would defeat the point of the whole graceful-
+    absence contract that the rest of the ``.reviewer/`` loader
+    carries.
+    """
+    repo_root = context.get("repo_root")
+    base_sha = context.get("base_sha")
+    if not isinstance(repo_root, str) or not repo_root:
+        return None
+    if not isinstance(base_sha, str) or not base_sha:
+        return None
+    try:
+        prompts: RepoPrompts = load_repo_prompts(repo_root, base_sha=base_sha)
+    except RepoConfigUnreachableError as exc:
+        logger.warning("repo prompts load skipped: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("repo prompts load failed: %s", exc)
+        return None
+    if prompts.is_empty:
+        # Normalise "tree present but empty" to "tree absent" so
+        # downstream code has one signal for "nothing to merge" —
+        # avoids branching on ``.is_empty`` at every call site.
+        return None
+    return prompts
+
+
+def _resolve_example_format_from_config(
+    context: dict[str, Any],
+    *,
+    kind: str,
+    vendor: str,
+    model: str,
+) -> str | None:
+    """Consult ``.reviewer/models/<vendor>/<model>.yaml`` for ``example_format``.
+
+    Returns the string value verbatim when present and a string; any
+    other value (missing file, wrong type, empty) returns ``None`` so
+    the caller falls through to the markdown default inside
+    :func:`build_review_prompt`.
+
+    Like :func:`_load_repo_prompts_from_context`, this is best-effort —
+    infrastructure failures log at warning and return ``None`` rather
+    than propagating. Model-config issues shouldn't block a review.
+    """
+    repo_root = context.get("repo_root")
+    base_sha = context.get("base_sha")
+    if not isinstance(repo_root, str) or not repo_root:
+        return None
+    if not isinstance(base_sha, str) or not base_sha:
+        return None
+    try:
+        cfg: RepoConfig = load_repo_config(repo_root, base_sha=base_sha)
+    except RepoConfigUnreachableError as exc:
+        logger.warning("example_format config read skipped: %s", exc)
+        return None
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("example_format config read failed: %s", exc)
+        return None
+    resolved = cfg.resolve(kind=kind, vendor=vendor, model=model)
+    value = resolved.get("example_format")
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _resolve_repo_severity_floor(context: dict[str, Any]) -> str | None:
@@ -617,6 +721,25 @@ class ReviewerAgent(BaseAgent):
         )
 
         metadata = {**_as_dict(args.get("metadata")), "model": chosen_model}
+
+        # Repo-side prompt merge (FR fr_reviewer_92453047). Loaded here
+        # rather than inside the provider so both Ollama and Claude-CLI
+        # providers get the same merge behavior without re-implementing
+        # the git-show plumbing. Graceful-absence: when context lacks
+        # ``repo_root``/``base_sha``, both helpers return ``None`` and
+        # providers fall back to the built-in prompt bytes.
+        repo_prompts = _load_repo_prompts_from_context(context)
+        example_format = _resolve_example_format_from_config(
+            context,
+            kind=kind,
+            vendor=provider.name,
+            model=chosen_model,
+        )
+        if repo_prompts is not None:
+            metadata[_METADATA_REPO_PROMPTS_KEY] = repo_prompts
+        if example_format is not None:
+            metadata[_METADATA_EXAMPLE_FORMAT_KEY] = example_format
+
         request = ReviewRequest(
             kind=kind,
             content=content,
