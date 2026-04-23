@@ -119,6 +119,41 @@ _DEFAULT_SEVERITY_FLOOR = "nit"
 _METADATA_REPO_PROMPTS_KEY = "_khonliang_repo_prompts"
 _METADATA_EXAMPLE_FORMAT_KEY = "_khonliang_example_format"
 
+#: Reserved prefix for internal-only passthrough keys on
+#: :attr:`ReviewRequest.metadata`. Every key carrying values the agent
+#: itself injects (see ``_METADATA_*`` constants above) starts with this
+#: prefix. Callers MUST NOT supply keys with this prefix via
+#: ``args["metadata"]`` — :func:`_strip_reserved_metadata` scrubs any
+#: that slip in before the caller dict is merged into the request. The
+#: scrub is the single, authoritative defense: downstream providers and
+#: prompt-assembly code can then trust that when a reserved key is
+#: present the agent put it there, and can use the expected type
+#: without redundant ``isinstance`` checks on a trust boundary the
+#: agent already enforces.
+_RESERVED_METADATA_PREFIX = "_khonliang_"
+
+
+def _strip_reserved_metadata(user_metadata: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``user_metadata`` with reserved keys removed.
+
+    Keys starting with :data:`_RESERVED_METADATA_PREFIX` are reserved
+    for internal agent-side passthrough (repo-prompts snapshots,
+    example-format hints). Accepting them from caller-supplied metadata
+    would let an untrusted caller inject values into prompt-assembly
+    code paths that expect specific in-process Python types — e.g.
+    a :class:`RepoPrompts` instance the agent just built from a git-
+    show read. Stripping before merge keeps the boundary simple: by
+    the time the request reaches a provider, any reserved key it sees
+    was put there by the agent itself.
+    """
+    if not user_metadata:
+        return {}
+    return {
+        key: value
+        for key, value in user_metadata.items()
+        if not (isinstance(key, str) and key.startswith(_RESERVED_METADATA_PREFIX))
+    }
+
 
 class SeverityFloorError(ValueError):
     """Raised when a caller-supplied ``severity_floor`` isn't a known value.
@@ -720,7 +755,17 @@ class ReviewerAgent(BaseAgent):
             kind,
         )
 
-        metadata = {**_as_dict(args.get("metadata")), "model": chosen_model}
+        # Strip any ``_khonliang_*`` keys from caller-supplied metadata
+        # before merge — those are reserved for in-process passthrough
+        # from the agent to the provider (see ``_RESERVED_METADATA_PREFIX``).
+        # A caller cannot be allowed to inject a value for e.g.
+        # ``_khonliang_repo_prompts``: providers forward it into
+        # :func:`build_review_prompt` expecting a :class:`RepoPrompts`
+        # instance the agent just loaded from a trusted base SHA.
+        metadata = {
+            **_strip_reserved_metadata(_as_dict(args.get("metadata"))),
+            "model": chosen_model,
+        }
 
         # Repo-side prompt merge (FR fr_reviewer_92453047). Loaded here
         # rather than inside the provider so both Ollama and Claude-CLI

@@ -229,6 +229,76 @@ async def test_review_text_merges_caller_metadata_with_model():
     assert fake.last_request.metadata["model"] == "qwen3.5"
 
 
+async def test_review_text_strips_reserved_khonliang_metadata_keys():
+    """Caller-supplied ``_khonliang_*`` keys are reserved and must be
+    stripped before the provider ever sees the request.
+
+    Regression guard for the Copilot concern on PR #14: a caller that
+    injects ``metadata={"_khonliang_repo_prompts": "evil"}`` must NOT
+    be able to poison the prompt-assembly path. Providers forward
+    ``_khonliang_repo_prompts`` into :func:`build_review_prompt`
+    expecting a :class:`RepoPrompts` instance; the agent guarantees
+    that invariant by stripping the prefix at the merge site.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "metadata": {
+                "repo": "tolldog/x",
+                "_khonliang_repo_prompts": "evil",
+                "_khonliang_example_format": {"not": "a string"},
+                "_khonliang_future_key": [1, 2, 3],
+            },
+        },
+    )
+
+    assert fake.last_request is not None
+    md = fake.last_request.metadata
+    # legitimate caller key preserved
+    assert md["repo"] == "tolldog/x"
+    # rule-table-chosen model still injected
+    assert md["model"] == "qwen3.5"
+    # reserved-prefix keys scrubbed — none of them should survive
+    assert "_khonliang_repo_prompts" not in md
+    assert "_khonliang_example_format" not in md
+    assert "_khonliang_future_key" not in md
+
+
+def test_strip_reserved_metadata_helper_is_pure_copy():
+    """The strip helper must not mutate its input and must drop every
+    ``_khonliang_*`` key regardless of value type.
+    """
+    from reviewer.agent import _strip_reserved_metadata
+
+    original = {
+        "repo": "tolldog/x",
+        "pr_number": 7,
+        "_khonliang_repo_prompts": object(),
+        "_khonliang_example_format": None,
+        "_khonliang_anything": {"nested": True},
+    }
+    snapshot = dict(original)
+
+    out = _strip_reserved_metadata(original)
+
+    # input untouched — the strip returns a copy
+    assert original == snapshot
+    # reserved keys dropped
+    assert "_khonliang_repo_prompts" not in out
+    assert "_khonliang_example_format" not in out
+    assert "_khonliang_anything" not in out
+    # non-reserved keys preserved, values identical
+    assert out["repo"] == "tolldog/x"
+    assert out["pr_number"] == 7
+    # empty input is a no-op
+    assert _strip_reserved_metadata({}) == {}
+
+
 # ---------------------------------------------------------------------------
 # review_text error paths
 # ---------------------------------------------------------------------------

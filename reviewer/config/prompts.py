@@ -29,16 +29,20 @@ gets exactly that, no warnings.
 Parse errors
 ------------
 Malformed inputs (a ``git show`` failure on a file that ``ls-tree``
-reports, non-string content at the read boundary) log at debug and drop
-just the one file. The rest of the load proceeds. Matching the
+reports, non-string content at the read boundary) silently drop just
+the one file — :func:`reviewer.config.repo._git_show_text` returns
+``None`` on a non-zero ``git show`` exit, and :func:`_read_optional`
+passes that through. The rest of the load proceeds. Matching the
 graceful-absence policy of :mod:`reviewer.config.repo`: operator typos
-shouldn't block an entire review run.
+shouldn't block an entire review run, and a warning every review for
+a missing file would just flood the log.
 
 Assembly order
 --------------
 The loader does **not** assemble the final prompt here — it returns the
-raw pieces in a :class:`RepoPrompts` dataclass. The agent-side merge
-(see ``_assemble_repo_prompts`` in :mod:`reviewer.providers._prompt`)
+raw pieces in a :class:`RepoPrompts` dataclass. The prompt-assembly
+layer (see :func:`reviewer.providers._prompt.build_review_prompt` and
+its helper :func:`reviewer.providers._prompt._render_repo_prompts`)
 does the actual ordering:
 
     built-in reviewer system prompt
@@ -94,6 +98,17 @@ class RepoPrompts:
     dict for examples). Consumers differentiate "no repo prompts at all"
     from "repo prompts present but this specific file is missing" only
     when they care to — both degrade gracefully.
+
+    Trust boundary
+    --------------
+    Instances of this class travel from the agent into providers via
+    :attr:`ReviewRequest.metadata` under the reserved
+    ``_khonliang_repo_prompts`` key. The agent strips any
+    ``_khonliang_*`` keys from caller-supplied metadata before merge
+    (see :func:`reviewer.agent._strip_reserved_metadata`), so a
+    provider that finds this key on a request can trust it's a
+    ``RepoPrompts`` instance the agent built from a ``git show`` read
+    against the configured base SHA — not caller-controlled bytes.
     """
 
     #: Contents of ``.reviewer/prompts/system_preamble.md``, or ``None``
