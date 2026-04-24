@@ -1,7 +1,7 @@
 """Ollama review provider via the OpenAI-compatible endpoint.
 
 Hits Ollama's ``/v1/chat/completions`` endpoint with the ``openai`` SDK
-so any Ollama-served model — local (``qwen3.5``, ``glm-4.7-flash``) or
+so any Ollama-served model — local (``qwen2.5-coder:14b``, ``glm-4.7-flash``) or
 cloud (``kimi-k2.5:cloud``, ``glm-5:cloud``) — can drive a review from
 the same provider. Model choice is per-request via
 ``request.metadata["model"]`` with a config-level fallback.
@@ -66,7 +66,7 @@ class OllamaProviderConfig:
     #: something. Use a descriptive placeholder so leaked logs are
     #: obviously-local, not mistaken for a real key.
     api_key: str = "ollama"
-    default_model: str = "qwen3.5"
+    default_model: str = "qwen2.5-coder:14b"
     timeout_seconds: float = 300.0
 
 

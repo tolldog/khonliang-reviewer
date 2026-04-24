@@ -11,7 +11,7 @@ bus_url: http://localhost:8787
 # Rule-table-driven selection lands in a later work unit; until then this
 # value is what the placeholder skill falls back to.
 default_provider: ollama
-default_model: qwen3.5
+default_model: qwen2.5-coder:14b
 
 # Provider-specific configuration. Each provider is implemented in a later
 # work unit; the keys below are placeholders documenting the eventual shape.

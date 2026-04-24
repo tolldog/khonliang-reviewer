@@ -149,4 +149,4 @@ async def test_profile_flows_into_policy_input():
     )
     # small diff + profile present → fallback still applies
     assert decision.backend == "ollama"
-    assert decision.model == "qwen3.5"
+    assert decision.model == "qwen2.5-coder:14b"

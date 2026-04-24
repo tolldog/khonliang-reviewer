@@ -28,7 +28,7 @@ SUCCESS_RESPONSE: dict[str, Any] = {
     "id": "chatcmpl-1",
     "object": "chat.completion",
     "created": 1776660000,
-    "model": "qwen3.5",
+    "model": "qwen2.5-coder:14b",
     "choices": [
         {
             "index": 0,
@@ -91,7 +91,7 @@ class _FakeModelsList:
         self.called += 1
         if self._raises is not None:
             raise self._raises
-        return {"data": [{"id": "qwen3.5"}]}
+        return {"data": [{"id": "qwen2.5-coder:14b"}]}
 
 
 def _make_client(
@@ -151,7 +151,7 @@ async def test_success_response_produces_posted_review():
 
     assert result.disposition == "posted"
     assert result.backend == "ollama"
-    assert result.model == "qwen3.5"
+    assert result.model == "qwen2.5-coder:14b"
     assert result.summary == "Ollama review summary."
     assert len(result.findings) == 1
     assert result.findings[0].severity == "concern"
@@ -173,7 +173,7 @@ async def test_prompt_passed_in_messages_and_includes_schema():
 
     call = client._create.last_call
     assert call is not None
-    assert call["model"] == "qwen3.5"
+    assert call["model"] == "qwen2.5-coder:14b"
     assert call["response_format"] == {"type": "json_object"}
     messages = call["messages"]
     assert len(messages) == 1
@@ -218,7 +218,7 @@ async def test_attribute_style_response_supported():
     response = SimpleNamespace(
         choices=[choice],
         usage=usage,
-        model="qwen3.5",
+        model="qwen2.5-coder:14b",
     )
     client = _make_client(response=response)
 
