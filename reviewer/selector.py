@@ -30,7 +30,7 @@ class SelectorConfig:
     """Defaults used when no caller override is present."""
 
     default_backend: str = "ollama"
-    default_model: str = "qwen3.5"
+    default_model: str = "qwen2.5-coder:14b"
 
 
 class ProviderSelector:

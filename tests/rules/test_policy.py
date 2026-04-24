@@ -24,7 +24,7 @@ def test_empty_input_hits_fallback():
     decision = decide(PolicyInput())
     assert decision == DEFAULT_FALLBACK
     assert decision.backend == "ollama"
-    assert decision.model == "qwen3.5"
+    assert decision.model == "qwen2.5-coder:14b"
 
 
 def test_small_code_diff_hits_fallback():
@@ -36,7 +36,7 @@ def test_docs_kind_routes_to_qwen_small():
     for kind in ("spec", "doc", "fr", "pr_description"):
         decision = decide(PolicyInput(kind=kind, diff_line_count=20))
         assert decision.backend == "ollama"
-        assert decision.model == "qwen3.5"
+        assert decision.model == "qwen2.5-coder:14b"
         assert decision.context_window_floor == CTX_SMALL
         assert "text-kind" in decision.reason
 

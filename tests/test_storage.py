@@ -14,7 +14,7 @@ def _open_store() -> UsageStore:
 def _event(
     *,
     backend: str = "ollama",
-    model: str = "qwen3.5",
+    model: str = "qwen2.5-coder:14b",
     input_tokens: int = 100,
     output_tokens: int = 50,
     cache_read_tokens: int = 0,
@@ -103,7 +103,7 @@ def test_write_usage_round_trips_via_summary():
     assert len(summaries) == 1
     s = summaries[0]
     assert s.backend == "ollama"
-    assert s.model == "qwen3.5"
+    assert s.model == "qwen2.5-coder:14b"
     assert s.rows == 2
     assert s.input_tokens == 300
     assert s.output_tokens == 80
@@ -111,13 +111,13 @@ def test_write_usage_round_trips_via_summary():
 
 def test_summarize_groups_by_backend_model():
     store = _open_store()
-    store.write_usage(_event(backend="ollama", model="qwen3.5"))
+    store.write_usage(_event(backend="ollama", model="qwen2.5-coder:14b"))
     store.write_usage(_event(backend="claude_cli", model="claude-opus-4-7"))
     store.write_usage(_event(backend="claude_cli", model="claude-opus-4-7"))
 
     summaries = store.summarize()
     by_key = {(s.backend, s.model): s for s in summaries}
-    assert by_key[("ollama", "qwen3.5")].rows == 1
+    assert by_key[("ollama", "qwen2.5-coder:14b")].rows == 1
     assert by_key[("claude_cli", "claude-opus-4-7")].rows == 2
 
 
@@ -133,7 +133,7 @@ def test_summarize_filters_by_backend():
 
 def test_summarize_filters_by_model():
     store = _open_store()
-    store.write_usage(_event(model="qwen3.5"))
+    store.write_usage(_event(model="qwen2.5-coder:14b"))
     store.write_usage(_event(model="kimi-k2.5:cloud"))
 
     summaries = store.summarize(model="kimi-k2.5:cloud")
@@ -193,22 +193,22 @@ def test_put_pricing_upserts_on_conflict():
     store = _open_store()
     store.put_pricing(
         ModelPricing(
-            backend="ollama", model="qwen3.5", input_per_mtoken_usd=1.0
+            backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=1.0
         )
     )
     store.put_pricing(
         ModelPricing(
-            backend="ollama", model="qwen3.5", input_per_mtoken_usd=2.0
+            backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=2.0
         )
     )
     assert store.pricing_count() == 1
-    assert store.get_pricing("ollama", "qwen3.5").input_per_mtoken_usd == 2.0
+    assert store.get_pricing("ollama", "qwen2.5-coder:14b").input_per_mtoken_usd == 2.0
 
 
 def test_seed_pricing_if_empty_populates_on_empty():
     store = _open_store()
     entries = [
-        ModelPricing(backend="ollama", model="qwen3.5"),
+        ModelPricing(backend="ollama", model="qwen2.5-coder:14b"),
         ModelPricing(backend="claude_cli", model="claude-opus-4-7"),
     ]
     inserted = store.seed_pricing_if_empty(entries)
@@ -225,8 +225,8 @@ def test_seed_pricing_dedups_entries_before_insert():
     """
     store = _open_store()
     entries = [
-        ModelPricing(backend="ollama", model="qwen3.5", input_per_mtoken_usd=1.0),
-        ModelPricing(backend="ollama", model="qwen3.5", input_per_mtoken_usd=2.0),
+        ModelPricing(backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=1.0),
+        ModelPricing(backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=2.0),
         ModelPricing(backend="claude_cli", model="claude-opus-4-7"),
     ]
     inserted = store.seed_pricing_if_empty(entries)
@@ -235,7 +235,7 @@ def test_seed_pricing_dedups_entries_before_insert():
     assert store.pricing_count() == 2
     # last-wins resolution for the duplicate
     assert (
-        store.get_pricing("ollama", "qwen3.5").input_per_mtoken_usd == 2.0
+        store.get_pricing("ollama", "qwen2.5-coder:14b").input_per_mtoken_usd == 2.0
     )
 
 
@@ -244,15 +244,15 @@ def test_seed_pricing_if_empty_is_idempotent_once_populated():
     store = _open_store()
     store.put_pricing(
         ModelPricing(
-            backend="ollama", model="qwen3.5", input_per_mtoken_usd=99.0
+            backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=99.0
         )
     )
     # Pretend we restart: re-seed with different defaults
     inserted = store.seed_pricing_if_empty(
-        [ModelPricing(backend="ollama", model="qwen3.5", input_per_mtoken_usd=1.0)]
+        [ModelPricing(backend="ollama", model="qwen2.5-coder:14b", input_per_mtoken_usd=1.0)]
     )
     assert inserted == 0
-    assert store.get_pricing("ollama", "qwen3.5").input_per_mtoken_usd == 99.0
+    assert store.get_pricing("ollama", "qwen2.5-coder:14b").input_per_mtoken_usd == 99.0
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +316,7 @@ def test_back_fill_cost_preserves_other_fields():
     store.put_pricing(
         ModelPricing(
             backend="ollama",
-            model="qwen3.5",
+            model="qwen2.5-coder:14b",
             input_per_mtoken_usd=1.0,
             output_per_mtoken_usd=1.0,
         )

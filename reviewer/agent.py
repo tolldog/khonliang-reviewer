@@ -1208,7 +1208,7 @@ class ReviewerAgent(BaseAgent):
                     base_url=str(
                         ollama_cfg.get("base_url") or "http://localhost:11434/v1"
                     ),
-                    default_model=str(config.get("default_model") or "qwen3.5"),
+                    default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
                 )
             ),
         }
@@ -1216,7 +1216,7 @@ class ReviewerAgent(BaseAgent):
             providers,
             SelectorConfig(
                 default_backend=str(config.get("default_provider") or "ollama"),
-                default_model=str(config.get("default_model") or "qwen3.5"),
+                default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
             ),
         )
 

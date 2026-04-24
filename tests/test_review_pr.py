@@ -261,11 +261,11 @@ def _make_result(
         findings=findings or [],
         disposition="posted",
         backend="ollama",
-        model="qwen3.5",
+        model="qwen2.5-coder:14b",
         usage=UsageEvent(
             timestamp=1.0,
             backend="ollama",
-            model="qwen3.5",
+            model="qwen2.5-coder:14b",
             input_tokens=50,
             output_tokens=20,
         ),
@@ -338,7 +338,7 @@ def _make_harness(
 ) -> AgentTestHarness:
     selector = ProviderSelector(
         {"ollama": provider},
-        SelectorConfig(default_backend="ollama", default_model="qwen3.5"),
+        SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
     )
     return AgentTestHarness(
         ReviewerAgent,

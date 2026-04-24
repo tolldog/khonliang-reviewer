@@ -91,7 +91,7 @@ selection resolves in this order:
 The `model` argument is honored on both backends:
 
 - **Ollama** uses `model` directly in the `chat.completions.create`
-  call (any Ollama-served model id — `qwen3.5`, `kimi-k2.5:cloud`, etc.).
+  call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).

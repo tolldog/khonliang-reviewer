@@ -68,18 +68,18 @@ def _make_harness(
     providers: dict[str, ReviewProvider] | None = None,
     *,
     default_backend: str = "ollama",
-    default_model: str = "qwen3.5",
+    default_model: str = "qwen2.5-coder:14b",
 ) -> AgentTestHarness:
     """Build an AgentTestHarness with an injected :class:`ProviderSelector`.
 
     The default provider map registers a single fake under ``"ollama"``
-    so the rule table's default fallback (``ollama`` / ``qwen3.5``)
+    so the rule table's default fallback (``ollama`` / ``qwen2.5-coder:14b``)
     resolves cleanly in tests that don't care about provider identity.
     Tests that want multiple providers pass their own map; tests that
     want caller-override pass ``backend=...`` explicitly.
     """
     if providers is None:
-        providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))}
+        providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))}
     selector = ProviderSelector(
         providers,
         SelectorConfig(
@@ -121,8 +121,8 @@ def test_skills_parameters_match_public_contract():
 
 
 async def test_review_text_routes_to_rule_table_default_backend():
-    """Small content + pr_diff → rule table picks ollama/qwen3.5 (fallback)."""
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    """Small content + pr_diff → rule table picks ollama/qwen2.5-coder:14b (fallback)."""
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
 
     result = await harness.call(
@@ -135,7 +135,7 @@ async def test_review_text_routes_to_rule_table_default_backend():
     assert fake.last_request is not None
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
-    assert fake.last_request.metadata["model"] == "qwen3.5"
+    assert fake.last_request.metadata["model"] == "qwen2.5-coder:14b"
 
 
 async def test_review_text_caller_backend_override_picks_specific_provider():
@@ -226,7 +226,7 @@ async def test_review_text_merges_caller_metadata_with_model():
     assert fake.last_request.metadata["repo"] == "tolldog/x"
     assert fake.last_request.metadata["pr_number"] == 7
     # rule-table-chosen model injected alongside
-    assert fake.last_request.metadata["model"] == "qwen3.5"
+    assert fake.last_request.metadata["model"] == "qwen2.5-coder:14b"
 
 
 async def test_review_text_strips_reserved_khonliang_metadata_keys():
@@ -262,7 +262,7 @@ async def test_review_text_strips_reserved_khonliang_metadata_keys():
     # legitimate caller key preserved
     assert md["repo"] == "tolldog/x"
     # rule-table-chosen model still injected
-    assert md["model"] == "qwen3.5"
+    assert md["model"] == "qwen2.5-coder:14b"
     # reserved-prefix keys scrubbed — none of them should survive
     assert "_khonliang_repo_prompts" not in md
     assert "_khonliang_example_format" not in md
@@ -488,7 +488,7 @@ async def test_review_diff_diff_not_string_returns_error():
 
 
 async def test_rule_table_routes_docs_kind_to_ollama():
-    """A spec / doc / fr review (no override) → ollama + qwen3.5 per rule table."""
+    """A spec / doc / fr review (no override) → ollama + qwen2.5-coder:14b per rule table."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
     claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
     harness = _make_harness({"ollama": ollama, "claude_cli": claude})
@@ -500,7 +500,7 @@ async def test_rule_table_routes_docs_kind_to_ollama():
 
     assert ollama.last_request is not None
     assert claude.last_request is None
-    assert ollama.last_request.metadata["model"] == "qwen3.5"
+    assert ollama.last_request.metadata["model"] == "qwen2.5-coder:14b"
 
 
 async def test_rule_table_routes_large_diff_to_claude():
@@ -543,7 +543,7 @@ async def test_caller_override_bypasses_rule_table():
     big_diff = "diff --git a/f b/f\n" + ("+line\n" * 3000)
     await harness.call(
         "review_diff",
-        {"diff": big_diff, "backend": "ollama", "model": "qwen3.5"},
+        {"diff": big_diff, "backend": "ollama", "model": "qwen2.5-coder:14b"},
     )
 
     assert ollama.last_request is not None
@@ -578,7 +578,7 @@ async def test_context_diff_size_overrides_content_estimate():
 
 
 async def test_review_writes_usage_row_to_store():
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
     store = harness.agent._injected_store
     assert store is not None
@@ -589,13 +589,13 @@ async def test_review_writes_usage_row_to_store():
     assert len(summaries) == 1
     assert summaries[0].rows == 1
     assert summaries[0].backend == "ollama"
-    assert summaries[0].model == "qwen3.5"
+    assert summaries[0].model == "qwen2.5-coder:14b"
     assert summaries[0].input_tokens == 10
     assert summaries[0].output_tokens == 5
 
 
 async def test_review_emits_reviewer_usage_event(monkeypatch):
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
 
     published: list[tuple[str, dict]] = []
@@ -634,14 +634,14 @@ async def test_review_backfills_cost_from_model_pricing():
     """Ollama reviews (cost=0 from provider) get cost filled from pricing table."""
     from khonliang_reviewer import ModelPricing
 
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
     store = harness.agent._injected_store
     assert store is not None
     store.put_pricing(
         ModelPricing(
             backend="ollama",
-            model="qwen3.5",
+            model="qwen2.5-coder:14b",
             input_per_mtoken_usd=1_000_000.0,  # dramatic rate so math is obvious
             output_per_mtoken_usd=2_000_000.0,
         )
@@ -702,7 +702,7 @@ async def test_review_preserves_provider_cost_when_nonzero():
 
 
 async def test_usage_summary_aggregates_after_multiple_reviews():
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
 
     for _ in range(3):
@@ -713,7 +713,7 @@ async def test_usage_summary_aggregates_after_multiple_reviews():
     assert len(result["entries"]) == 1
     entry = result["entries"][0]
     assert entry["backend"] == "ollama"
-    assert entry["model"] == "qwen3.5"
+    assert entry["model"] == "qwen2.5-coder:14b"
     assert entry["rows"] == 3
     # 3 reviews * 10 input tokens each = 30
     assert entry["input_tokens"] == 30
@@ -764,7 +764,7 @@ async def test_usage_summary_returns_structured_error_on_store_failure(monkeypat
 
 async def test_review_preserves_success_when_usage_store_broken(monkeypatch):
     """A broken store must NOT cause the caller's review to appear failed."""
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
 
     def boom() -> None:
@@ -781,7 +781,7 @@ async def test_review_preserves_success_when_usage_store_broken(monkeypatch):
 
 async def test_review_preserves_success_when_back_fill_raises(monkeypatch):
     """back_fill_cost() errors must be swallowed like write_usage errors."""
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
     store = harness.agent._injected_store
     assert store is not None
@@ -798,7 +798,7 @@ async def test_review_preserves_success_when_back_fill_raises(monkeypatch):
 
 async def test_usage_summary_since_zero_treated_as_no_filter():
     """Omitting since/until (default=0) must not filter to an empty window."""
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen3.5"))
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
     harness = _make_harness({"ollama": fake})
 
     await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
@@ -822,7 +822,7 @@ def test_default_selector_constructs_both_providers_from_empty_config(tmp_path):
     selector = agent._ensure_selector()
     assert set(selector.providers) == {"claude_cli", "ollama"}
     assert selector.config.default_backend == "ollama"
-    assert selector.config.default_model == "qwen3.5"
+    assert selector.config.default_model == "qwen2.5-coder:14b"
 
 
 def test_default_selector_honors_config_yaml(tmp_path):
@@ -862,11 +862,11 @@ def _result_with_findings(findings: list[ReviewFinding], *, summary: str = "ok")
         findings=findings,
         disposition="posted",
         backend="ollama",
-        model="qwen3.5",
+        model="qwen2.5-coder:14b",
         usage=UsageEvent(
             timestamp=1.0,
             backend="ollama",
-            model="qwen3.5",
+            model="qwen2.5-coder:14b",
             input_tokens=10,
             output_tokens=5,
         ),
@@ -1593,7 +1593,7 @@ class _PromptCapturingProvider(ReviewProvider):
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
         )
-        return _make_result(backend=self.name, model="qwen3.5")
+        return _make_result(backend=self.name, model="qwen2.5-coder:14b")
 
 
 @pytest.mark.asyncio

@@ -130,9 +130,9 @@ DEFAULT_RULES: list[Rule] = [
         predicate=_docs_kind,
         decision=PolicyDecision(
             backend="ollama",
-            model="qwen3.5",
+            model="qwen2.5-coder:14b",
             context_window_floor=CTX_SMALL,
-            reason="text-kind review (spec/doc/fr/pr_description) — qwen3.5 suffices",
+            reason="text-kind review (spec/doc/fr/pr_description) — qwen2.5-coder:14b suffices",
         ),
     ),
 ]
@@ -142,9 +142,9 @@ DEFAULT_RULES: list[Rule] = [
 #: option. Matches the Ollama Copilot-CLI doc's recommended default.
 DEFAULT_FALLBACK = PolicyDecision(
     backend="ollama",
-    model="qwen3.5",
+    model="qwen2.5-coder:14b",
     context_window_floor=CTX_SMALL,
-    reason="default fallback — small code-diff review on local qwen3.5",
+    reason="default fallback — small code-diff review on local qwen2.5-coder:14b",
 )
 
 

@@ -54,7 +54,7 @@ pricing:
   # rates so usage_summary reflects actual spend.
   # -----------------------------------------------------------------
   - backend: ollama
-    model: qwen3.5
+    model: qwen2.5-coder:14b
     input_per_mtoken_usd: 0.0
     output_per_mtoken_usd: 0.0
     source_url: local
