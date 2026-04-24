@@ -144,7 +144,7 @@ DEFAULT_FALLBACK = PolicyDecision(
     backend="ollama",
     model="qwen2.5-coder:14b",
     context_window_floor=CTX_SMALL,
-    reason="default fallback — small code-diff review on local qwen2.5-coder:14b",
+    reason="default fallback — small code-diff review on qwen2.5-coder:14b",
 )
 
 
