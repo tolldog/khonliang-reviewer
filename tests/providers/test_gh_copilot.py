@@ -425,7 +425,11 @@ async def test_no_assistant_message_errored(monkeypatch):
     assert "no assistant.message" in result.error
 
 
-async def test_assistant_message_with_empty_content_errored(monkeypatch):
+async def test_only_empty_final_answer_event_errored(monkeypatch):
+    """A stream containing only a ``final_answer`` event with empty
+    content has no usable message — surfaces the same
+    ``malformed_envelope`` error path as a stream with no
+    assistant.message at all."""
     event = {
         "type": "assistant.message",
         "data": {"content": "", "phase": "final_answer"},
@@ -437,7 +441,42 @@ async def test_assistant_message_with_empty_content_errored(monkeypatch):
 
     assert result.disposition == "errored"
     assert result.error_category == "malformed_envelope"
-    assert "empty content" in result.error
+    # Message indicates no usable assistant.message was found; the
+    # empty-content final_answer was correctly ignored rather than
+    # overriding a (non-existent) fallback.
+    assert "no assistant.message" in result.error
+
+
+async def test_empty_final_answer_falls_back_to_earlier_content(monkeypatch):
+    """When a ``final_answer`` event is empty but an earlier
+    content-bearing message exists, the parser uses the fallback —
+    don't hard-fail when a recoverable answer is already present.
+
+    Hardens against a stream pattern where the model emits a
+    complete answer in one phase-less message, then a corrupted /
+    truncated final_answer arrives at the end. Earlier shapes
+    treated the empty final_answer as authoritative and returned
+    ``malformed_envelope``; the fix ignores final_answer events
+    with empty content so the earlier message wins.
+    """
+    earlier = {
+        "type": "assistant.message",
+        "data": {
+            "content": json.dumps({"summary": "rescued", "findings": []}),
+        },
+    }
+    bad_final = {
+        "type": "assistant.message",
+        "data": {"content": "", "phase": "final_answer"},
+    }
+    stdout = ("\n".join(json.dumps(e) for e in (earlier, bad_final))).encode()
+    proc = _FakeProc(stdout=stdout)
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await GhCopilotProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == "rescued"
 
 
 async def test_non_json_content_errored(monkeypatch):

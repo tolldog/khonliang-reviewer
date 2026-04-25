@@ -365,9 +365,17 @@ def _extract_final_message(stdout: bytes) -> tuple[dict[str, Any], int]:
         data = event.get("data") or {}
         if not isinstance(data, dict):
             continue
-        if data.get("phase") == "final_answer":
-            final_answer_event = event  # latest final_answer wins
-        elif isinstance(data.get("content"), str) and data["content"]:
+        content = data.get("content")
+        has_content = isinstance(content, str) and bool(content)
+        if data.get("phase") == "final_answer" and has_content:
+            # Only authoritative when content is non-empty. A
+            # ``final_answer`` event with missing / empty content
+            # shouldn't override an earlier content-bearing message
+            # — that would hard-fail the parse with
+            # ``malformed_envelope`` when a recoverable answer was
+            # already present in the stream.
+            final_answer_event = event
+        elif has_content:
             fallback_event = event  # latest content-bearing message wins
 
     final_event = final_answer_event if final_answer_event is not None else fallback_event
