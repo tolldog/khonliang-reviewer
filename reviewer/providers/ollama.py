@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -140,13 +141,31 @@ class OllamaProvider(ReviewProvider):
         started_wall = time.time()
         started_mono = time.monotonic()
 
+        # Size ``num_ctx`` to the actual prompt length when it would
+        # overflow Ollama's 4096-token default. Without this, large
+        # diffs silently truncate at the model boundary and the model
+        # returns a near-empty response — observed as
+        # ``output_tokens=8`` with ``disposition=posted`` and zero
+        # findings on a ~500-line diff (bug_reviewer_663d0d62), which
+        # is indistinguishable from a clean approval.
+        num_ctx_override = _suggest_num_ctx(prompt)
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "timeout": self.config.timeout_seconds,
+        }
+        if num_ctx_override is not None:
+            # Ollama's OpenAI-compatible endpoint accepts native Ollama
+            # options under ``options.num_ctx``. The ``openai`` SDK
+            # forwards ``extra_body`` verbatim so this works without
+            # depending on a future schema-flag for context window.
+            create_kwargs["extra_body"] = {
+                "options": {"num_ctx": num_ctx_override}
+            }
+
         try:
-            response = await self._client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                timeout=self.config.timeout_seconds,
-            )
+            response = await self._client.chat.completions.create(**create_kwargs)
         except openai.APIConnectionError as exc:
             return _errored(
                 request,
@@ -201,6 +220,34 @@ class OllamaProvider(ReviewProvider):
             started_wall=started_wall,
             duration_ms=duration_ms,
         )
+        # Truncation heuristic: a large input that produced a tiny
+        # output is the silent-truncation signature observed in
+        # bug_reviewer_663d0d62 (``output_tokens=8`` with
+        # ``disposition=posted`` and zero findings on a ~500-line
+        # diff). Surface a WARNING so operators can see the trap even
+        # when the rule-table / num_ctx auto-sizing didn't catch it
+        # (e.g. some other backend, off-by-one rounding, or a model
+        # that genuinely produces sparse output for some reason). The
+        # warning is informational — the result is still returned —
+        # because heuristics shouldn't reject otherwise-valid reviews.
+        if result.usage is not None:
+            input_tokens = result.usage.input_tokens
+            output_tokens = result.usage.output_tokens
+            if (
+                input_tokens > _TRUNCATION_INPUT_THRESHOLD
+                and output_tokens < _TRUNCATION_OUTPUT_THRESHOLD
+            ):
+                logger.warning(
+                    "ollama review may have been truncated: "
+                    "input_tokens=%s output_tokens=%s num_ctx=%s model=%s — "
+                    "low output relative to input is the silent-truncation "
+                    "signature; verify num_ctx covers the prompt and that "
+                    "the model can produce structured JSON at this size",
+                    input_tokens,
+                    output_tokens,
+                    num_ctx_override or f"default({_NUM_CTX_DEFAULT})",
+                    model,
+                )
         logger.debug(
             "ollama review done: disposition=%s category=%s model=%s tokens_in=%s tokens_out=%s duration_ms=%s",
             result.disposition,
@@ -219,6 +266,99 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
     if isinstance(override, str) and override:
         return override
     return default
+
+
+# Threshold for the truncation-warning heuristic. ``input_tokens >
+# _TRUNCATION_INPUT_THRESHOLD`` plus ``output_tokens <
+# _TRUNCATION_OUTPUT_THRESHOLD`` is the signature of a review that ran
+# but couldn't fit the prompt — Ollama silently truncates and the
+# model returns a near-empty response. Tuned conservatively so a real
+# clean review on a small diff (which legitimately produces few output
+# tokens) doesn't fire the warning. 2000 input is well above any
+# plausible "small diff". 32 output captures the silent-truncation
+# signature observed in bug_reviewer_663d0d62 (8 output tokens on a
+# 500-line diff): a meaningful review — even a clean approval — emits
+# a real summary string, which alone runs longer than 32 tokens once
+# you account for word boundaries; near-empty envelopes
+# (``{"summary":"","findings":[]}``) only require ~12 tokens, so 32
+# strikes a balance between catching truncation noise and not firing
+# on legitimate-but-terse reviews. The schema only *requires*
+# ``summary`` (a single short string would technically satisfy it),
+# so the threshold is empirical — observed truncated outputs cluster
+# under 16 tokens; observed legitimate reviews cluster well above.
+_TRUNCATION_INPUT_THRESHOLD = 2000
+_TRUNCATION_OUTPUT_THRESHOLD = 32
+
+
+# Standard ``num_ctx`` step sizes Ollama exposes. We round up the
+# estimated token count to one of these so the model gets a
+# power-of-two-ish window — which is what the underlying llama.cpp
+# implementations expect — rather than an arbitrary number.
+_NUM_CTX_LADDER: tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
+
+# Ollama's compiled-in default. We only override above this; below it
+# the override would be a no-op and risks rejection from local models
+# that don't accept smaller-than-default ``num_ctx``.
+_NUM_CTX_DEFAULT = 4096
+
+# Conservative UTF-8 BYTES-per-token ratio for any script. Counting
+# bytes (not characters) keeps the estimator uniform across scripts:
+# ASCII is 1 byte/char and ~3-4 chars/token (so ~3-4 bytes/token);
+# CJK is 3 bytes/char and ~1 char/token (so ~3 bytes/token). Across
+# every script the ratio sits at roughly 3-5 bytes/token. Picking 3
+# as the lower bound biases toward overshooting — overestimating
+# tokens just sizes ``num_ctx`` slightly large; underestimating is
+# the trap this whole helper exists to close.
+#
+# Earlier versions used ``len(prompt)`` (character count) which
+# silently underestimated for CJK / RTL / emoji-heavy content where a
+# single character can be one token. ``len(prompt.encode('utf-8'))``
+# is the canonical fix.
+_BYTES_PER_TOKEN = 3
+
+# Headroom reserved for the model's response so ``num_ctx`` covers
+# both prompt and completion. Real reviews emit summary + N findings;
+# 1024 tokens covers a typical structured response with several
+# medium-bodied findings.
+_RESPONSE_TOKEN_HEADROOM = 1024
+
+
+def _suggest_num_ctx(prompt: str) -> int | None:
+    """Suggest a ``num_ctx`` value that fits the prompt + a response.
+
+    Returns the smallest standard window in :data:`_NUM_CTX_LADDER`
+    that holds an estimated prompt-token count plus
+    :data:`_RESPONSE_TOKEN_HEADROOM`. Returns ``None`` when the
+    estimate fits inside Ollama's default 4096-token window — keeping
+    the fast path one-keyword-shorter and avoiding overrides that
+    might confuse smaller local models.
+
+    The estimator is deliberately conservative — UTF-8 byte length
+    divided by :data:`_BYTES_PER_TOKEN` (3, the lower bound of the
+    real ~3-5 bytes/token range across scripts), with ``math.ceil``
+    rather than floor division — to bias toward overshooting: a
+    slightly larger ``num_ctx`` costs a small amount of GPU memory,
+    while the bug this closes (``num_ctx`` too small) silently hides
+    review findings. Byte-counting (rather than character counting)
+    keeps the estimator uniform across CJK / RTL / emoji-heavy
+    content where a single character can be one token. Ceiling
+    division prevents borderline prompts from rounding *down* under
+    the threshold and skipping the override.
+    """
+    estimated_tokens = (
+        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+        + _RESPONSE_TOKEN_HEADROOM
+    )
+    if estimated_tokens <= _NUM_CTX_DEFAULT:
+        return None
+    for ctx in _NUM_CTX_LADDER:
+        if estimated_tokens <= ctx:
+            return ctx
+    # Beyond the largest ladder step the model probably can't usefully
+    # consume the prompt anyway; cap at the largest entry so the
+    # request still goes through with a clear truncation-warning if
+    # the model output is small.
+    return _NUM_CTX_LADDER[-1]
 
 
 def _parse_response(
