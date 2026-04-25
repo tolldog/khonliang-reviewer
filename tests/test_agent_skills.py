@@ -812,15 +812,15 @@ async def test_usage_summary_since_zero_treated_as_no_filter():
 # ---------------------------------------------------------------------------
 
 
-def test_default_selector_constructs_both_providers_from_empty_config(tmp_path):
-    """Without a config file, defaults are used; both providers present."""
+def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
+    """Without a config file, defaults are used; every shipped provider present."""
     agent = ReviewerAgent(
         agent_id="reviewer-test",
         bus_url="http://mock",
         config_path="",
     )
     selector = agent._ensure_selector()
-    assert set(selector.providers) == {"claude_cli", "ollama"}
+    assert set(selector.providers) == {"claude_cli", "codex_cli", "ollama"}
     assert selector.config.default_backend == "ollama"
     assert selector.config.default_model == "qwen2.5-coder:14b"
 

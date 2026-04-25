@@ -5,8 +5,8 @@ Bus-native reviewer agent for the khonliang ecosystem.
 The reviewer role is broader than code review: it evaluates PR diffs today and
 extends to specs, FRs, docs, and other content via the library's kind-
 extensible contract. Concrete review providers (Ollama, Claude-via-CLI,
-future GPT/Gemini) live in this repo; shared primitives live in
-`khonliang-reviewer-lib`.
+Codex-via-CLI, future GPT/Gemini direct) live in this repo; shared primitives
+live in `khonliang-reviewer-lib`.
 
 ## Current Role
 
@@ -69,6 +69,28 @@ export CLAUDE_CODE_OAUTH_TOKEN=...
 
 Never commit the token. Treat it like `GITHUB_WEBHOOK_SECRET`.
 
+### Codex backend provisioning (optional)
+
+The Codex-via-CLI provider drives the OpenAI ChatGPT subscription quota
+through the `codex` binary's stored OAuth token (`~/.codex/auth.json`).
+Provision once per machine:
+
+```sh
+codex login        # interactive ChatGPT sign-in
+codex login status # confirm "Logged in using ChatGPT"
+```
+
+For the API-key fallback (pay-per-token, not subscription), set
+`OPENAI_API_KEY` instead — `codex` reads it automatically when
+`auth.json` is absent.
+
+The `codex exec review` subcommand is *not* used by this provider: it is
+repo-bound (sources the diff from `--uncommitted` / `--base` / `--commit`,
+no stdin path) and lacks `--output-schema`, so it cannot honor the
+`ReviewFinding` contract. The provider uses parent `codex exec` with
+`--output-schema` and a stdin-piped prompt, which works on arbitrary diff
+bytes and produces schema-validated JSON.
+
 ## Running
 
 Start the reviewer agent against the bus:
@@ -88,13 +110,16 @@ selection resolves in this order:
 3. Config-level `default_provider` / `default_model` — the ultimate
    fallback.
 
-The `model` argument is honored on both backends:
+The `model` argument is honored on all three backends:
 
 - **Ollama** uses `model` directly in the `chat.completions.create`
   call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).
+- **Codex-via-CLI** threads `model` through as `codex exec -m <spec>`.
+  When neither the request nor the provider config supplies one, the `-m`
+  flag is omitted and codex picks from `~/.codex/config.toml`.
 
 `review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
 aggregation) are upcoming work units and not yet registered.

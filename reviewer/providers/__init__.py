@@ -13,6 +13,11 @@ from reviewer.providers.claude_cli import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
 )
+from reviewer.providers.codex_cli import (
+    CodexCliAuthError,
+    CodexCliProvider,
+    CodexCliProviderConfig,
+)
 from reviewer.providers.ollama import (
     OllamaAuthError,
     OllamaHealthcheckError,
@@ -26,6 +31,9 @@ __all__ = [
     "ClaudeCliAuthError",
     "ClaudeCliProvider",
     "ClaudeCliProviderConfig",
+    "CodexCliAuthError",
+    "CodexCliProvider",
+    "CodexCliProviderConfig",
     "OllamaAuthError",
     "OllamaHealthcheckError",
     "OllamaProvider",

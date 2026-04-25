@@ -54,6 +54,8 @@ from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
+    CodexCliProvider,
+    CodexCliProviderConfig,
     OllamaProvider,
     OllamaProviderConfig,
 )
@@ -1196,11 +1198,18 @@ class ReviewerAgent(BaseAgent):
         config = self._load_config()
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
+        codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
         providers = {
             "claude_cli": ClaudeCliProvider(
                 ClaudeCliProviderConfig(
                     binary=str(claude_cfg.get("binary") or "claude"),
+                )
+            ),
+            "codex_cli": CodexCliProvider(
+                CodexCliProviderConfig(
+                    binary=str(codex_cfg.get("binary") or "codex"),
+                    default_model=str(codex_cfg.get("default_model") or ""),
                 )
             ),
             "ollama": OllamaProvider(
