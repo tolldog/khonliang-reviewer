@@ -480,22 +480,44 @@ def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
     """Ceiling division must push borderline prompts over the override
     threshold rather than rounding down and silently truncating.
 
-    With chars/3 floor division, len=9217 produces 3072 estimated
+    With floor division, len=9217 ASCII bytes would estimate 3072
     tokens (9217 // 3 == 3072 because 3*3072 == 9216 < 9217), and
     3072+1024=4096 ≤ 4096 → no override → truncation risk on a prompt
-    that's actually one character over the line. With math.ceil the
-    same length produces 3073, and 3073+1024=4097 > 4096 → first
-    ladder step (8192). Locks the conservative-bias property the
-    docstring promises.
+    that's actually one byte over the line. With math.ceil the same
+    length produces 3073, and 3073+1024=4097 > 4096 → first ladder
+    step (8192). Locks the conservative-bias property the docstring
+    promises.
     """
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # Just at the boundary: 9216 chars / 3 = 3072 tokens exactly,
+    # Just at the boundary: 9216 ASCII bytes / 3 = 3072 tokens exactly,
     # plus 1024 = 4096 → no override (still inside default).
     assert _suggest_num_ctx("x" * 9216) is None
-    # One character over: ceil pushes to 3073 tokens + 1024 = 4097 →
-    # first ladder step.
+    # One byte over: ceil pushes to 3073 tokens + 1024 = 4097 → first
+    # ladder step.
     assert _suggest_num_ctx("x" * 9217) == 8192
+
+
+def test_suggest_num_ctx_counts_utf8_bytes_for_non_ascii():
+    """Multi-byte scripts must be measured in UTF-8 bytes, not chars.
+
+    A CJK character is 3 bytes in UTF-8 and tokenizes to roughly one
+    token in most modern tokenizers, so ``len(prompt)`` (character
+    count) would dramatically underestimate the token count and let a
+    truncation-prone prompt slip through with no override. Byte
+    counting keeps the estimator uniform across scripts.
+    """
+    from reviewer.providers.ollama import _suggest_num_ctx
+
+    # 5000 CJK characters = 15000 UTF-8 bytes ≈ 5000 tokens estimated
+    # (15000 / 3) + 1024 = 6024 → first ladder step (8192).
+    cjk_prompt = "中" * 5000
+    assert _suggest_num_ctx(cjk_prompt) == 8192
+    # Same character count in ASCII (5000 chars = 5000 bytes ≈ 1667
+    # tokens + 1024 headroom = 2691 tokens estimated) fits in default
+    # → no override. Confirms the byte-vs-char distinction matters at
+    # the relevant size band.
+    assert _suggest_num_ctx("x" * 5000) is None
 
 
 async def test_review_omits_extra_body_for_small_prompt():

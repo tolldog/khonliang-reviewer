@@ -301,12 +301,20 @@ _NUM_CTX_LADDER: tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
 # that don't accept smaller-than-default ``num_ctx``.
 _NUM_CTX_DEFAULT = 4096
 
-# Conservative chars-per-token ratio for English + JSON + code mix.
-# Real ratios range from ~3 (dense code/JSON) to ~5 (prose), so 3 is
-# the safe lower bound — overestimating tokens is fine, it just sizes
-# ``num_ctx`` slightly large. Underestimating is the trap we're trying
-# to close.
-_CHARS_PER_TOKEN = 3
+# Conservative UTF-8 BYTES-per-token ratio for any script. Counting
+# bytes (not characters) keeps the estimator uniform across scripts:
+# ASCII is 1 byte/char and ~3-4 chars/token (so ~3-4 bytes/token);
+# CJK is 3 bytes/char and ~1 char/token (so ~3 bytes/token). Across
+# every script the ratio sits at roughly 3-5 bytes/token. Picking 3
+# as the lower bound biases toward overshooting — overestimating
+# tokens just sizes ``num_ctx`` slightly large; underestimating is
+# the trap this whole helper exists to close.
+#
+# Earlier versions used ``len(prompt)`` (character count) which
+# silently underestimated for CJK / RTL / emoji-heavy content where a
+# single character can be one token. ``len(prompt.encode('utf-8'))``
+# is the canonical fix.
+_BYTES_PER_TOKEN = 3
 
 # Headroom reserved for the model's response so ``num_ctx`` covers
 # both prompt and completion. Real reviews emit summary + N findings;
@@ -325,18 +333,21 @@ def _suggest_num_ctx(prompt: str) -> int | None:
     the fast path one-keyword-shorter and avoiding overrides that
     might confuse smaller local models.
 
-    The estimator is deliberately conservative
-    (:data:`_CHARS_PER_TOKEN` set low + ``math.ceil`` rather than
-    floor division) to bias toward overshooting: a slightly larger
-    ``num_ctx`` costs a small amount of GPU memory, while the bug
-    this closes (``num_ctx`` too small) silently hides review
-    findings. Ceiling division specifically prevents borderline
-    prompts (e.g. 9217 chars ≈ exactly the 4096-token boundary at
-    chars/3) from rounding *down* under the threshold and skipping
-    the override.
+    The estimator is deliberately conservative — UTF-8 byte length
+    divided by :data:`_BYTES_PER_TOKEN` (3, the lower bound of the
+    real ~3-5 bytes/token range across scripts), with ``math.ceil``
+    rather than floor division — to bias toward overshooting: a
+    slightly larger ``num_ctx`` costs a small amount of GPU memory,
+    while the bug this closes (``num_ctx`` too small) silently hides
+    review findings. Byte-counting (rather than character counting)
+    keeps the estimator uniform across CJK / RTL / emoji-heavy
+    content where a single character can be one token. Ceiling
+    division prevents borderline prompts from rounding *down* under
+    the threshold and skipping the override.
     """
     estimated_tokens = (
-        math.ceil(len(prompt) / _CHARS_PER_TOKEN) + _RESPONSE_TOKEN_HEADROOM
+        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+        + _RESPONSE_TOKEN_HEADROOM
     )
     if estimated_tokens <= _NUM_CTX_DEFAULT:
         return None
