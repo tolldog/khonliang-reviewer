@@ -762,7 +762,11 @@ class ReviewerAgent(BaseAgent):
 
         try:
             selector = self._ensure_selector()
-            if caller_backend or caller_model:
+            # ``is not None`` (not truthiness) so explicit ``model=""``
+            # — meaning "let the provider apply its own default" —
+            # takes the caller-override branch instead of falling
+            # through to rule-table resolution.
+            if caller_backend is not None or caller_model is not None:
                 provider, chosen_model = selector.select(
                     backend=caller_backend, model=caller_model
                 )

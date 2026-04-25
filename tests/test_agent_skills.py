@@ -189,6 +189,39 @@ async def test_review_text_explicit_empty_model_reaches_provider():
     assert fake.last_request.metadata["model"] == ""
 
 
+async def test_review_text_explicit_empty_model_without_backend_routes_via_caller_override():
+    """``model=""`` without an explicit ``backend`` must still take the
+    caller-override branch, not fall through to rule-table resolution.
+
+    The dispatch branch at ``handle_review_text`` previously did:
+
+        if caller_backend or caller_model:
+            ... caller override path ...
+
+    which is truthiness — ``model=""`` was falsy, so the condition was
+    False (when no backend was supplied either) and the request fell
+    through to rule-table / default-resolution. That silently
+    overwrote the explicit-empty signal with whatever the rule table
+    picked. Switching to ``is not None`` distinguishes "caller supplied
+    explicit empty" (caller-override path) from "caller didn't say"
+    (rule-table path).
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "model": ""},
+    )
+
+    assert fake.last_request is not None
+    # No ``backend`` supplied → selector falls through to default
+    # backend (ollama). The explicit ``model=""`` must still reach the
+    # provider as ``""`` so the provider applies its own default,
+    # rather than being clobbered by rule-table resolution.
+    assert fake.last_request.metadata["model"] == ""
+
+
 async def test_review_text_forwards_instructions_and_context():
     fake = _RecordingProvider("ollama", _make_result())
     harness = _make_harness({"ollama": fake})
