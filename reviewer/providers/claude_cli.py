@@ -226,17 +226,22 @@ class ClaudeCliProvider(ReviewProvider):
             elif _stderr_suggests_unknown_option(stderr_text):
                 # Older claude CLIs that don't recognize one of our
                 # required flags (most likely ``--permission-mode``,
-                # which entered the CLI at 2.1.119). Upgrade the
-                # category and rewrite the error message so operators
-                # don't have to grep for "unknown option" in a
-                # truncated stderr to figure out it's a version
-                # problem.
-                category = "binary_not_found"
+                # which entered the CLI at 2.1.119). The binary is
+                # present and ran — it just lacks the flag — so we
+                # keep ``error_category="nonzero_exit"`` (the technical
+                # truth from analytics' point of view) and rewrite the
+                # operator-facing message to name the version
+                # requirement and the right config knob. Adding a new
+                # ``binary_incompatible`` category would require
+                # changing the ``ErrorCategory`` enum in
+                # ``khonliang-reviewer-lib``; out of scope here.
+                category = "nonzero_exit"
                 error_message = (
                     f"claude -p rejected an argument (exit {proc.returncode}); "
                     f"this provider requires claude CLI >= 2.1.119 for "
-                    f"--permission-mode support. Upgrade the binary or "
-                    f"override CLAUDE_CLI_BINARY"
+                    f"--permission-mode support. Upgrade the binary, or "
+                    f"point ``providers.claude_cli.binary`` in config.yaml "
+                    f"at a newer claude installation"
                     + (f". stderr: {stderr_text}" if stderr_text else "")
                 )
             else:

@@ -263,8 +263,14 @@ async def test_non_zero_exit_with_auth_hint_upgrades_category(monkeypatch):
     assert result.error_category == "auth_not_provisioned"
 
 
-async def test_non_zero_exit_with_unknown_option_upgrades_category(monkeypatch):
-    """Older claude CLIs that don't recognize --permission-mode get a clear diagnostic."""
+async def test_non_zero_exit_with_unknown_option_rewrites_message(monkeypatch):
+    """Older claude CLIs that don't recognize --permission-mode get a clear diagnostic.
+
+    Category stays ``nonzero_exit`` because the binary is present and
+    ran — the ErrorCategory enum has no ``binary_incompatible`` slot
+    today. The operator-facing message is what carries the version
+    requirement and the right config knob to update.
+    """
     proc = _FakeProc(
         stdout=b"",
         stderr=b"error: unknown option '--permission-mode'",
@@ -275,9 +281,15 @@ async def test_non_zero_exit_with_unknown_option_upgrades_category(monkeypatch):
     result = await ClaudeCliProvider().review(_make_request())
 
     assert result.disposition == "errored"
-    assert result.error_category == "binary_not_found"
+    # Same category as a generic non-zero exit; analytics see the
+    # technical truth (CLI exited non-zero), operators get the
+    # diagnostic message instead.
+    assert result.error_category == "nonzero_exit"
     assert "rejected an argument" in result.error
     assert ">= 2.1.119" in result.error
+    # Operator pointer references the actual config knob, not a
+    # nonexistent env var.
+    assert "providers.claude_cli.binary" in result.error
     # Original stderr is preserved so operators can still see the
     # underlying CLI message for context.
     assert "unknown option" in result.error
