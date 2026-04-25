@@ -60,7 +60,7 @@ from reviewer.providers import (
     OllamaProviderConfig,
 )
 from reviewer.pricing_seed import load_default_pricing
-from reviewer.registry import ProviderRegistration, ProviderRegistry
+from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyDecision, PolicyInput, decide
 from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
 from reviewer.storage import UsageStore, open_usage_store

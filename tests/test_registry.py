@@ -288,6 +288,37 @@ def test_check_availability_gh_copilot_no_binary(monkeypatch):
     assert "copilot binary not found" in reason
 
 
+def test_check_availability_gh_copilot_no_auth(monkeypatch, tmp_path):
+    """Binary on PATH but no token / OAuth credentials → unavailable.
+
+    Mirrors the codex_cli no-auth coverage so both subscription-CLI
+    backends have parity. The probe must clear the token env vars
+    AND ensure ``~/.copilot`` doesn't exist as a directory (the cheap
+    upper-bound for OAuth credentials in the module's _gh_copilot_auth_present
+    helper).
+    """
+    monkeypatch.setattr(
+        "reviewer.registry.shutil.which",
+        lambda binary: "/usr/local/bin/copilot" if binary == "copilot" else None,
+    )
+    for env in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(env, raising=False)
+    # Point HOME at a directory that does NOT contain ~/.copilot so
+    # the cheap-upper-bound OAuth check returns false.
+    fresh_home = tmp_path / "no-copilot-home"
+    fresh_home.mkdir()
+    monkeypatch.setenv("HOME", str(fresh_home))
+
+    provider = _Fake("gh_copilot", config=SimpleNamespace(binary="copilot"))
+    available, reason = _check_availability("gh_copilot", provider)
+    assert available is False
+    assert "no copilot auth" in reason
+    # Operator-facing hint must name the actual config knobs the
+    # operator can flip — not just say "no auth".
+    assert "copilot login" in reason
+    assert "GH_TOKEN" in reason
+
+
 # ---------------------------------------------------------------------------
 # Unknown backend
 # ---------------------------------------------------------------------------
