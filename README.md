@@ -123,6 +123,21 @@ provider only uses `copilot -p <prompt> --output-format json
 plus an empty tool surface gives review-only behavior with no risk of
 the model attempting an action.
 
+> **Privacy / argv exposure.** The GitHub Copilot CLI has no stdin or
+> `--prompt-file` variant for non-interactive mode; the entire prompt
+> (including the diff body) is passed as a single argv element to
+> `copilot -p`. While the subprocess is running, that argument is
+> visible to other local users via `ps`, `/proc/<pid>/cmdline`, or
+> equivalent process-listing surfaces. **Don't route sensitive diff
+> content through gh_copilot on a multi-user host.** The stdin-piping
+> backends (claude_cli, codex_cli) keep the diff out of argv and do
+> not have this exposure; route confidential reviews there. Argv
+> overflow on very large diffs is also a real failure mode (hits OS
+> `ARG_MAX`, ~128KB on Linux); the provider catches the resulting
+> `OSError` and returns a structured errored result with a hint, but
+> the reviewer should fall back to a stdin-capable backend for those
+> cases anyway.
+
 ## Running
 
 Start the reviewer agent against the bus:

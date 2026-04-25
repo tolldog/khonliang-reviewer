@@ -226,6 +226,32 @@ async def test_no_model_omits_dash_m(monkeypatch):
     assert "-m" not in argv
 
 
+async def test_explicit_empty_model_overrides_config_default(monkeypatch):
+    """Caller-explicit ``model=""`` is honored over a configured default.
+
+    The selector convention (see ``ProviderSelector.select`` and the
+    matching codex_cli / claude_cli ``_resolve_model`` helpers) is
+    that ``model is None`` means "no override; use defaults" while
+    ``model == ""`` means "EXPLICIT: let the backend pick its
+    ambient default, even if a per-provider default_model is
+    configured". Without ``is not None`` distinction, this signal is
+    silently dropped at the provider boundary.
+    """
+    proc = _FakeProc(stdout=_success_stdout(SUCCESS_PAYLOAD))
+    calls = _install_fake_proc(monkeypatch, proc)
+    config = GhCopilotProviderConfig(default_model="gpt-5.4")
+
+    # Caller passes ``model=""`` explicitly — must NOT inherit the
+    # config default.
+    request = _make_request(metadata={"repo": "tolldog/example", "model": ""})
+    await GhCopilotProvider(config).review(request)
+
+    argv = calls[0]
+    assert "-m" not in argv, (
+        "explicit model='' must override config default and omit -m"
+    )
+
+
 async def test_reasoning_effort_threaded_to_argv(monkeypatch):
     proc = _FakeProc(stdout=_success_stdout(SUCCESS_PAYLOAD))
     calls = _install_fake_proc(monkeypatch, proc)
@@ -292,6 +318,63 @@ async def test_falls_back_to_assistant_message_without_phase(monkeypatch):
 
     assert result.disposition == "posted"
     assert result.summary == "ok"
+
+
+async def test_fallback_picks_latest_phase_less_message(monkeypatch):
+    """When multiple phase-less assistant.message events fire, the
+    LATEST one with content wins (matches the docstring contract).
+
+    Earlier shapes captured the first such message via
+    ``elif final_event is None ...``; tracking the latest is more
+    robust to streams where the model iterates and only the last
+    assistant message carries the complete answer.
+    """
+    early = {
+        "type": "assistant.message",
+        "data": {
+            "content": json.dumps({"summary": "early", "findings": []}),
+            # no phase field
+        },
+    }
+    late = {
+        "type": "assistant.message",
+        "data": {
+            "content": json.dumps({"summary": "late", "findings": []}),
+            # no phase field
+        },
+    }
+    stdout = ("\n".join(json.dumps(e) for e in (early, late))).encode()
+    proc = _FakeProc(stdout=stdout)
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await GhCopilotProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == "late"
+
+
+async def test_final_answer_wins_over_fallback_regardless_of_order(monkeypatch):
+    """Even when a phase-less content message comes AFTER a final_answer,
+    the final_answer event is the authoritative response."""
+    final = _final_message_event(
+        json.dumps({"summary": "final-answer-wins", "findings": []}),
+        output_tokens=42,
+    )
+    later_phaseless = {
+        "type": "assistant.message",
+        "data": {
+            "content": json.dumps({"summary": "should-not-win", "findings": []}),
+        },
+    }
+    stdout = ("\n".join(json.dumps(e) for e in (final, later_phaseless))).encode()
+    proc = _FakeProc(stdout=stdout)
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await GhCopilotProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == "final-answer-wins"
+    assert result.usage.output_tokens == 42
 
 
 async def test_skips_non_json_lines(monkeypatch):

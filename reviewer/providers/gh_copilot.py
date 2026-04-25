@@ -334,7 +334,18 @@ def _extract_final_message(stdout: bytes) -> tuple[dict[str, Any], int]:
     if not text:
         raise _CopilotEnvelopeError("copilot -p produced empty stdout")
 
-    final_event: dict[str, Any] | None = None
+    # Track ``final_answer`` events and ``content`` events
+    # separately. ``final_answer`` always wins if any are present
+    # (latest one — turns can iterate). When the stream emits no
+    # ``final_answer`` events at all (older CLI versions, edge
+    # cases), fall back to the latest ``assistant.message`` that
+    # carries non-empty content. Earlier shapes only captured the
+    # first content-bearing fallback message; tracking the latest
+    # is more robust to streams where the model emits multiple
+    # assistant messages and only the last one carries the
+    # complete answer.
+    final_answer_event: dict[str, Any] | None = None
+    fallback_event: dict[str, Any] | None = None
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -355,12 +366,11 @@ def _extract_final_message(stdout: bytes) -> tuple[dict[str, Any], int]:
         if not isinstance(data, dict):
             continue
         if data.get("phase") == "final_answer":
-            final_event = event  # latest final_answer wins
-        elif final_event is None and isinstance(data.get("content"), str) and data["content"]:
-            # Fallback: any assistant.message with content, if no
-            # final_answer was emitted (defensive — shouldn't happen
-            # in practice but covers older CLI versions).
-            final_event = event
+            final_answer_event = event  # latest final_answer wins
+        elif isinstance(data.get("content"), str) and data["content"]:
+            fallback_event = event  # latest content-bearing message wins
+
+    final_event = final_answer_event if final_answer_event is not None else fallback_event
 
     if final_event is None:
         raise _CopilotEnvelopeError(
@@ -596,9 +606,19 @@ def _stderr_suggests_auth_failure(stderr_text: str) -> bool:
 
 
 def _resolve_model(request: ReviewRequest, default: str) -> str:
-    """Use request-supplied model if present, else the provider default."""
+    """Use request-supplied model if present, else the provider default.
+
+    Distinguishes ``None`` (caller didn't supply ``model``) from
+    ``""`` (caller-explicit "let the backend pick its ambient
+    default") so the codebase-wide convention from the selector
+    layer (see ``ProviderSelector.select`` and the codex_cli /
+    claude_cli ``_resolve_model`` parallels) holds at the CLI
+    boundary too. An explicit empty string is honored verbatim and
+    causes the provider to omit ``-m`` from argv even when a
+    per-provider ``default_model`` is configured.
+    """
     override = request.metadata.get("model")
-    if isinstance(override, str) and override:
+    if isinstance(override, str):
         return override
     return default
 
