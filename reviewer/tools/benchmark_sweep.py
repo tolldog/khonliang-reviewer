@@ -401,7 +401,13 @@ def _render_markdown(rows: list[_BenchmarkRow]) -> str:
             )
         )
     if not rows:
-        lines.append("| _no rows — registry was empty after filters_ | | | | | | | | | |")
+        # Emit a non-table paragraph rather than trying to fit a
+        # message-cell row into a 10-column table. Markdown
+        # renderers handle paragraphs after a table cleanly; spacer
+        # rows with mismatched cell counts render misaligned in
+        # GitHub's markdown.
+        lines.append("")
+        lines.append("_(no rows — registry was empty after filters)_")
     return "\n".join(lines) + "\n"
 
 

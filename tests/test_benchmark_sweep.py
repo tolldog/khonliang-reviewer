@@ -459,6 +459,14 @@ async def test_run_writes_diff_payload_to_output(tmp_path):
 def test_render_markdown_handles_empty_rows():
     md = benchmark_sweep._render_markdown([])
     assert "no rows" in md.lower()
+    # Empty-rows fallback must NOT inject a malformed table row
+    # (mismatched cell count vs the 10-column header). Emit as a
+    # paragraph below the table instead.
+    lines = [line for line in md.splitlines() if line.strip()]
+    table_lines = [line for line in lines if line.startswith("|")]
+    # Header + alignment row only — no data row pretending to be
+    # part of the table.
+    assert len(table_lines) == 2
 
 
 def test_render_markdown_includes_severity_split():
