@@ -99,3 +99,31 @@ pricing:
     output_per_mtoken_usd: 0.0
     source_url: https://openai.com/api/pricing
     as_of: "2026-04-24"
+
+  # -----------------------------------------------------------------
+  # gh_copilot — `copilot -p` rides the GitHub Copilot subscription
+  # quota via ~/.copilot/ OAuth or one of COPILOT_GITHUB_TOKEN /
+  # GH_TOKEN / GITHUB_TOKEN. GitHub Copilot's headless surface emits
+  # JSONL events including `outputTokens` on the final
+  # assistant.message but does NOT report prompt-token counts, so
+  # `estimated_api_cost_usd` is best-effort (output side only) and
+  # the rates below are 0.0 placeholders for the same reason as
+  # codex_cli — populating real rates without input-token plumbing
+  # would attach misleading numbers to incomplete usage data. Two
+  # sample models are seeded so list_models surfaces something
+  # operator-curated; add or remove rows as new Copilot-hosted
+  # models become useful in this workspace.
+  # -----------------------------------------------------------------
+  - backend: gh_copilot
+    model: gpt-5.4
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: https://github.com/features/copilot
+    as_of: "2026-04-25"
+
+  - backend: gh_copilot
+    model: claude-sonnet-4.5
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: https://github.com/features/copilot
+    as_of: "2026-04-25"

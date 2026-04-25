@@ -18,6 +18,11 @@ from reviewer.providers.codex_cli import (
     CodexCliProvider,
     CodexCliProviderConfig,
 )
+from reviewer.providers.gh_copilot import (
+    GhCopilotAuthError,
+    GhCopilotProvider,
+    GhCopilotProviderConfig,
+)
 from reviewer.providers.ollama import (
     OllamaAuthError,
     OllamaHealthcheckError,
@@ -34,6 +39,9 @@ __all__ = [
     "CodexCliAuthError",
     "CodexCliProvider",
     "CodexCliProviderConfig",
+    "GhCopilotAuthError",
+    "GhCopilotProvider",
+    "GhCopilotProviderConfig",
     "OllamaAuthError",
     "OllamaHealthcheckError",
     "OllamaProvider",

@@ -894,7 +894,12 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         config_path="",
     )
     selector = agent._ensure_selector()
-    assert set(selector.providers) == {"claude_cli", "codex_cli", "ollama"}
+    assert set(selector.providers) == {
+        "claude_cli",
+        "codex_cli",
+        "gh_copilot",
+        "ollama",
+    }
     assert selector.config.default_backend == "ollama"
     assert selector.config.default_model == "qwen2.5-coder:14b"
 

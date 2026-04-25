@@ -5,8 +5,8 @@ Bus-native reviewer agent for the khonliang ecosystem.
 The reviewer role is broader than code review: it evaluates PR diffs today and
 extends to specs, FRs, docs, and other content via the library's kind-
 extensible contract. Concrete review providers (Ollama, Claude-via-CLI,
-Codex-via-CLI, future GPT/Gemini direct) live in this repo; shared primitives
-live in `khonliang-reviewer-lib`.
+Codex-via-CLI, GitHub-Copilot-via-CLI, future GPT/Gemini direct) live in
+this repo; shared primitives live in `khonliang-reviewer-lib`.
 
 ## Current Role
 
@@ -91,6 +91,38 @@ no stdin path) and lacks `--output-schema`, so it cannot honor the
 `--output-schema` and a stdin-piped prompt, which works on arbitrary diff
 bytes and produces schema-validated JSON.
 
+### GitHub Copilot backend provisioning (optional)
+
+The GitHub-Copilot-via-CLI provider rides the operator's GitHub Copilot
+Pro/Pro+/Business subscription via the `copilot` CLI binary (separate
+from `gh`). Provision once per machine:
+
+```sh
+copilot login          # OAuth device flow; stores credentials
+                       # in ~/.copilot/ or the OS keyring
+```
+
+For headless / CI use, set one of `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`,
+or `GITHUB_TOKEN` to a fine-grained PAT with the "Copilot Requests"
+permission, an OAuth token from the GitHub Copilot CLI app, or an
+OAuth token from the GitHub CLI (`gh`). Classic `ghp_` PATs are NOT
+supported by Copilot.
+
+Unlike claude_cli (`--json-schema`) and codex_cli (`--output-schema`),
+the GitHub Copilot CLI has no schema-enforcement flag. The provider
+embeds the response schema in the prompt body (same approach as the
+Ollama path) and parses the JSONL event stream — taking the
+`assistant.message` event with `phase: "final_answer"` and decoding
+its `content` field as JSON. Tool surface is locked down via
+`--available-tools=` (empty list) so the model can reason but not
+edit files or invoke shell commands.
+
+`copilot exec` and other interactive subcommands are NOT used. The
+provider only uses `copilot -p <prompt> --output-format json
+--allow-all-tools --available-tools= --no-color` — the headless gate
+plus an empty tool surface gives review-only behavior with no risk of
+the model attempting an action.
+
 ## Running
 
 Start the reviewer agent against the bus:
@@ -110,7 +142,7 @@ selection resolves in this order:
 3. Config-level `default_provider` / `default_model` — the ultimate
    fallback.
 
-The `model` argument is honored on all three backends:
+The `model` argument is honored on all four backends:
 
 - **Ollama** uses `model` directly in the `chat.completions.create`
   call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
@@ -133,6 +165,14 @@ The `model` argument is honored on all three backends:
   non-default backend, because the global default is paired with the
   default backend (e.g. `qwen2.5-coder:14b` is an Ollama model, not a
   Codex one).
+- **GitHub-Copilot-via-CLI** threads `model` through as `copilot -p
+  -m <spec>` (`gpt-5.4`, `claude-sonnet-4.5`, etc.; see the GitHub
+  Copilot model catalog). Same precedence as Codex: caller's `model`
+  arg → `providers.gh_copilot.default_model` → omit `-m` and let
+  `copilot -p` pick its own ambient default. Optional
+  `providers.gh_copilot.reasoning_effort` (`low`/`medium`/`high`/
+  `xhigh`) maps to `--effort` on the CLI for callers that want
+  depth control without per-request plumbing.
 
 `review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
 aggregation) are also registered alongside `review_text` / `review_diff`
