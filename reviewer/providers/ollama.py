@@ -245,7 +245,7 @@ class OllamaProvider(ReviewProvider):
                     "the model can produce structured JSON at this size",
                     input_tokens,
                     output_tokens,
-                    num_ctx_override or "default(4096)",
+                    num_ctx_override or f"default({_NUM_CTX_DEFAULT})",
                     model,
                 )
         logger.debug(
