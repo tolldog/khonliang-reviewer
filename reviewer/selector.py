@@ -76,7 +76,14 @@ class ProviderSelector:
         model: str | None = None,
     ) -> tuple[ReviewProvider, str]:
         chosen_backend = backend or self.config.default_backend
-        if model:
+        # Distinguish ``None`` (caller didn't supply a value, fall
+        # through to the default-resolution rules) from ``""``
+        # (caller explicitly chose "no model", which means "let the
+        # provider apply its own default"). The previous shape used
+        # ``if model:`` which collapsed both cases — a caller passing
+        # ``model=""`` would unexpectedly inherit ``config.default_model``
+        # when the chosen backend matched ``config.default_backend``.
+        if model is not None:
             chosen_model = model
         elif chosen_backend == self.config.default_backend:
             chosen_model = self.config.default_model

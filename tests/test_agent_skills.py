@@ -942,6 +942,19 @@ def test_selector_does_not_apply_default_model_to_non_default_backend():
     assert provider.name == "codex_cli"
     assert model == "gpt-5"
 
+    # Caller-explicit ``model=""`` is honored verbatim (means "use
+    # provider's own default") — distinct from ``model=None`` which
+    # falls through to the default-resolution rules.
+    provider, model = selector.select(backend="ollama", model="")
+    assert provider.name == "ollama"
+    assert model == ""
+
+    # Same explicit empty against the default backend: still empty,
+    # not the global default. Caller's ``""`` always wins.
+    provider, model = selector.select(model="")
+    assert provider.name == "ollama"
+    assert model == ""
+
 
 # ---------------------------------------------------------------------------
 # severity_floor post-filter (FR fr_reviewer_dfd27582)
