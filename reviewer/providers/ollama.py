@@ -281,7 +281,7 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
 # a real summary string, which alone runs longer than 32 tokens once
 # you account for word boundaries; near-empty envelopes
 # (``{"summary":"","findings":[]}``) only require ~12 tokens, so 32
-# strikes a balance between catching trunation noise and not firing
+# strikes a balance between catching truncation noise and not firing
 # on legitimate-but-terse reviews. The schema only *requires*
 # ``summary`` (a single short string would technically satisfy it),
 # so the threshold is empirical — observed truncated outputs cluster
