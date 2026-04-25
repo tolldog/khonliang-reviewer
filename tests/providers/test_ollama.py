@@ -429,3 +429,146 @@ async def test_healthcheck_error_is_runtime_error():
 async def test_provider_name_is_ollama():
     assert OllamaProvider.name == "ollama"
     assert OllamaProvider(client=_make_client()).name == "ollama"
+
+
+# ---------------------------------------------------------------------------
+# num_ctx auto-sizing (regression for bug_reviewer_663d0d62)
+# ---------------------------------------------------------------------------
+
+
+def test_suggest_num_ctx_returns_none_for_small_prompt():
+    """Prompts that fit Ollama's 4096 default should not override num_ctx.
+
+    Forcing a non-default ``num_ctx`` on a short prompt would risk
+    rejection from local models that don't accept smaller-than-default
+    windows, and the override gains nothing.
+    """
+    from reviewer.providers.ollama import _suggest_num_ctx
+
+    # Default headroom (1024) + len/3 must stay under 4096 to skip override.
+    # 9000 chars = 3000 estimated tokens + 1024 headroom = 4024 → still under default.
+    assert _suggest_num_ctx("x" * 9000) is None
+    # And a tiny prompt obviously fits.
+    assert _suggest_num_ctx("hi") is None
+
+
+def test_suggest_num_ctx_steps_up_through_ladder():
+    """Larger prompts should land on standard llama.cpp window sizes."""
+    from reviewer.providers.ollama import _suggest_num_ctx
+
+    # ~15000 chars / 3 = 5000 + 1024 = 6024 → first ladder step is 8192.
+    assert _suggest_num_ctx("x" * 15_000) == 8192
+    # ~30000 chars / 3 = 10000 + 1024 = 11024 → 16384.
+    assert _suggest_num_ctx("x" * 30_000) == 16384
+    # ~80000 chars / 3 = 26666 + 1024 = 27690 → 32768.
+    assert _suggest_num_ctx("x" * 80_000) == 32768
+    # ~150000 chars / 3 = 50000 + 1024 = 51024 → 65536.
+    assert _suggest_num_ctx("x" * 150_000) == 65536
+
+
+def test_suggest_num_ctx_caps_at_largest_ladder_step():
+    """Beyond 131072 we cap; review should still go through and the
+    truncation warning will fire if the model can't actually consume it."""
+    from reviewer.providers.ollama import _suggest_num_ctx
+
+    # 1MB of x's: estimated tokens ~= 333334 + 1024 = 334358 → exceeds
+    # all ladder entries; cap at top.
+    assert _suggest_num_ctx("x" * 1_000_000) == 131072
+
+
+async def test_review_omits_extra_body_for_small_prompt():
+    """When the prompt fits the default window the SDK call carries no extra_body."""
+    client = _make_client(response=SUCCESS_RESPONSE)
+    await OllamaProvider(client=client).review(_make_request())
+
+    last = client._create.last_call
+    assert last is not None
+    assert "extra_body" not in last, (
+        "small prompts should not override num_ctx; default 4096 is fine"
+    )
+
+
+async def test_review_passes_num_ctx_for_large_prompt():
+    """Large prompts should land a num_ctx override under extra_body.options."""
+    client = _make_client(response=SUCCESS_RESPONSE)
+
+    # ~30KB of diff content overflows the default 4096-token window.
+    big_diff = "diff --git a/f b/f\n" + ("+padding line content\n" * 1500)
+    await OllamaProvider(client=client).review(
+        _make_request(content=big_diff)
+    )
+
+    last = client._create.last_call
+    assert last is not None
+    assert "extra_body" in last, (
+        "large prompts must override num_ctx so Ollama doesn't silently truncate"
+    )
+    assert "options" in last["extra_body"]
+    num_ctx = last["extra_body"]["options"]["num_ctx"]
+    # Exact step depends on the prompt-builder overhead; assert it's
+    # strictly above the default and on the ladder.
+    assert num_ctx > 4096
+    assert num_ctx in {8192, 16384, 32768, 65536, 131072}
+
+
+async def test_review_warns_on_low_output_relative_to_input(caplog):
+    """A high-input / low-output review should emit a truncation WARNING.
+
+    Reproduces the bug_reviewer_663d0d62 signature: review returned
+    ``output_tokens=8`` with ``disposition=posted`` on a large input.
+    The warning gives operators a chance to notice the silent
+    truncation even when the rule-table / num_ctx-auto-size didn't
+    catch it.
+    """
+    response = dict(SUCCESS_RESPONSE)
+    response["usage"] = {
+        "prompt_tokens": 5000,  # large input
+        "completion_tokens": 8,  # tiny output — truncation signature
+        "total_tokens": 5008,
+    }
+    # Replace message content with empty findings so the result still
+    # round-trips cleanly; the warning is independent of finding shape.
+    response["choices"] = [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": json.dumps({"summary": "", "findings": []}),
+            },
+            "finish_reason": "stop",
+        }
+    ]
+
+    client = _make_client(response=response)
+
+    with caplog.at_level("WARNING"):
+        await OllamaProvider(client=client).review(_make_request())
+
+    truncation_warnings = [
+        r for r in caplog.records if "truncated" in r.getMessage()
+    ]
+    assert truncation_warnings, (
+        "low output_tokens on a large input must surface a WARNING; "
+        f"all records: {[r.getMessage() for r in caplog.records]}"
+    )
+
+
+async def test_review_no_warning_on_clean_small_review(caplog):
+    """A small input + small output is a legitimate clean review — no warning."""
+    response = dict(SUCCESS_RESPONSE)
+    response["usage"] = {
+        "prompt_tokens": 200,
+        "completion_tokens": 8,
+        "total_tokens": 208,
+    }
+    client = _make_client(response=response)
+
+    with caplog.at_level("WARNING"):
+        await OllamaProvider(client=client).review(_make_request())
+
+    truncation_warnings = [
+        r for r in caplog.records if "truncated" in r.getMessage()
+    ]
+    assert truncation_warnings == [], (
+        "small-input clean review should not fire the truncation heuristic"
+    )

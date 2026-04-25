@@ -140,13 +140,31 @@ class OllamaProvider(ReviewProvider):
         started_wall = time.time()
         started_mono = time.monotonic()
 
+        # Size ``num_ctx`` to the actual prompt length when it would
+        # overflow Ollama's 4096-token default. Without this, large
+        # diffs silently truncate at the model boundary and the model
+        # returns a near-empty response — observed as
+        # ``output_tokens=8`` with ``disposition=posted`` and zero
+        # findings on a ~500-line diff (bug_reviewer_663d0d62), which
+        # is indistinguishable from a clean approval.
+        num_ctx_override = _suggest_num_ctx(prompt)
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "timeout": self.config.timeout_seconds,
+        }
+        if num_ctx_override is not None:
+            # Ollama's OpenAI-compatible endpoint accepts native Ollama
+            # options under ``options.num_ctx``. The ``openai`` SDK
+            # forwards ``extra_body`` verbatim so this works without
+            # depending on a future schema-flag for context window.
+            create_kwargs["extra_body"] = {
+                "options": {"num_ctx": num_ctx_override}
+            }
+
         try:
-            response = await self._client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                timeout=self.config.timeout_seconds,
-            )
+            response = await self._client.chat.completions.create(**create_kwargs)
         except openai.APIConnectionError as exc:
             return _errored(
                 request,
@@ -201,6 +219,34 @@ class OllamaProvider(ReviewProvider):
             started_wall=started_wall,
             duration_ms=duration_ms,
         )
+        # Truncation heuristic: a large input that produced a tiny
+        # output is the silent-truncation signature observed in
+        # bug_reviewer_663d0d62 (``output_tokens=8`` with
+        # ``disposition=posted`` and zero findings on a ~500-line
+        # diff). Surface a WARNING so operators can see the trap even
+        # when the rule-table / num_ctx auto-sizing didn't catch it
+        # (e.g. some other backend, off-by-one rounding, or a model
+        # that genuinely produces sparse output for some reason). The
+        # warning is informational — the result is still returned —
+        # because heuristics shouldn't reject otherwise-valid reviews.
+        if result.usage is not None:
+            input_tokens = result.usage.input_tokens
+            output_tokens = result.usage.output_tokens
+            if (
+                input_tokens > _TRUNCATION_INPUT_THRESHOLD
+                and output_tokens < _TRUNCATION_OUTPUT_THRESHOLD
+            ):
+                logger.warning(
+                    "ollama review may have been truncated: "
+                    "input_tokens=%s output_tokens=%s num_ctx=%s model=%s — "
+                    "low output relative to input is the silent-truncation "
+                    "signature; verify num_ctx covers the prompt and that "
+                    "the model can produce structured JSON at this size",
+                    input_tokens,
+                    output_tokens,
+                    num_ctx_override or "default(4096)",
+                    model,
+                )
         logger.debug(
             "ollama review done: disposition=%s category=%s model=%s tokens_in=%s tokens_out=%s duration_ms=%s",
             result.disposition,
@@ -219,6 +265,74 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
     if isinstance(override, str) and override:
         return override
     return default
+
+
+# Threshold for the truncation-warning heuristic. ``input_tokens >
+# _TRUNCATION_INPUT_THRESHOLD`` plus ``output_tokens <
+# _TRUNCATION_OUTPUT_THRESHOLD`` is the signature of a review that ran
+# but couldn't fit the prompt — Ollama silently truncates and the
+# model returns a near-empty response. Tuned conservatively so a real
+# clean review on a small diff (which legitimately produces few output
+# tokens) doesn't fire the warning. 2000 input is well above any
+# plausible "small diff"; 32 output is below any structured JSON
+# review envelope (which carries summary + at least the schema's
+# required keys).
+_TRUNCATION_INPUT_THRESHOLD = 2000
+_TRUNCATION_OUTPUT_THRESHOLD = 32
+
+
+# Standard ``num_ctx`` step sizes Ollama exposes. We round up the
+# estimated token count to one of these so the model gets a
+# power-of-two-ish window — which is what the underlying llama.cpp
+# implementations expect — rather than an arbitrary number.
+_NUM_CTX_LADDER: tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
+
+# Ollama's compiled-in default. We only override above this; below it
+# the override would be a no-op and risks rejection from local models
+# that don't accept smaller-than-default ``num_ctx``.
+_NUM_CTX_DEFAULT = 4096
+
+# Conservative chars-per-token ratio for English + JSON + code mix.
+# Real ratios range from ~3 (dense code/JSON) to ~5 (prose), so 3 is
+# the safe lower bound — overestimating tokens is fine, it just sizes
+# ``num_ctx`` slightly large. Underestimating is the trap we're trying
+# to close.
+_CHARS_PER_TOKEN = 3
+
+# Headroom reserved for the model's response so ``num_ctx`` covers
+# both prompt and completion. Real reviews emit summary + N findings;
+# 1024 tokens covers a typical structured response with several
+# medium-bodied findings.
+_RESPONSE_TOKEN_HEADROOM = 1024
+
+
+def _suggest_num_ctx(prompt: str) -> int | None:
+    """Suggest a ``num_ctx`` value that fits the prompt + a response.
+
+    Returns the smallest standard window in :data:`_NUM_CTX_LADDER`
+    that holds an estimated prompt-token count plus
+    :data:`_RESPONSE_TOKEN_HEADROOM`. Returns ``None`` when the
+    estimate fits inside Ollama's default 4096-token window — keeping
+    the fast path one-keyword-shorter and avoiding overrides that
+    might confuse smaller local models.
+
+    The estimator is deliberately conservative
+    (:data:`_CHARS_PER_TOKEN` set low) to bias toward overshooting:
+    a slightly larger ``num_ctx`` costs a small amount of GPU memory,
+    while the bug this closes (``num_ctx`` too small) silently hides
+    review findings.
+    """
+    estimated_tokens = len(prompt) // _CHARS_PER_TOKEN + _RESPONSE_TOKEN_HEADROOM
+    if estimated_tokens <= _NUM_CTX_DEFAULT:
+        return None
+    for ctx in _NUM_CTX_LADDER:
+        if estimated_tokens <= ctx:
+            return ctx
+    # Beyond the largest ladder step the model probably can't usefully
+    # consume the prompt anyway; cap at the largest entry so the
+    # request still goes through with a clear truncation-warning if
+    # the model output is small.
+    return _NUM_CTX_LADDER[-1]
 
 
 def _parse_response(
