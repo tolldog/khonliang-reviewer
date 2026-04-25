@@ -23,6 +23,7 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 from reviewer.agent import ReviewerAgent
+from reviewer.registry import ProviderRegistry
 from reviewer.selector import ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
 
@@ -69,6 +70,7 @@ def _make_harness(
     *,
     default_backend: str = "ollama",
     default_model: str = "qwen2.5-coder:14b",
+    registry: ProviderRegistry | None = None,
 ) -> AgentTestHarness:
     """Build an AgentTestHarness with an injected :class:`ProviderSelector`.
 
@@ -77,9 +79,21 @@ def _make_harness(
     resolves cleanly in tests that don't care about provider identity.
     Tests that want multiple providers pass their own map; tests that
     want caller-override pass ``backend=...`` explicitly.
+
+    Tests that exercise ``list_models`` can pass a pre-built
+    :class:`ProviderRegistry` to override the auto-derived registry —
+    useful for asserting registration order, declared-models content,
+    or filter behavior without spinning up real provider classes.
+    When omitted, the harness builds a registry from the providers
+    map so the agent's ``list_models`` skill still has something
+    coherent to enumerate (default model only, no declared list).
     """
     if providers is None:
         providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))}
+    if registry is None:
+        registry = ProviderRegistry()
+        for name, provider in providers.items():
+            registry.register(provider, default_model=default_model if name == default_backend else "")
     selector = ProviderSelector(
         providers,
         SelectorConfig(
@@ -89,6 +103,7 @@ def _make_harness(
     return AgentTestHarness(
         ReviewerAgent,
         selector=selector,
+        registry=registry,
         usage_store=open_usage_store(":memory:"),
     )
 
@@ -102,6 +117,9 @@ def test_expected_skills_registered():
     harness = _make_harness()
     assert "review_text" in harness.skill_names
     assert "review_diff" in harness.skill_names
+    assert "review_pr" in harness.skill_names
+    assert "usage_summary" in harness.skill_names
+    assert "list_models" in harness.skill_names
 
 
 def test_skills_parameters_match_public_contract():
@@ -2086,3 +2104,128 @@ async def test_unreachable_base_sha_falls_back_to_builtin_prompt(tmp_path):
     # base SHA and collapsed to None.
     assert fake.last_prompt is not None
     assert "## Severity Rubric" not in fake.last_prompt
+
+
+# ---------------------------------------------------------------------------
+# list_models (FR fr_khonliang-reviewer_3d11d944)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_models_returns_all_registered_providers():
+    """No filter → every registered backend in registration order."""
+    registry = ProviderRegistry()
+    registry.register(
+        _RecordingProvider("ollama", _make_result(backend="ollama")),
+        default_model="qwen2.5-coder:14b",
+        declared_models=["qwen2.5-coder:14b", "glm-4.7-flash"],
+    )
+    registry.register(
+        _RecordingProvider("claude_cli", _make_result(backend="claude_cli")),
+        default_model="claude-opus-4-7",
+        declared_models=["claude-opus-4-7", "claude-sonnet-4-6"],
+    )
+    harness = _make_harness(
+        {
+            "ollama": registry.providers["ollama"],
+            "claude_cli": registry.providers["claude_cli"],
+        },
+        registry=registry,
+    )
+
+    result = await harness.call("list_models", {})
+
+    assert "providers" in result
+    backends = [p["backend"] for p in result["providers"]]
+    assert backends == ["ollama", "claude_cli"]
+    ollama = result["providers"][0]
+    assert ollama["default_model"] == "qwen2.5-coder:14b"
+    assert ollama["models"] == ["qwen2.5-coder:14b", "glm-4.7-flash"]
+    # ``available`` reflects the cheap probe; for ollama the probe is
+    # always True, so the assertion is stable across machines.
+    assert ollama["available"] is True
+    assert ollama["reason"] == ""
+
+
+async def test_list_models_backend_filter_returns_only_match():
+    """``backend`` arg narrows the response to one entry."""
+    registry = ProviderRegistry()
+    registry.register(
+        _RecordingProvider("ollama", _make_result(backend="ollama")),
+        default_model="qwen2.5-coder:14b",
+    )
+    registry.register(
+        _RecordingProvider("claude_cli", _make_result(backend="claude_cli")),
+        default_model="claude-opus-4-7",
+    )
+    harness = _make_harness(
+        {name: registry.providers[name] for name in ("ollama", "claude_cli")},
+        registry=registry,
+    )
+
+    result = await harness.call("list_models", {"backend": "claude_cli"})
+
+    assert len(result["providers"]) == 1
+    assert result["providers"][0]["backend"] == "claude_cli"
+
+
+async def test_list_models_unknown_backend_filter_returns_empty():
+    registry = ProviderRegistry()
+    registry.register(
+        _RecordingProvider("ollama", _make_result(backend="ollama")),
+        default_model="qwen2.5-coder:14b",
+    )
+    harness = _make_harness({"ollama": registry.providers["ollama"]}, registry=registry)
+
+    result = await harness.call("list_models", {"backend": "nonexistent"})
+
+    assert result["providers"] == []
+
+
+async def test_list_models_empty_string_backend_means_no_filter():
+    """Default for the skill arg is ``""`` (no filter); should return all."""
+    registry = ProviderRegistry()
+    registry.register(
+        _RecordingProvider("ollama", _make_result(backend="ollama")),
+        default_model="qwen2.5-coder:14b",
+    )
+    registry.register(
+        _RecordingProvider("claude_cli", _make_result(backend="claude_cli")),
+        default_model="claude-opus-4-7",
+    )
+    harness = _make_harness(
+        {name: registry.providers[name] for name in ("ollama", "claude_cli")},
+        registry=registry,
+    )
+
+    result = await harness.call("list_models", {"backend": ""})
+
+    assert len(result["providers"]) == 2
+
+
+async def test_list_models_skill_parameters_match_contract():
+    """``backend`` is the only optional arg; default empty string."""
+    harness = _make_harness()
+    skill = next(s for s in harness.skills if s.name == "list_models")
+    assert "backend" in skill.parameters
+    assert skill.parameters["backend"].get("required", False) is False
+    assert skill.parameters["backend"].get("default") == ""
+
+
+async def test_list_models_handler_error_path_is_structured(monkeypatch):
+    """Registry-level failures surface as ``{"error": ..., "providers": []}``
+    instead of crashing the skill call."""
+    harness = _make_harness()
+
+    def _fail(*_a, **_k):
+        raise RuntimeError("registry boom")
+
+    # Monkeypatch the registry's list method on the agent so the
+    # error is raised inside the handler's try/except.
+    agent = harness.agent
+    monkeypatch.setattr(agent._injected_registry, "list", _fail)
+
+    result = await harness.call("list_models", {})
+
+    assert "error" in result
+    assert "registry boom" in result["error"]
+    assert result["providers"] == []
