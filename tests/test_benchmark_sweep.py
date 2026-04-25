@@ -111,22 +111,24 @@ def test_load_diff_rejects_unresolvable_source():
     assert "did not resolve" in str(excinfo.value)
 
 
-def test_load_diff_bundled_missing_raises_runtime_error_with_hint(monkeypatch, tmp_path):
-    """Catch OSError on the bundled-diff path, surface a clear hint.
+def test_load_diff_bundled_missing_raises_runtime_error_with_hint(monkeypatch):
+    """Catch resource-load failure on the bundled-diff path, surface a hint.
 
     Otherwise an install missing the ``benchmark_data/`` payload
     would raise a raw ``FileNotFoundError`` from
-    ``Path.read_text`` — confusing for the operator who can't see
-    why the harness failed without the package_data context.
+    ``importlib.resources.read_text`` — confusing for the operator
+    who can't see why the harness failed without the package_data
+    context.
     """
-    bogus = tmp_path / "missing.diff"
-    monkeypatch.setattr(benchmark_sweep, "_DEFAULT_DIFF_PATH", bogus)
+    monkeypatch.setattr(
+        benchmark_sweep, "_DEFAULT_DIFF_NAME", "definitely-not-bundled.diff"
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         benchmark_sweep.load_diff(None)
 
     msg = str(excinfo.value)
-    assert "bundled reference diff is missing" in msg
+    assert "unreadable" in msg
     assert "package-data" in msg
     assert "--diff" in msg
 

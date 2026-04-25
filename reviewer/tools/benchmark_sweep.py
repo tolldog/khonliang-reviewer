@@ -52,6 +52,7 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -61,7 +62,8 @@ from reviewer.agent import ReviewerAgent
 from reviewer.registry import ProviderRegistration, ProviderRegistry
 
 
-_DEFAULT_DIFF_PATH = Path(__file__).parent / "benchmark_data" / "bus_lib_pr14.diff"
+_DEFAULT_DIFF_PACKAGE = "reviewer.tools.benchmark_data"
+_DEFAULT_DIFF_NAME = "bus_lib_pr14.diff"
 _PR_REF_PATTERN = re.compile(r"^([\w.-]+)/([\w.-]+)#(\d+)$")
 _LOGGER = logging.getLogger("reviewer.tools.benchmark_sweep")
 
@@ -113,26 +115,31 @@ def load_diff(source: str | None) -> tuple[str, str]:
       flow). Surfacing fetch errors as a friendly RuntimeError.
     """
     if not source:
-        # Catch ``OSError`` (parent of ``FileNotFoundError``,
-        # ``PermissionError``, etc.) and surface a clearer hint than
-        # the raw filesystem error. This branch fires when the
-        # package was installed without bundling the
-        # ``benchmark_data/`` payload — the harness still works but
-        # the operator must pass ``--diff <path>`` or a PR
-        # reference.
+        # Use ``importlib.resources`` so the harness works regardless
+        # of installation layout (zipimport, packaged-resource, etc.)
+        # — matches the convention in :mod:`reviewer.pricing_seed`
+        # rather than poking ``Path(__file__).parent``. Catch the
+        # filesystem and module-resolution errors that surface when
+        # the package was installed without bundling the
+        # ``benchmark_data/`` payload, and surface a clearer hint.
         try:
-            diff = _DEFAULT_DIFF_PATH.read_text(encoding="utf-8")
-        except OSError as exc:
+            diff = (
+                resources.files(_DEFAULT_DIFF_PACKAGE)
+                .joinpath(_DEFAULT_DIFF_NAME)
+                .read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, ModuleNotFoundError, OSError) as exc:
             raise RuntimeError(
-                f"bundled reference diff is missing at "
-                f"{_DEFAULT_DIFF_PATH}: {exc}. The package may have "
-                f"been installed without ``benchmark_data/`` payload "
+                f"bundled reference diff "
+                f"{_DEFAULT_DIFF_PACKAGE}/{_DEFAULT_DIFF_NAME} is "
+                f"unreadable: {exc}. The package may have been "
+                f"installed without ``benchmark_data/`` payload "
                 f"(check pyproject.toml ``package-data`` includes "
-                f"``reviewer/tools/benchmark_data/*.diff``). Pass "
-                f"``--diff <path>`` or a ``<owner>/<repo>#<num>`` "
+                f"``reviewer.tools.benchmark_data = ['*.diff']``). "
+                f"Pass ``--diff <path>`` or a ``<owner>/<repo>#<num>`` "
                 f"PR reference to bypass."
             ) from exc
-        return diff, f"bundled:{_DEFAULT_DIFF_PATH.name}"
+        return diff, f"bundled:{_DEFAULT_DIFF_NAME}"
 
     pr_match = _PR_REF_PATTERN.match(source)
     if pr_match:
@@ -234,7 +241,7 @@ async def _run_one(
     registry: ProviderRegistry,
 ) -> _BenchmarkRow:
     """Exercise a single (backend, model) pair and write the artifact."""
-    provider = registry.providers.get(reg.backend)
+    provider = registry.get_provider(reg.backend)
     if provider is None:
         # Defensive — shouldn't happen given _filter_registry comes
         # from registry.list() — but covers a future race where the

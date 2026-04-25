@@ -107,6 +107,16 @@ class ProviderRegistry:
         """Read-only mapping suitable for :class:`ProviderSelector`."""
         return dict(self._providers)
 
+    def get_provider(self, backend: str) -> ReviewProvider | None:
+        """Return the registered provider for ``backend`` or ``None``.
+
+        Hot-path accessor for callers that look up one provider per
+        request — avoids the per-call ``dict`` copy that
+        :attr:`providers` performs to keep the property's read-only
+        contract.
+        """
+        return self._providers.get(backend)
+
     def list(
         self, backend: str | None = None
     ) -> list[ProviderRegistration]:
