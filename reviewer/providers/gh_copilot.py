@@ -608,17 +608,20 @@ def _stderr_suggests_auth_failure(stderr_text: str) -> bool:
 def _resolve_model(request: ReviewRequest, default: str) -> str:
     """Use request-supplied model if present, else the provider default.
 
-    Distinguishes ``None`` (caller didn't supply ``model``) from
-    ``""`` (caller-explicit "let the backend pick its ambient
-    default") so the codebase-wide convention from the selector
-    layer (see ``ProviderSelector.select`` and the codex_cli /
-    claude_cli ``_resolve_model`` parallels) holds at the CLI
-    boundary too. An explicit empty string is honored verbatim and
-    causes the provider to omit ``-m`` from argv even when a
-    per-provider ``default_model`` is configured.
+    Mirrors the contract used by ``codex_cli`` and ``ollama``: a
+    non-empty ``request.metadata['model']`` wins; anything else
+    (None, wrong type, OR empty string) falls through to the config
+    ``default_model``. The selector produces ``chosen_model = ""``
+    in two distinct cases — caller said ``model=""`` AND caller
+    omitted ``model`` while picking a non-default backend — and in
+    both cases the intended downstream behavior is the same: let
+    the provider apply its own ``default_model``. Distinguishing
+    those two cases at the provider boundary would force the
+    selector to thread a separate signal, which the rest of the
+    codebase doesn't do.
     """
     override = request.metadata.get("model")
-    if isinstance(override, str):
+    if isinstance(override, str) and override:
         return override
     return default
 

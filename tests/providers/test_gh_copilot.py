@@ -226,30 +226,31 @@ async def test_no_model_omits_dash_m(monkeypatch):
     assert "-m" not in argv
 
 
-async def test_explicit_empty_model_overrides_config_default(monkeypatch):
-    """Caller-explicit ``model=""`` is honored over a configured default.
+async def test_empty_metadata_model_falls_through_to_config_default(monkeypatch):
+    """``request.metadata['model'] == ''`` resolves to config default.
 
-    The selector convention (see ``ProviderSelector.select`` and the
-    matching codex_cli / claude_cli ``_resolve_model`` helpers) is
-    that ``model is None`` means "no override; use defaults" while
-    ``model == ""`` means "EXPLICIT: let the backend pick its
-    ambient default, even if a per-provider default_model is
-    configured". Without ``is not None`` distinction, this signal is
-    silently dropped at the provider boundary.
+    Mirrors the codex_cli / ollama contract: the selector emits
+    ``chosen_model = ""`` for two reasons — caller said ``model=""``
+    AND caller omitted ``model`` while picking a non-default
+    backend — and in both cases the provider must apply its own
+    config-level ``default_model``. The ``isinstance(override, str)
+    and override`` truthy check in ``_resolve_model`` is the
+    canonical way to express this; assert the chain still works
+    end-to-end.
     """
     proc = _FakeProc(stdout=_success_stdout(SUCCESS_PAYLOAD))
     calls = _install_fake_proc(monkeypatch, proc)
     config = GhCopilotProviderConfig(default_model="gpt-5.4")
 
-    # Caller passes ``model=""`` explicitly — must NOT inherit the
-    # config default.
     request = _make_request(metadata={"repo": "tolldog/example", "model": ""})
     await GhCopilotProvider(config).review(request)
 
     argv = calls[0]
-    assert "-m" not in argv, (
-        "explicit model='' must override config default and omit -m"
-    )
+    # Empty metadata model falls through → config default fires →
+    # ``-m gpt-5.4`` lands in argv.
+    assert "-m" in argv
+    m_idx = argv.index("-m")
+    assert argv[m_idx + 1] == "gpt-5.4"
 
 
 async def test_reasoning_effort_threaded_to_argv(monkeypatch):
