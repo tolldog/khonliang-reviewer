@@ -146,12 +146,14 @@ class ClaudeCliProvider(ReviewProvider):
         # tools — so locking this prevents an unexpected MCP/skill
         # invocation from succeeding silently. Cheap defense-in-depth.
         #
-        # Why no ``--bare``: as of claude 2.1.119, ``--bare`` forces
-        # ``ANTHROPIC_API_KEY`` / ``apiKeyHelper`` auth and skips OAuth
-        # / keychain reads. That violates the per-token-cost rule from
-        # ``feedback_claude_subprocess_exception.md`` — the whole point
-        # of the CLI subprocess is to ride the subscription quota via
-        # ``CLAUDE_CODE_OAUTH_TOKEN``. Re-evaluate if Anthropic adds an
+        # Why no ``--bare``: as of claude 2.1.119, ``--bare`` is
+        # documented to read Anthropic auth strictly from
+        # ``ANTHROPIC_API_KEY`` (or ``apiKeyHelper`` via ``--settings``)
+        # — OAuth and keychain are never read. Combining ``--bare`` with
+        # ``claude -p`` therefore forces pay-per-token API billing,
+        # which defeats this provider's purpose of riding the
+        # ``CLAUDE_CODE_OAUTH_TOKEN`` subscription quota (see this
+        # module's docstring). Re-evaluate if Anthropic adds an
         # OAuth-compatible bare mode.
         cmd = [
             self.config.binary,
