@@ -1280,7 +1280,7 @@ def main() -> None:
     from khonliang_bus import add_version_flag
 
     parser = argparse.ArgumentParser(
-        prog="reviewer.agent",
+        prog="khonliang-reviewer",
         description="khonliang-reviewer bus agent",
     )
     add_version_flag(parser)
