@@ -232,3 +232,67 @@ async def test_submit_review_forwards_payload():
     assert len(captured["kwargs"]["comments"]) == 1
     assert submitted.id == 123
     assert submitted.state == "COMMENTED"
+
+
+# ---------------------------------------------------------------------------
+# githubkit constructor — kwarg compatibility (regression for bug_reviewer_0870e278)
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_client_passes_auth_kwarg_to_githubkit(monkeypatch):
+    """Token must be threaded through as ``auth=``, not the legacy ``token=``.
+
+    githubkit ~0.13 renamed the constructor kwarg from ``token`` to
+    ``auth``; the prior shape would raise:
+
+        GitHubCore.__init__() got an unexpected keyword argument 'token'
+
+    on every review_pr call. Guard against that regression.
+    """
+    captured: dict[str, Any] = {}
+
+    class _FakeGitHub:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    import githubkit
+
+    monkeypatch.setattr(githubkit, "GitHub", _FakeGitHub)
+
+    client = ReviewerGithubClient(token="fake-token")
+    client._client()  # triggers lazy githubkit.GitHub(...) call
+
+    assert captured["args"] == ()
+    assert "token" not in captured["kwargs"], (
+        "legacy 'token' kwarg leaked through; current githubkit expects 'auth'"
+    )
+    assert captured["kwargs"].get("auth") == "fake-token"
+
+
+def test_lazy_client_no_kwargs_when_token_missing(monkeypatch):
+    """Without a token, ``GitHub()`` is called bare (anonymous client).
+
+    Anonymous clients can still hit public-repo read endpoints; the
+    constructor must not be passed ``auth=None``, which some versions
+    of githubkit treat as "explicit no-auth" but others reject.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class _FakeGitHub:
+        def __init__(self, *args, **kwargs):
+            captured.append({"args": args, "kwargs": kwargs})
+
+    import githubkit
+
+    monkeypatch.setattr(githubkit, "GitHub", _FakeGitHub)
+    # Stub the credentials lookup so the client doesn't pick up a real
+    # token from the environment / gh CLI during the test.
+    monkeypatch.setattr(
+        "reviewer.credentials.get_github_token", lambda: None
+    )
+
+    client = ReviewerGithubClient()
+    client._client()
+
+    assert captured == [{"args": (), "kwargs": {}}]

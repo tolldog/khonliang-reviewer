@@ -124,7 +124,15 @@ class ReviewerGithubClient:
                 ) from exc
             # Keyword form avoids reliance on the positional-arg order
             # of githubkit's GitHub constructor across minor versions.
-            self._gh = GitHub(token=self._token) if self._token else GitHub()
+            # As of githubkit ~0.13, the constructor takes ``auth`` —
+            # accepting either a string token or a TokenAuth wrapper —
+            # rather than the older ``token`` kwarg. Passing a bare
+            # string is still supported. Older versions used ``token``;
+            # operators on a stale install will see TypeError here and
+            # the bus skill (review_pr) will surface
+            # ``error_category="backend_error"`` with the kwarg name in
+            # the message, which is the diagnostic operators need.
+            self._gh = GitHub(auth=self._token) if self._token else GitHub()
         return self._gh
 
     # -- reads ---------------------------------------------------------
