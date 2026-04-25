@@ -51,21 +51,21 @@ class CodexCliAuthError(RuntimeError):
     """
 
 
-# Stable on-disk path for the JSON schema codex enforces via
-# ``--output-schema``. Single content per process — every provider
-# instance writes the same bytes derived from REVIEW_RESPONSE_SCHEMA, so
-# overwrites are idempotent. Living under ``tempfile.gettempdir()`` keeps
-# the file out of the repo without relying on ``__del__`` cleanup.
-_SCHEMA_FILE_NAME = "khonliang_codex_review_schema.json"
+def _materialize_schema_file() -> str:
+    """Materialize REVIEW_RESPONSE_SCHEMA to a fresh tempfile and return its path.
 
-
-def _ensure_schema_file() -> str:
-    """Write REVIEW_RESPONSE_SCHEMA to a stable tempfile path and return it."""
-    path = os.path.join(tempfile.gettempdir(), _SCHEMA_FILE_NAME)
-    # Always rewrite — cheap, ensures the on-disk content matches the
-    # in-process schema even if a stale copy survived from an older
-    # release.
-    with open(path, "w", encoding="utf-8") as f:
+    Uses :func:`tempfile.mkstemp` so the file is created with ``O_EXCL``
+    (no clobber of a hostile pre-existing path) and an unpredictable
+    suffix — closes the symlink-following / clobber vector that a
+    fixed-name path under ``gettempdir()`` would expose. Best-effort
+    cleanup is left to the OS at process exit; the schema file is tiny
+    (a few hundred bytes) and a single instance writes it at most once
+    via lazy init in :meth:`CodexCliProvider._get_schema_path`.
+    """
+    fd, path = tempfile.mkstemp(
+        prefix="khonliang_codex_review_schema_", suffix=".json"
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(REVIEW_RESPONSE_SCHEMA, f)
     return path
 
@@ -96,22 +96,48 @@ class CodexCliProvider(ReviewProvider):
 
     def __init__(self, config: CodexCliProviderConfig | None = None):
         self.config = config or CodexCliProviderConfig()
-        self._schema_path = _ensure_schema_file()
+        # Lazy: defer the tempfile write until the first ``review()`` call so
+        # that a tempdir / disk-full failure at startup doesn't prevent the
+        # whole reviewer agent from booting. Boot-time eagerness was the
+        # earlier shape; Copilot flagged it as a bus-wide single point of
+        # failure for any deployment that wires codex_cli into the default
+        # selector but never actually calls it.
+        self._schema_path: str | None = None
+
+    def _get_schema_path(self) -> str:
+        """Return the on-disk schema path, materializing it on first use."""
+        if self._schema_path is None:
+            self._schema_path = _materialize_schema_file()
+        return self._schema_path
 
     async def healthcheck(self) -> None:
         """Verify the CLI is authenticated. Intended for agent boot.
 
-        Codex's ``login status`` subcommand emits free-form text — the
-        match is on the substring ``"Logged in"``. There is no ``--json``
-        flag on ``login status`` as of codex 0.125.0, so a string match
-        is the available contract.
+        Two acceptable auth paths:
+
+        1. ChatGPT subscription via ``codex login`` — detected by running
+           ``codex login status`` and matching the substring ``"Logged in"``
+           in its output. There is no ``--json`` flag on ``login status``
+           as of codex 0.125.0, so a string match is the available
+           contract.
+        2. API-key fallback via ``OPENAI_API_KEY`` env var — codex reads
+           this automatically when ``~/.codex/auth.json`` is absent. If
+           the env var is set we accept that path without invoking
+           ``codex login status``: a logged-out subscription state is fine
+           when the API key is present.
 
         Raises:
             FileNotFoundError: if the ``codex`` binary is not on PATH.
-            CodexCliAuthError: if the CLI reports logged-out.
+            CodexCliAuthError: if neither auth path is available.
             RuntimeError: for other unexpected failures (non-zero exit
                 without an auth-shaped message).
         """
+        if os.environ.get("OPENAI_API_KEY"):
+            # API-key path is sufficient on its own; skip the login
+            # probe so we don't fail on a logged-out subscription when
+            # the operator has explicitly chosen the env-var route.
+            return
+
         proc = await asyncio.create_subprocess_exec(
             self.config.binary,
             "login",
@@ -169,7 +195,7 @@ class CodexCliProvider(ReviewProvider):
             "--ignore-user-config",
             "--ignore-rules",
             "--output-schema",
-            self._schema_path,
+            self._get_schema_path(),
         ]
         if model:
             cmd += ["-m", model]

@@ -118,8 +118,16 @@ The `model` argument is honored on all three backends:
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).
 - **Codex-via-CLI** threads `model` through as `codex exec -m <spec>`.
-  When neither the request nor the provider config supplies one, the `-m`
-  flag is omitted and codex picks from `~/.codex/config.toml`.
+  On the bus-skill path the selector usually supplies a model — either
+  the caller's `model` argument or, when the caller picks `codex_cli`
+  without a `model`, the provider's own
+  `CodexCliProviderConfig.default_model` (configurable in
+  `config.yaml`). Only when both are empty does the provider omit `-m`
+  and let codex pick from `~/.codex/config.toml`. Note: the
+  selector deliberately does **not** apply `config.default_model` to a
+  non-default backend, because the global default is paired with the
+  default backend (e.g. `qwen2.5-coder:14b` is an Ollama model, not a
+  Codex one).
 
 `review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
 aggregation) are upcoming work units and not yet registered.

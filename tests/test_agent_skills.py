@@ -844,6 +844,52 @@ def test_default_selector_honors_config_yaml(tmp_path):
     assert selector.config.default_model == "claude-opus-4-7"
 
 
+def test_selector_does_not_apply_default_model_to_non_default_backend():
+    """When the caller picks a non-default backend without a model, the
+    selector returns an empty model string so the provider applies its
+    own default rather than inheriting the global default model — which
+    is paired with the global default backend and would not fit (e.g.
+    an Ollama model spec leaking into Codex / Claude).
+    """
+    class _Stub(ReviewProvider):
+        def __init__(self, name: str):
+            self.name = name
+
+        async def review(self, request):  # pragma: no cover — unused
+            raise NotImplementedError
+
+    providers = {
+        "ollama": _Stub("ollama"),
+        "codex_cli": _Stub("codex_cli"),
+        "claude_cli": _Stub("claude_cli"),
+    }
+    selector = ProviderSelector(
+        providers,
+        SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
+    )
+
+    # No caller input: both fall through to the default pair.
+    provider, model = selector.select()
+    assert provider.name == "ollama"
+    assert model == "qwen2.5-coder:14b"
+
+    # Caller picks default backend without a model: paired default applies.
+    provider, model = selector.select(backend="ollama", model=None)
+    assert provider.name == "ollama"
+    assert model == "qwen2.5-coder:14b"
+
+    # Caller picks a different backend without a model: empty string,
+    # so the provider gets to apply its own default.
+    provider, model = selector.select(backend="codex_cli", model=None)
+    assert provider.name == "codex_cli"
+    assert model == ""
+
+    # Caller-supplied model always wins, regardless of backend.
+    provider, model = selector.select(backend="codex_cli", model="gpt-5")
+    assert provider.name == "codex_cli"
+    assert model == "gpt-5"
+
+
 # ---------------------------------------------------------------------------
 # severity_floor post-filter (FR fr_reviewer_dfd27582)
 # ---------------------------------------------------------------------------

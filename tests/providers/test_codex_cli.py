@@ -349,6 +349,7 @@ async def test_payload_without_findings_yields_empty_list(monkeypatch):
 
 
 async def test_healthcheck_logged_in_succeeds(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     proc = _FakeProc(stdout=b"Logged in using ChatGPT\n")
     _install_fake_proc(monkeypatch, proc)
 
@@ -357,6 +358,7 @@ async def test_healthcheck_logged_in_succeeds(monkeypatch):
 
 
 async def test_healthcheck_logged_out_raises_auth_error(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     proc = _FakeProc(stdout=b"Not logged in\n")
     _install_fake_proc(monkeypatch, proc)
 
@@ -364,7 +366,24 @@ async def test_healthcheck_logged_out_raises_auth_error(monkeypatch):
         await CodexCliProvider().healthcheck()
 
 
+async def test_healthcheck_api_key_env_skips_login_probe(monkeypatch):
+    """OPENAI_API_KEY presence accepts the env-var auth path without invoking codex login."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*cmd: str, **_: object) -> _FakeProc:
+        calls.append(tuple(cmd))
+        return _FakeProc(stdout=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    # Should not raise even though no login probe runs
+    await CodexCliProvider().healthcheck()
+    assert calls == [], "healthcheck should short-circuit on OPENAI_API_KEY"
+
+
 async def test_healthcheck_nonzero_exit_raises_runtime_error(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     proc = _FakeProc(stdout=b"", stderr=b"oops", returncode=1)
     _install_fake_proc(monkeypatch, proc)
 
@@ -374,24 +393,34 @@ async def test_healthcheck_nonzero_exit_raises_runtime_error(monkeypatch):
 
 
 async def test_healthcheck_missing_binary_raises_filenotfound(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     _install_missing_binary(monkeypatch)
 
     with pytest.raises(FileNotFoundError):
         await CodexCliProvider().healthcheck()
 
 
-def test_schema_file_written_to_tempdir():
-    """Provider init must materialize the schema file on disk."""
+def test_schema_file_lazy_init_writes_on_first_use():
+    """Schema path is None at construction; first access materializes the file."""
     provider = CodexCliProvider()
-    path = provider._schema_path
+    # Eager-init regression guard: __init__ must NOT touch the disk.
+    assert provider._schema_path is None
+    path = provider._get_schema_path()
     assert os.path.isfile(path)
+    # Calls after the first reuse the cached path (no rewrite).
+    assert provider._get_schema_path() == path
     with open(path) as f:
         loaded = json.load(f)
-    # Round-trips REVIEW_RESPONSE_SCHEMA
     assert loaded == codex_cli.REVIEW_RESPONSE_SCHEMA
-    # findings.severity enum is present and matches the contract
     finding_props = loaded["properties"]["findings"]["items"]["properties"]
     assert finding_props["severity"]["enum"] == ["nit", "comment", "concern"]
+
+
+def test_schema_file_uses_unique_tempfile_path():
+    """Two provider instances must materialize to distinct paths (mkstemp guarantees uniqueness)."""
+    a = CodexCliProvider()
+    b = CodexCliProvider()
+    assert a._get_schema_path() != b._get_schema_path()
 
 
 # Integration: exercises the real codex binary if available + authenticated.
