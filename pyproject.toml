@@ -26,6 +26,11 @@ include = ["reviewer*"]
 
 [tool.setuptools.package-data]
 "reviewer.data" = ["*.yaml"]
+# Bundle the reference diff with installs so
+# ``python -m reviewer.tools.benchmark_sweep`` works out-of-the-box
+# (without ``--diff <path>``) on the same machine that imports the
+# package.
+"reviewer.tools.benchmark_data" = ["*.diff"]
 
 [build-system]
 requires = ["setuptools>=68"]

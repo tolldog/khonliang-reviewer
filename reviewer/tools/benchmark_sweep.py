@@ -113,7 +113,25 @@ def load_diff(source: str | None) -> tuple[str, str]:
       flow). Surfacing fetch errors as a friendly RuntimeError.
     """
     if not source:
-        diff = _DEFAULT_DIFF_PATH.read_text(encoding="utf-8")
+        # Catch ``OSError`` (parent of ``FileNotFoundError``,
+        # ``PermissionError``, etc.) and surface a clearer hint than
+        # the raw filesystem error. This branch fires when the
+        # package was installed without bundling the
+        # ``benchmark_data/`` payload — the harness still works but
+        # the operator must pass ``--diff <path>`` or a PR
+        # reference.
+        try:
+            diff = _DEFAULT_DIFF_PATH.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"bundled reference diff is missing at "
+                f"{_DEFAULT_DIFF_PATH}: {exc}. The package may have "
+                f"been installed without ``benchmark_data/`` payload "
+                f"(check pyproject.toml ``package-data`` includes "
+                f"``reviewer/tools/benchmark_data/*.diff``). Pass "
+                f"``--diff <path>`` or a ``<owner>/<repo>#<num>`` "
+                f"PR reference to bypass."
+            ) from exc
         return diff, f"bundled:{_DEFAULT_DIFF_PATH.name}"
 
     pr_match = _PR_REF_PATTERN.match(source)
@@ -185,14 +203,22 @@ def _filter_registry(
     for reg in registry.list():
         if backend_filter and reg.backend not in backend_filter:
             continue
-        # Always run at least once per backend, even when the pricing
-        # YAML is silent about declared models (gives the row + the
-        # provider's own default a place to land in the report).
-        candidate_models = list(reg.models) if reg.models else [""]
-        for m in candidate_models:
-            if model_filter and m and m not in model_filter:
-                continue
-            pairs.append((reg, m))
+        if reg.models:
+            for m in reg.models:
+                if model_filter and m not in model_filter:
+                    continue
+                pairs.append((reg, m))
+        else:
+            # Backend with no declared models. When ``--model`` is
+            # set, the empty sentinel can't satisfy any filter — drop
+            # the row rather than running an unfiltered provider in
+            # what's supposed to be a model-scoped sweep. When
+            # ``--model`` is NOT set, run once with the empty
+            # sentinel so a freshly-registered backend with empty
+            # pricing YAML still appears in the matrix (its own
+            # config default_model resolves at provider time).
+            if not model_filter:
+                pairs.append((reg, ""))
     return pairs
 
 
@@ -264,13 +290,23 @@ async def _run_one(
         severities[f.severity] = severities.get(f.severity, 0) + 1
 
     usage = result.usage
+    measured_ms = int((time.monotonic() - start) * 1000)
+    # Prefer the provider's reported duration (typically more accurate
+    # — it strips off our own argv-assembly overhead) but fall back
+    # to wall-clock when the provider didn't populate ``usage`` or
+    # left ``duration_ms`` at 0. Otherwise rows from providers that
+    # don't track latency themselves would show a misleading 0ms.
+    if usage and usage.duration_ms:
+        duration_ms = usage.duration_ms
+    else:
+        duration_ms = measured_ms
     return _BenchmarkRow(
         backend=reg.backend,
         model=model,
         disposition=result.disposition,
         error=result.error,
         error_category=result.error_category,
-        duration_ms=usage.duration_ms if usage else 0,
+        duration_ms=duration_ms,
         input_tokens=usage.input_tokens if usage else 0,
         output_tokens=usage.output_tokens if usage else 0,
         finding_count_total=len(result.findings),
