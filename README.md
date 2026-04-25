@@ -122,8 +122,13 @@ The `model` argument is honored on all three backends:
   the caller's `model` argument or, when the caller picks `codex_cli`
   without a `model`, the provider's own
   `CodexCliProviderConfig.default_model` (configurable in
-  `config.yaml`). Only when both are empty does the provider omit `-m`
-  and let codex pick from `~/.codex/config.toml`. Note: the
+  `config.yaml` under `providers.codex_cli.default_model`). Only when
+  both are empty does the provider omit `-m`, and in that case codex
+  falls back to its **built-in default model** — not the user's
+  `~/.codex/config.toml`, because the subprocess argv also passes
+  `--ignore-user-config` for deterministic behavior across operators.
+  If you want a deterministic per-provider default, set
+  `providers.codex_cli.default_model` explicitly. Note also that the
   selector deliberately does **not** apply `config.default_model` to a
   non-default backend, because the global default is paired with the
   default backend (e.g. `qwen2.5-coder:14b` is an Ollama model, not a

@@ -318,13 +318,52 @@ class CodexCliProvider(ReviewProvider):
 def _resolve_model(request: ReviewRequest, default: str) -> str:
     """Use request-supplied model if present, else the provider default.
 
-    Returns an empty string when neither is set so the caller can omit
-    ``-m`` from argv and let codex pick from its own config.
+    Returns an empty string when neither is set, in which case the
+    provider omits ``-m`` from argv. Note: the subprocess argv also
+    includes ``--ignore-user-config``, so codex does **not** read
+    ``~/.codex/config.toml`` for a default model in that case — it
+    falls back to its own built-in default model selection (whatever
+    the codex binary's compiled-in default is at the running version).
+    Operators who want a deterministic per-provider default should set
+    ``CodexCliProviderConfig.default_model`` explicitly (or pass
+    ``model`` per request).
     """
     override = request.metadata.get("model")
     if isinstance(override, str) and override:
         return override
     return default
+
+
+_VALID_SEVERITIES: frozenset[str] = frozenset(("nit", "comment", "concern"))
+
+
+def _coerce_str(val: Any, default: str = "") -> str:
+    """Defensive str coercion that treats ``None`` / non-strings as ``default``.
+
+    ``str(None)`` would produce the literal string ``"None"`` which then
+    leaks into the ``ReviewResult.summary`` and ``ReviewFinding.title``
+    fields — surprising operators reading the output. The reviewer's
+    bus-boundary-validation principle (per ``CLAUDE.md``) says external
+    payloads must be validated before constructing library dataclasses;
+    this function is the validation point for string-typed fields.
+    """
+    if isinstance(val, str):
+        return val
+    return default
+
+
+def _coerce_severity(val: Any) -> str:
+    """Map an external severity value to the contract enum or default to ``comment``.
+
+    ``ReviewFinding.severity`` is a ``Literal["nit", "comment", "concern"]``;
+    a typo or wrong type from the model output would silently land an
+    out-of-contract value in the dataclass. Coerce to ``comment`` (a
+    safe middle severity) when the value is unknown so downstream
+    severity_floor filtering still works correctly.
+    """
+    if isinstance(val, str) and val in _VALID_SEVERITIES:
+        return val
+    return "comment"
 
 
 def _parse_payload(
@@ -335,20 +374,28 @@ def _parse_payload(
     started_wall: float,
     duration_ms: int,
 ) -> ReviewResult:
-    """Translate a schema-validated codex payload into a :class:`ReviewResult`."""
-    summary = str(payload.get("summary", ""))
+    """Translate a schema-validated codex payload into a :class:`ReviewResult`.
+
+    Even though ``--output-schema`` enforces the response shape upstream,
+    the parser still validates types defensively. The codex JSON-schema
+    surface is a recently-added subprocess contract; any future schema
+    laxity (or an off-spec model that emits ``null`` for required
+    fields) would otherwise produce surprising values like
+    ``summary == "None"`` or out-of-enum severities reaching the bus.
+    """
+    summary = _coerce_str(payload.get("summary"))
     raw_findings = payload.get("findings") or []
     if not isinstance(raw_findings, list):
         raw_findings = []
     findings = [
         ReviewFinding(
-            severity=item.get("severity", "comment"),
-            title=str(item.get("title", "")),
-            body=str(item.get("body", "")),
-            category=str(item.get("category", "")),
-            path=item.get("path"),
+            severity=_coerce_severity(item.get("severity")),  # type: ignore[arg-type]
+            title=_coerce_str(item.get("title")),
+            body=_coerce_str(item.get("body")),
+            category=_coerce_str(item.get("category")),
+            path=item.get("path") if isinstance(item.get("path"), str) else None,
             line=_int_or_none(item.get("line")),
-            suggestion=item.get("suggestion"),
+            suggestion=item.get("suggestion") if isinstance(item.get("suggestion"), str) else None,
         )
         for item in raw_findings
         if isinstance(item, dict)

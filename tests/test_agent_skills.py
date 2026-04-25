@@ -844,6 +844,59 @@ def test_default_selector_honors_config_yaml(tmp_path):
     assert selector.config.default_model == "claude-opus-4-7"
 
 
+def test_ollama_default_model_decoupled_from_global_default(tmp_path):
+    """Ollama's provider-default model must NOT inherit a non-Ollama global default.
+
+    When ``default_provider: claude_cli`` and ``default_model:
+    claude-opus-4-7``, an earlier shape sourced
+    ``OllamaProviderConfig.default_model`` from the global
+    ``config.default_model`` — which would inject a Claude model id
+    into Ollama. The current shape sources Ollama's default from
+    ``providers.ollama.default_model`` with a built-in qwen baseline,
+    so a caller that picks ``backend: ollama`` without a model gets a
+    valid Ollama model id even when the global default isn't Ollama-shaped.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_provider: claude_cli\n"
+        "default_model: claude-opus-4-7\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    base_url: http://example:11434/v1\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    # Built-in baseline applies; the global default_model 'claude-opus-4-7'
+    # must NOT have leaked into Ollama's provider config.
+    assert ollama_provider.config.default_model == "qwen2.5-coder:14b"
+
+
+def test_ollama_default_model_honors_per_provider_config(tmp_path):
+    """When operators set ``providers.ollama.default_model`` it overrides the qwen baseline."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_provider: claude_cli\n"
+        "default_model: claude-opus-4-7\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    base_url: http://example:11434/v1\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.default_model == "glm-4.7-flash"
+
+
 def test_selector_does_not_apply_default_model_to_non_default_backend():
     """When the caller picks a non-default backend without a model, the
     selector returns an empty model string so the provider applies its

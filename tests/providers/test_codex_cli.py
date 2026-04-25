@@ -348,6 +348,71 @@ async def test_payload_without_findings_yields_empty_list(monkeypatch):
     assert result.findings == []
 
 
+async def test_null_summary_coerced_to_empty_string(monkeypatch):
+    """An off-spec payload with ``summary: null`` must not produce ``"None"``."""
+    proc = _FakeProc(stdout=b'{"summary": null, "findings": []}')
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await CodexCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    assert result.summary == ""
+    assert result.findings == []
+
+
+async def test_unknown_severity_coerced_to_comment(monkeypatch):
+    """Severities outside the contract enum default to ``comment`` — preserves
+    severity_floor filtering and avoids leaking off-spec values into ReviewFinding.
+    """
+    payload = {
+        "summary": "ok",
+        "findings": [
+            {"severity": "MEGA", "title": "A", "body": "B"},
+            {"severity": None, "title": "C", "body": "D"},
+            {"severity": 7, "title": "E", "body": "F"},
+            {"severity": "concern", "title": "G", "body": "H"},
+        ],
+    }
+    proc = _FakeProc(stdout=json.dumps(payload).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await CodexCliProvider().review(_make_request())
+
+    assert result.disposition == "posted"
+    severities = [f.severity for f in result.findings]
+    assert severities == ["comment", "comment", "comment", "concern"]
+
+
+async def test_null_finding_string_fields_coerced(monkeypatch):
+    """Null title / body / category / path / suggestion must not stringify to ``"None"``."""
+    payload = {
+        "summary": "ok",
+        "findings": [
+            {
+                "severity": "nit",
+                "title": None,
+                "body": None,
+                "category": None,
+                "path": None,
+                "line": None,
+                "suggestion": None,
+            },
+        ],
+    }
+    proc = _FakeProc(stdout=json.dumps(payload).encode())
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await CodexCliProvider().review(_make_request())
+
+    finding = result.findings[0]
+    assert finding.title == ""
+    assert finding.body == ""
+    assert finding.category == ""
+    assert finding.path is None
+    assert finding.line is None
+    assert finding.suggestion is None
+
+
 async def test_healthcheck_logged_in_succeeds(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     proc = _FakeProc(stdout=b"Logged in using ChatGPT\n")

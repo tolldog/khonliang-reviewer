@@ -1217,7 +1217,22 @@ class ReviewerAgent(BaseAgent):
                     base_url=str(
                         ollama_cfg.get("base_url") or "http://localhost:11434/v1"
                     ),
-                    default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
+                    # Source Ollama's provider-default model from
+                    # ``providers.ollama.default_model`` (per-provider
+                    # config), falling back to the built-in qwen
+                    # baseline. Decoupled from the global
+                    # ``config.default_model`` so an operator who sets
+                    # ``default_provider: claude_cli`` and
+                    # ``default_model: claude-opus-4-7`` doesn't
+                    # accidentally inject a Claude model id into Ollama
+                    # when a caller picks ``backend: ollama`` without
+                    # specifying a model. The selector deliberately
+                    # returns ``""`` for non-default-backend selections
+                    # (see ``ProviderSelector.select``); each provider
+                    # then applies its own config-level default.
+                    default_model=str(
+                        ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
+                    ),
                 )
             ),
         }
