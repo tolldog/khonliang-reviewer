@@ -495,21 +495,41 @@ def test_schema_file_lazy_init_writes_on_first_use():
     # Eager-init regression guard: __init__ must NOT touch the disk.
     assert provider._schema_path is None
     path = provider._get_schema_path()
-    assert os.path.isfile(path)
-    # Calls after the first reuse the cached path (no rewrite).
-    assert provider._get_schema_path() == path
-    with open(path) as f:
-        loaded = json.load(f)
-    assert loaded == codex_cli.REVIEW_RESPONSE_SCHEMA
-    finding_props = loaded["properties"]["findings"]["items"]["properties"]
-    assert finding_props["severity"]["enum"] == ["nit", "comment", "concern"]
+    try:
+        assert os.path.isfile(path)
+        # Calls after the first reuse the cached path (no rewrite).
+        assert provider._get_schema_path() == path
+        with open(path) as f:
+            loaded = json.load(f)
+        assert loaded == codex_cli.REVIEW_RESPONSE_SCHEMA
+        finding_props = loaded["properties"]["findings"]["items"]["properties"]
+        assert finding_props["severity"]["enum"] == ["nit", "comment", "concern"]
+    finally:
+        # Production materializes once per provider instance and leaves
+        # the file for the OS tempdir sweep (see _materialize_schema_file
+        # docstring). The test creates one file per run, which would
+        # accumulate across thousands of CI invocations; clean up
+        # explicitly so the suite stays side-effect free.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def test_schema_file_uses_unique_tempfile_path():
     """Two provider instances must materialize to distinct paths (mkstemp guarantees uniqueness)."""
     a = CodexCliProvider()
     b = CodexCliProvider()
-    assert a._get_schema_path() != b._get_schema_path()
+    a_path = a._get_schema_path()
+    b_path = b._get_schema_path()
+    try:
+        assert a_path != b_path
+    finally:
+        for p in (a_path, b_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 async def test_schema_materialization_oserror_yields_errored_result(monkeypatch):

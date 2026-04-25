@@ -135,7 +135,8 @@ The `model` argument is honored on all three backends:
   Codex one).
 
 `review_pr` (GitHub fetch + post) and `usage_summary` (SQLite-backed
-aggregation) are upcoming work units and not yet registered.
+aggregation) are also registered alongside `review_text` / `review_diff`
+as part of the current bus-skill surface.
 
 ## Repository Boundaries
 
