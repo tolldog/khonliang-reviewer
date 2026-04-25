@@ -82,3 +82,20 @@ pricing:
     output_per_mtoken_usd: 4.0
     source_url: https://ollama.com/pricing
     as_of: "2026-04-20"
+
+  # -----------------------------------------------------------------
+  # codex_cli — `codex exec` shells out to the OpenAI ChatGPT subscription
+  # quota via ~/.codex/auth.json (provisioned by `codex login`). The 0.0
+  # rates below are deliberate placeholders: `codex exec` without `--json`
+  # does not emit per-call token counts on stdout, so `estimated_api_cost_usd`
+  # is always 0 today regardless of what we put here. Populate with real
+  # OpenAI API rates only after a follow-up FR adds `--json` event-stream
+  # parsing and surfaces token counts; until then they would be misleading
+  # numbers attached to events that never actually carry a token count.
+  # -----------------------------------------------------------------
+  - backend: codex_cli
+    model: gpt-5
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: https://openai.com/api/pricing
+    as_of: "2026-04-24"

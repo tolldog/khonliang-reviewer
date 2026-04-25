@@ -45,8 +45,15 @@ class ProviderSelector:
     Precedence:
 
     1. Caller-supplied ``backend`` + ``model`` — always win.
-    2. Caller-supplied ``backend`` alone — backend from caller, model
-       from config default.
+    2. Caller-supplied ``backend`` alone:
+       - When the chosen backend matches ``config.default_backend`` the
+         caller-omitted model resolves to ``config.default_model``.
+       - When the chosen backend differs from the default backend, the
+         model resolves to ``""`` so the provider applies its own
+         default. ``config.default_model`` is treated as paired with
+         ``config.default_backend`` and is not applied to a different
+         backend, since the global default model would not fit (e.g.
+         ``qwen2.5-coder:14b`` is not a Codex model).
     3. No caller input — both from config default.
     """
 
@@ -69,7 +76,24 @@ class ProviderSelector:
         model: str | None = None,
     ) -> tuple[ReviewProvider, str]:
         chosen_backend = backend or self.config.default_backend
-        chosen_model = model or self.config.default_model
+        # Distinguish ``None`` (caller didn't supply a value, fall
+        # through to the default-resolution rules) from ``""``
+        # (caller explicitly chose "no model", which means "let the
+        # provider apply its own default"). The previous shape used
+        # ``if model:`` which collapsed both cases — a caller passing
+        # ``model=""`` would unexpectedly inherit ``config.default_model``
+        # when the chosen backend matched ``config.default_backend``.
+        if model is not None:
+            chosen_model = model
+        elif chosen_backend == self.config.default_backend:
+            chosen_model = self.config.default_model
+        else:
+            # Caller switched backends without specifying a model; the
+            # global ``default_model`` is paired with ``default_backend``
+            # and would not fit here (e.g. an Ollama model spec leaking
+            # into a Codex / Claude provider). Empty string lets the
+            # provider apply its own default.
+            chosen_model = ""
         provider = self._providers.get(chosen_backend)
         if provider is None:
             raise UnknownBackendError(

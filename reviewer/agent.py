@@ -54,6 +54,8 @@ from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
+    CodexCliProvider,
+    CodexCliProviderConfig,
     OllamaProvider,
     OllamaProviderConfig,
 )
@@ -726,7 +728,16 @@ class ReviewerAgent(BaseAgent):
             return {"error": "content is required and must be a non-empty string"}
 
         caller_backend = args.get("backend") or None
-        caller_model = args.get("model") or None
+        # Preserve an explicit empty-string model: ``model=""`` means
+        # "let the provider apply its own default", which is the
+        # semantic ``ProviderSelector.select()`` honors when the
+        # caller passes ``model is not None``. Coalescing ``""`` to
+        # ``None`` here would silently route the caller back into the
+        # default-resolution rules, defeating the explicit signal.
+        # ``None`` (key absent / wrong type) still maps to ``None``;
+        # only non-string values are filtered out.
+        raw_model = args.get("model")
+        caller_model = raw_model if isinstance(raw_model, str) else None
         context = _as_dict(args.get("context"))
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the
@@ -751,7 +762,11 @@ class ReviewerAgent(BaseAgent):
 
         try:
             selector = self._ensure_selector()
-            if caller_backend or caller_model:
+            # ``is not None`` (not truthiness) so explicit ``model=""``
+            # — meaning "let the provider apply its own default" —
+            # takes the caller-override branch instead of falling
+            # through to rule-table resolution.
+            if caller_backend is not None or caller_model is not None:
                 provider, chosen_model = selector.select(
                     backend=caller_backend, model=caller_model
                 )
@@ -1029,7 +1044,12 @@ class ReviewerAgent(BaseAgent):
                 "pr": metadata.to_dict(),
             },
             "backend": args.get("backend") or "",
-            "model": args.get("model") or "",
+            # Forward ``model`` verbatim so handle_review_text's empty-
+            # string-vs-None distinction reaches the selector. ``None``
+            # (caller omitted) and ``""`` (caller-explicit "use
+            # provider default") have different meanings; ``or ""``
+            # would conflate them.
+            "model": args.get("model"),
             "metadata": {"repo": repo, "pr_number": pr_number},
             # review_pr fetches via API (no local clone), so the
             # ``.reviewer/config.yaml`` layer can't activate here —
@@ -1196,6 +1216,7 @@ class ReviewerAgent(BaseAgent):
         config = self._load_config()
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
+        codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
         providers = {
             "claude_cli": ClaudeCliProvider(
@@ -1203,12 +1224,33 @@ class ReviewerAgent(BaseAgent):
                     binary=str(claude_cfg.get("binary") or "claude"),
                 )
             ),
+            "codex_cli": CodexCliProvider(
+                CodexCliProviderConfig(
+                    binary=str(codex_cfg.get("binary") or "codex"),
+                    default_model=str(codex_cfg.get("default_model") or ""),
+                )
+            ),
             "ollama": OllamaProvider(
                 OllamaProviderConfig(
                     base_url=str(
                         ollama_cfg.get("base_url") or "http://localhost:11434/v1"
                     ),
-                    default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
+                    # Source Ollama's provider-default model from
+                    # ``providers.ollama.default_model`` (per-provider
+                    # config), falling back to the built-in qwen
+                    # baseline. Decoupled from the global
+                    # ``config.default_model`` so an operator who sets
+                    # ``default_provider: claude_cli`` and
+                    # ``default_model: claude-opus-4-7`` doesn't
+                    # accidentally inject a Claude model id into Ollama
+                    # when a caller picks ``backend: ollama`` without
+                    # specifying a model. The selector deliberately
+                    # returns ``""`` for non-default-backend selections
+                    # (see ``ProviderSelector.select``); each provider
+                    # then applies its own config-level default.
+                    default_model=str(
+                        ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
+                    ),
                 )
             ),
         }

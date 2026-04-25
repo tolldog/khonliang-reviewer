@@ -166,6 +166,62 @@ async def test_review_text_caller_model_override_threads_to_metadata():
     assert fake.last_request.metadata["model"] == "kimi-k2.5:cloud"
 
 
+async def test_review_text_explicit_empty_model_reaches_provider():
+    """Caller passing ``model=""`` should reach the provider as ``""``.
+
+    The selector distinguishes ``model is None`` (not supplied → fall
+    through to default-resolution) from ``model == ""`` (explicit
+    "use the provider's own default"). Earlier shapes coalesced ``""``
+    to ``None`` at the bus-skill boundary, making the explicit-empty
+    semantic unreachable through the public skill API. Guard against
+    regressing back into that.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "backend": "ollama", "model": ""},
+    )
+
+    assert fake.last_request is not None
+    # Empty string is preserved through the agent → selector → provider chain.
+    assert fake.last_request.metadata["model"] == ""
+
+
+async def test_review_text_explicit_empty_model_without_backend_routes_via_caller_override():
+    """``model=""`` without an explicit ``backend`` must still take the
+    caller-override branch, not fall through to rule-table resolution.
+
+    The dispatch branch at ``handle_review_text`` previously did:
+
+        if caller_backend or caller_model:
+            ... caller override path ...
+
+    which is truthiness — ``model=""`` was falsy, so the condition was
+    False (when no backend was supplied either) and the request fell
+    through to rule-table / default-resolution. That silently
+    overwrote the explicit-empty signal with whatever the rule table
+    picked. Switching to ``is not None`` distinguishes "caller supplied
+    explicit empty" (caller-override path) from "caller didn't say"
+    (rule-table path).
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "model": ""},
+    )
+
+    assert fake.last_request is not None
+    # No ``backend`` supplied → selector falls through to default
+    # backend (ollama). The explicit ``model=""`` must still reach the
+    # provider as ``""`` so the provider applies its own default,
+    # rather than being clobbered by rule-table resolution.
+    assert fake.last_request.metadata["model"] == ""
+
+
 async def test_review_text_forwards_instructions_and_context():
     fake = _RecordingProvider("ollama", _make_result())
     harness = _make_harness({"ollama": fake})
@@ -812,15 +868,15 @@ async def test_usage_summary_since_zero_treated_as_no_filter():
 # ---------------------------------------------------------------------------
 
 
-def test_default_selector_constructs_both_providers_from_empty_config(tmp_path):
-    """Without a config file, defaults are used; both providers present."""
+def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
+    """Without a config file, defaults are used; every shipped provider present."""
     agent = ReviewerAgent(
         agent_id="reviewer-test",
         bus_url="http://mock",
         config_path="",
     )
     selector = agent._ensure_selector()
-    assert set(selector.providers) == {"claude_cli", "ollama"}
+    assert set(selector.providers) == {"claude_cli", "codex_cli", "ollama"}
     assert selector.config.default_backend == "ollama"
     assert selector.config.default_model == "qwen2.5-coder:14b"
 
@@ -842,6 +898,118 @@ def test_default_selector_honors_config_yaml(tmp_path):
     selector = agent._ensure_selector()
     assert selector.config.default_backend == "claude_cli"
     assert selector.config.default_model == "claude-opus-4-7"
+
+
+def test_ollama_default_model_decoupled_from_global_default(tmp_path):
+    """Ollama's provider-default model must NOT inherit a non-Ollama global default.
+
+    When ``default_provider: claude_cli`` and ``default_model:
+    claude-opus-4-7``, an earlier shape sourced
+    ``OllamaProviderConfig.default_model`` from the global
+    ``config.default_model`` — which would inject a Claude model id
+    into Ollama. The current shape sources Ollama's default from
+    ``providers.ollama.default_model`` with a built-in qwen baseline,
+    so a caller that picks ``backend: ollama`` without a model gets a
+    valid Ollama model id even when the global default isn't Ollama-shaped.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_provider: claude_cli\n"
+        "default_model: claude-opus-4-7\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    base_url: http://example:11434/v1\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    # Built-in baseline applies; the global default_model 'claude-opus-4-7'
+    # must NOT have leaked into Ollama's provider config.
+    assert ollama_provider.config.default_model == "qwen2.5-coder:14b"
+
+
+def test_ollama_default_model_honors_per_provider_config(tmp_path):
+    """When operators set ``providers.ollama.default_model`` it overrides the qwen baseline."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_provider: claude_cli\n"
+        "default_model: claude-opus-4-7\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    base_url: http://example:11434/v1\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.default_model == "glm-4.7-flash"
+
+
+def test_selector_does_not_apply_default_model_to_non_default_backend():
+    """When the caller picks a non-default backend without a model, the
+    selector returns an empty model string so the provider applies its
+    own default rather than inheriting the global default model — which
+    is paired with the global default backend and would not fit (e.g.
+    an Ollama model spec leaking into Codex / Claude).
+    """
+    class _Stub(ReviewProvider):
+        def __init__(self, name: str):
+            self.name = name
+
+        async def review(self, request):  # pragma: no cover — unused
+            raise NotImplementedError
+
+    providers = {
+        "ollama": _Stub("ollama"),
+        "codex_cli": _Stub("codex_cli"),
+        "claude_cli": _Stub("claude_cli"),
+    }
+    selector = ProviderSelector(
+        providers,
+        SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
+    )
+
+    # No caller input: both fall through to the default pair.
+    provider, model = selector.select()
+    assert provider.name == "ollama"
+    assert model == "qwen2.5-coder:14b"
+
+    # Caller picks default backend without a model: paired default applies.
+    provider, model = selector.select(backend="ollama", model=None)
+    assert provider.name == "ollama"
+    assert model == "qwen2.5-coder:14b"
+
+    # Caller picks a different backend without a model: empty string,
+    # so the provider gets to apply its own default.
+    provider, model = selector.select(backend="codex_cli", model=None)
+    assert provider.name == "codex_cli"
+    assert model == ""
+
+    # Caller-supplied model always wins, regardless of backend.
+    provider, model = selector.select(backend="codex_cli", model="gpt-5")
+    assert provider.name == "codex_cli"
+    assert model == "gpt-5"
+
+    # Caller-explicit ``model=""`` is honored verbatim (means "use
+    # provider's own default") — distinct from ``model=None`` which
+    # falls through to the default-resolution rules.
+    provider, model = selector.select(backend="ollama", model="")
+    assert provider.name == "ollama"
+    assert model == ""
+
+    # Same explicit empty against the default backend: still empty,
+    # not the global default. Caller's ``""`` always wins.
+    provider, model = selector.select(model="")
+    assert provider.name == "ollama"
+    assert model == ""
 
 
 # ---------------------------------------------------------------------------
