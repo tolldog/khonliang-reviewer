@@ -488,6 +488,35 @@ def test_schema_file_uses_unique_tempfile_path():
     assert a._get_schema_path() != b._get_schema_path()
 
 
+async def test_schema_materialization_oserror_yields_errored_result(monkeypatch):
+    """A tempfile/disk failure during lazy schema init should not crash review()."""
+    provider = CodexCliProvider()
+
+    def fail_materialize() -> str:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(provider, "_get_schema_path", fail_materialize)
+
+    # The fake subprocess never gets called because the schema-write
+    # error short-circuits review() before subprocess construction.
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*cmd: str, **_: Any) -> _FakeProc:
+        calls.append(tuple(cmd))
+        return _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await provider.review(_make_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
+    assert "output-schema file" in result.error
+    assert "No space left on device" in result.error
+    # Subprocess must NOT have been spawned — short-circuit before argv.
+    assert calls == []
+
+
 # Integration: exercises the real codex binary if available + authenticated.
 @pytest.mark.skipif(
     not os.path.exists(os.path.expanduser("~/.codex/auth.json")),

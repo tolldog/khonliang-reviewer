@@ -191,6 +191,27 @@ class CodexCliProvider(ReviewProvider):
 
         model = _resolve_model(request, self.config.default_model)
 
+        # Materialize the schema file before assembling argv. The
+        # lazy-init helper writes to a tempfile via ``mkstemp``; under
+        # rare conditions (tempdir not writable, disk full, EMFILE on
+        # the process) that ``open()`` can raise OSError. Catching
+        # here turns what would otherwise be an uncaught crash of the
+        # bus skill call into a structured ``errored`` ReviewResult so
+        # the caller sees the same shape every other failure path
+        # produces. Categorized as ``backend_error`` — the codex
+        # binary isn't the problem; the local environment is.
+        try:
+            schema_path = self._get_schema_path()
+        except OSError as exc:
+            return _errored(
+                request,
+                error=f"failed to materialize codex output-schema file: {exc}",
+                error_category="backend_error",
+                model=model or "codex",
+                started_wall=started_wall,
+                duration_ms=_elapsed_ms(started_mono),
+            )
+
         cmd = [
             self.config.binary,
             "exec",
@@ -199,7 +220,7 @@ class CodexCliProvider(ReviewProvider):
             "--ignore-user-config",
             "--ignore-rules",
             "--output-schema",
-            self._get_schema_path(),
+            schema_path,
         ]
         if model:
             cmd += ["-m", model]
