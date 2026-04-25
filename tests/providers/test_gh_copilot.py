@@ -429,6 +429,36 @@ async def test_missing_binary_errored(monkeypatch):
     assert "copilot" in result.error
 
 
+async def test_argv_too_long_yields_errored_result(monkeypatch):
+    """Oversized prompts that overflow argv must surface as errored,
+    not crash the skill call. ``OSError`` (errno 7 / E2BIG) is the
+    most likely concrete cause; this test simulates it generically."""
+
+    async def fake_exec(*_cmd: str, **_kwargs: object) -> object:
+        # OSError with errno=7 mirrors how Linux reports E2BIG when
+        # execve's argv exceeds ARG_MAX. The provider's broad
+        # OSError catch covers this branch without depending on the
+        # specific errno — but we set it so the error message
+        # surfaces realistic context.
+        err = OSError(7, "Argument list too long")
+        raise err
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    # Use a large prompt so the byte-count in the error message is
+    # representative of the failure mode operators would see.
+    big = _make_request(content="x" * 200_000)
+    result = await GhCopilotProvider().review(big)
+
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
+    assert "errno=7" in result.error
+    # Prompt-size hint must be in the operator-facing message so
+    # the trigger condition is visible without re-running.
+    assert "bytes" in result.error
+    assert "ARG_MAX" in result.error
+
+
 async def test_subprocess_timeout_errored(monkeypatch):
     proc = _FakeProc(
         stdout=_success_stdout(SUCCESS_PAYLOAD),
@@ -479,7 +509,10 @@ async def test_healthcheck_with_binary_and_token_succeeds(monkeypatch):
         gh_copilot.shutil, "which",
         lambda binary: "/usr/local/bin/copilot" if binary == "copilot" else None,
     )
-    monkeypatch.setenv("GH_TOKEN", "ghp_fake")
+    # Use a v2 fine-grained PAT shape (``github_pat_*``); copilot
+    # does NOT accept classic ``ghp_`` PATs, so the test fixture
+    # should reflect what an operator would actually set.
+    monkeypatch.setenv("GH_TOKEN", "github_pat_fake")
 
     # Should not raise.
     await GhCopilotProvider().healthcheck()

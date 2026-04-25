@@ -184,6 +184,20 @@ class GhCopilotProvider(ReviewProvider):
         if self.config.reasoning_effort:
             cmd += ["--effort", self.config.reasoning_effort]
 
+        # ``copilot -p <prompt>`` carries the prompt as a single argv
+        # element (the CLI has no ``--prompt-file`` / stdin variant as
+        # of GitHub Copilot CLI 1.0.36 — verified 2026-04-25). Large
+        # diffs can exceed OS ``ARG_MAX`` (~128KB on Linux,
+        # ~1MB on macOS) and raise ``OSError`` (errno 7, ``E2BIG``)
+        # from ``execve``; the exec call also raises plain ``OSError``
+        # for various platform-specific failures beyond the
+        # ``FileNotFoundError`` subclass. Catch the broad ``OSError``
+        # parent so neither mode crashes the bus skill call —
+        # translate to a structured errored ReviewResult instead.
+        # ``FileNotFoundError`` is a subclass and gets the
+        # binary_not_found category; everything else (E2BIG, ENOMEM,
+        # transient platform errors) maps to backend_error so
+        # operators can tell the difference.
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -195,6 +209,26 @@ class GhCopilotProvider(ReviewProvider):
                 request,
                 error=f"copilot binary not found at {self.config.binary!r}",
                 error_category="binary_not_found",
+                model=model or "copilot",
+                started_wall=started_wall,
+                duration_ms=_elapsed_ms(started_mono),
+            )
+        except OSError as exc:
+            # Most likely E2BIG on a large diff — argv overflow. The
+            # error message names the prompt size so operators can
+            # see the trigger condition without re-running.
+            prompt_bytes = len(prompt.encode("utf-8", errors="replace"))
+            return _errored(
+                request,
+                error=(
+                    f"copilot exec failed to spawn (errno={exc.errno}): {exc}. "
+                    f"Prompt was {prompt_bytes} bytes; "
+                    f"copilot CLI passes the prompt via argv (no stdin / "
+                    f"--prompt-file variant), so very large diffs may exceed "
+                    f"OS ARG_MAX. Consider chunking the diff or routing "
+                    f"large reviews to a different backend."
+                ),
+                error_category="backend_error",
                 model=model or "copilot",
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
@@ -511,6 +545,25 @@ def _errored(
 def _auth_present() -> bool:
     """Return True if any of the env vars or the ``~/.copilot/`` dir
     is present.
+
+    **Known blind spot:** macOS systems where the operator authenticated
+    via ``copilot login`` (web flow) and the token went straight into
+    the system credential store WITHOUT ``~/.copilot/`` ever being
+    created can slip past this probe. In practice the directory is
+    created the first time ``copilot`` runs (for config / history
+    files, even when the token lives in the keyring), so any operator
+    who has run the CLI once will hit the directory check correctly.
+    Operators on a freshly-provisioned box that hasn't run ``copilot``
+    interactively — but has the keyring entry from a prior install —
+    must set one of :data:`_AUTH_ENV_VARS` explicitly to be detected
+    by this probe.
+
+    The GitHub Copilot CLI does not expose a ``copilot login status``
+    or analogous cheap-probe command (verified 2026-04-25, CLI 1.0.36),
+    so a true keyring lookup would require either a real
+    ``copilot -p`` invocation (which spends subscription quota) or a
+    platform-specific keyring read. Both are heavier than the
+    probe's cheap-static contract — out of scope.
 
     Mirrors :func:`reviewer.registry._gh_copilot_auth_present`. Kept
     separate so the provider's healthcheck doesn't import from the
