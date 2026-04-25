@@ -532,9 +532,14 @@ def _stderr_suggests_unknown_option(stderr_text: str) -> bool:
     Older ``claude`` CLIs that predate ``--permission-mode`` (2.1.119)
     will reject our argv with a generic non-zero exit. Detecting the
     canonical "unknown option" / "unrecognized argument" wording lets
-    the provider upgrade the error category to ``binary_not_found``
-    and rewrite the error message to point at the version requirement
-    — much faster than hunting through truncated stderr.
+    the provider rewrite the operator-facing error message to name
+    the version requirement and the right config knob to point at,
+    instead of leaving operators to grep for "unknown option" in a
+    truncated stderr to figure out it's a version problem. The
+    ``error_category`` itself stays ``nonzero_exit`` because the
+    binary is present and ran — adding a ``binary_incompatible``
+    category would expand scope to ``khonliang-reviewer-lib``'s
+    ``ErrorCategory`` enum.
     """
     lowered = stderr_text.lower()
     return any(hint in lowered for hint in _UNKNOWN_OPTION_HINTS)
