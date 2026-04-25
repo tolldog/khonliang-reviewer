@@ -76,10 +76,14 @@ class CodexCliProviderConfig:
 
     binary: str = "codex"
     timeout_seconds: float = 300.0
-    #: Empty string defers to codex's own configured default (typically
-    #: read from ``~/.codex/config.toml``). Set when an operator wants
-    #: to lock the provider to a specific model regardless of codex's
-    #: ambient default.
+    #: Empty string causes the provider to omit ``-m`` from argv, in
+    #: which case codex falls back to its own **built-in default
+    #: model** — NOT the user's ``~/.codex/config.toml``, because the
+    #: subprocess argv passes ``--ignore-user-config`` for
+    #: deterministic behavior across operators. Set this to a specific
+    #: model id when an operator wants a deterministic per-provider
+    #: default regardless of the codex binary's compiled-in choice or
+    #: the global selector default.
     default_model: str = ""
 
 
