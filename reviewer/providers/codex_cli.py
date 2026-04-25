@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -57,10 +58,17 @@ def _materialize_schema_file() -> str:
     Uses :func:`tempfile.mkstemp` so the file is created with ``O_EXCL``
     (no clobber of a hostile pre-existing path) and an unpredictable
     suffix — closes the symlink-following / clobber vector that a
-    fixed-name path under ``gettempdir()`` would expose. Best-effort
-    cleanup is left to the OS at process exit; the schema file is tiny
-    (a few hundred bytes) and a single instance writes it at most once
-    via lazy init in :meth:`CodexCliProvider._get_schema_path`.
+    fixed-name path under ``gettempdir()`` would expose. The file is
+    NOT cleaned up at process exit (``mkstemp`` does not register
+    atexit unlinking, unlike :class:`tempfile.NamedTemporaryFile`);
+    it persists in ``gettempdir()`` until the operating system's
+    periodic tempdir cleanup removes it. The schema file is tiny (a
+    few hundred bytes) and a single provider instance writes it at
+    most once via lazy init in
+    :meth:`CodexCliProvider._get_schema_path`, so accumulation across
+    many short-lived processes is bounded by the host's tempdir
+    sweep policy. If the residue ever becomes load-bearing, register
+    an :func:`atexit` unlink at the call site.
     """
     fd, path = tempfile.mkstemp(
         prefix="khonliang_codex_review_schema_", suffix=".json"
@@ -140,6 +148,16 @@ class CodexCliProvider(ReviewProvider):
             # API-key path is sufficient on its own; skip the login
             # probe so we don't fail on a logged-out subscription when
             # the operator has explicitly chosen the env-var route.
+            # Still verify the binary exists — the docstring promises
+            # FileNotFoundError when ``codex`` is missing, and an
+            # API-key-set environment with no codex binary would
+            # otherwise let boot succeed only to fail every review()
+            # call later. ``shutil.which`` honors absolute paths and
+            # PATH lookup symmetrically.
+            if shutil.which(self.config.binary) is None:
+                raise FileNotFoundError(
+                    f"codex binary not found at {self.config.binary!r}"
+                )
             return
 
         proc = await asyncio.create_subprocess_exec(

@@ -432,8 +432,15 @@ async def test_healthcheck_logged_out_raises_auth_error(monkeypatch):
 
 
 async def test_healthcheck_api_key_env_skips_login_probe(monkeypatch):
-    """OPENAI_API_KEY presence accepts the env-var auth path without invoking codex login."""
+    """OPENAI_API_KEY presence accepts the env-var auth path without invoking codex login.
+
+    When the binary is on PATH, the env-var short-circuit is honored
+    and no ``codex login status`` subprocess is invoked.
+    """
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
+    monkeypatch.setattr(
+        codex_cli.shutil, "which", lambda _binary: "/usr/local/bin/codex"
+    )
     calls: list[tuple[str, ...]] = []
 
     async def fake_exec(*cmd: str, **_: object) -> _FakeProc:
@@ -445,6 +452,23 @@ async def test_healthcheck_api_key_env_skips_login_probe(monkeypatch):
     # Should not raise even though no login probe runs
     await CodexCliProvider().healthcheck()
     assert calls == [], "healthcheck should short-circuit on OPENAI_API_KEY"
+
+
+async def test_healthcheck_api_key_set_but_binary_missing_raises(monkeypatch):
+    """OPENAI_API_KEY without a codex binary on PATH still raises FileNotFoundError.
+
+    Otherwise an env-var-only environment with no codex binary would
+    let ``healthcheck()`` succeed at boot but fail every subsequent
+    ``review()`` call — silently broken until the first review attempt.
+    The docstring promises FileNotFoundError when the binary is
+    missing, regardless of which auth path the operator chose.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-real")
+    monkeypatch.setattr(codex_cli.shutil, "which", lambda _binary: None)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        await CodexCliProvider().healthcheck()
+    assert "codex" in str(excinfo.value)
 
 
 async def test_healthcheck_nonzero_exit_raises_runtime_error(monkeypatch):

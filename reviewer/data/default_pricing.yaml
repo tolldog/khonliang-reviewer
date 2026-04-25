@@ -85,12 +85,13 @@ pricing:
 
   # -----------------------------------------------------------------
   # codex_cli — `codex exec` shells out to the OpenAI ChatGPT subscription
-  # quota via ~/.codex/auth.json (provisioned by `codex login`). For
-  # subscription-backed runs the rates are hypothetical: "what this would
-  # have cost on the OpenAI API". codex exec without --json does not emit
-  # token counts, so estimated_api_cost_usd is left at 0 in UsageEvent;
-  # the per-token rates here are kept as reference for when token counts
-  # become available (event-stream parsing follow-up).
+  # quota via ~/.codex/auth.json (provisioned by `codex login`). The 0.0
+  # rates below are deliberate placeholders: `codex exec` without `--json`
+  # does not emit per-call token counts on stdout, so `estimated_api_cost_usd`
+  # is always 0 today regardless of what we put here. Populate with real
+  # OpenAI API rates only after a follow-up FR adds `--json` event-stream
+  # parsing and surfaces token counts; until then they would be misleading
+  # numbers attached to events that never actually carry a token count.
   # -----------------------------------------------------------------
   - backend: codex_cli
     model: gpt-5
