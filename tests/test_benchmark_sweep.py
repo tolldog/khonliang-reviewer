@@ -416,12 +416,11 @@ async def test_duration_ms_falls_back_to_wall_clock_when_usage_missing(tmp_path)
         registry=registry,
     )
 
-    # Wall-clock fallback. Even a no-op fake takes >=0ms; the int
-    # cast can land at 0 on extremely fast hosts. Assert >=0 so the
-    # field always populates from the measured path; a separate
-    # branch (usage with duration_ms != 0) is covered by other tests.
+    # Wall-clock fallback clamps to a 1ms floor so a row from a
+    # provider that didn't track latency never reports a misleading
+    # 0ms even on hosts where the int-cast lands at 0.
     assert len(rows) == 1
-    assert rows[0].duration_ms >= 0
+    assert rows[0].duration_ms >= 1
 
 
 async def test_run_writes_diff_payload_to_output(tmp_path):

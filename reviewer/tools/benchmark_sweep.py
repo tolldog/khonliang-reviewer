@@ -256,8 +256,15 @@ async def _run_one(
     start = time.monotonic()
     try:
         result = await provider.review(request)
+        # Capture wall-clock immediately so the fallback measurement
+        # tracks provider runtime only, not the artifact-write +
+        # finding-iteration that happens below. ``max(..., 1)`` keeps
+        # the row from reporting a misleading 0ms on extremely fast
+        # providers (the sub-millisecond clamp is purely cosmetic but
+        # makes "the harness measured something" unambiguous).
+        measured_ms = max(int((time.monotonic() - start) * 1000), 1)
     except Exception as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
+        duration_ms = max(int((time.monotonic() - start) * 1000), 1)
         _LOGGER.warning(
             "benchmark sweep: %s/%s raised %s: %s",
             reg.backend,
@@ -295,12 +302,13 @@ async def _run_one(
         severities[f.severity] = severities.get(f.severity, 0) + 1
 
     usage = result.usage
-    measured_ms = int((time.monotonic() - start) * 1000)
-    # Prefer the provider's reported duration (typically more accurate
-    # — it strips off our own argv-assembly overhead) but fall back
-    # to wall-clock when the provider didn't populate ``usage`` or
-    # left ``duration_ms`` at 0. Otherwise rows from providers that
-    # don't track latency themselves would show a misleading 0ms.
+    # ``measured_ms`` was captured immediately after ``await
+    # provider.review(...)`` so it reflects provider runtime only,
+    # not the artifact-write or finding-iteration that runs above.
+    # Prefer the provider's own reported duration (typically more
+    # accurate — it strips our argv-assembly overhead too); fall
+    # back to wall-clock when the provider didn't populate ``usage``
+    # or left ``duration_ms`` at 0.
     if usage and usage.duration_ms:
         duration_ms = usage.duration_ms
     else:
