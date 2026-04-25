@@ -8,7 +8,11 @@ dependencies = [
     "khonliang-bus-lib",
     "pyyaml>=6.0",
     "openai>=1.40",
-    "githubkit>=0.11",
+    # ``GitHub.__init__`` renamed the ``token`` kwarg to ``auth`` around
+    # 0.13; this provider passes ``auth=`` (see reviewer/github_client.py).
+    # Bump the floor accordingly so the install fails loudly on stale
+    # versions instead of getting a runtime TypeError on first review_pr.
+    "githubkit>=0.13",
 ]
 
 [project.optional-dependencies]
