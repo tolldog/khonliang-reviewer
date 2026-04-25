@@ -1262,6 +1262,25 @@ class ReviewerAgent(BaseAgent):
     def _ensure_registry(self) -> ProviderRegistry:
         if self._injected_registry is not None:
             return self._injected_registry
+        if self._injected_selector is not None:
+            # Test harnesses inject only a selector when they don't
+            # care about list_models metadata. Derive a minimal
+            # registry from the selector's provider map so
+            # ``list_models`` enumerates the SAME backends the
+            # selector resolves to. Without this, the agent would
+            # silently call ``_build_default_registry`` and
+            # instantiate real providers (claude/codex/ollama) under
+            # the hood — defeating the harness's isolation contract.
+            # The derived registry has no declared_models / default
+            # metadata; ``list_models`` callers see backends + a
+            # default-empty list, which is the truthful answer for
+            # an injection that didn't supply that information.
+            if self._cached_registry is None:
+                derived = ProviderRegistry()
+                for provider in self._injected_selector.providers.values():
+                    derived.register(provider)
+                self._cached_registry = derived
+            return self._cached_registry
         if self._cached_registry is None:
             self._cached_registry = self._build_default_registry()
         return self._cached_registry
@@ -1296,13 +1315,15 @@ class ReviewerAgent(BaseAgent):
             declared_by_backend.setdefault(row.backend, []).append(row.model)
 
         registry = ProviderRegistry()
+        claude_default = str(claude_cfg.get("default_model") or "")
         registry.register(
             ClaudeCliProvider(
                 ClaudeCliProviderConfig(
                     binary=str(claude_cfg.get("binary") or "claude"),
+                    default_model=claude_default,
                 )
             ),
-            default_model=str(claude_cfg.get("default_model") or ""),
+            default_model=claude_default,
             declared_models=declared_by_backend.get("claude_cli", []),
         )
         registry.register(

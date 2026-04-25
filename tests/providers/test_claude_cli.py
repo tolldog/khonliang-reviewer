@@ -696,3 +696,45 @@ async def test_healthcheck_malformed_output_raises_runtime(monkeypatch):
 async def test_claude_cli_auth_error_is_runtime_error():
     """Callers can catch RuntimeError to handle any healthcheck failure."""
     assert issubclass(ClaudeCliAuthError, RuntimeError)
+
+
+async def test_request_model_overrides_config_default(monkeypatch):
+    """Caller-supplied ``request.metadata['model']`` always wins."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    config = ClaudeCliProviderConfig(default_model="claude-haiku-4-5")
+    provider = ClaudeCliProvider(config)
+
+    request = _make_request(metadata={"repo": "tolldog/example", "model": "opus"})
+    await provider.review(request)
+
+    argv = calls[0]
+    assert "--model" in argv
+    m_idx = argv.index("--model")
+    assert argv[m_idx + 1] == "opus"
+
+
+async def test_config_default_model_used_when_request_silent(monkeypatch):
+    """Empty ``request.metadata['model']`` falls through to config default."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    config = ClaudeCliProviderConfig(default_model="claude-opus-4-7")
+    provider = ClaudeCliProvider(config)
+
+    await provider.review(_make_request())  # no metadata['model']
+
+    argv = calls[0]
+    assert "--model" in argv
+    m_idx = argv.index("--model")
+    assert argv[m_idx + 1] == "claude-opus-4-7"
+
+
+async def test_no_model_at_all_omits_flag(monkeypatch):
+    """Both empty → omit ``--model`` so claude -p picks its own ambient default."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    await ClaudeCliProvider().review(_make_request())  # default config = ""
+
+    argv = calls[0]
+    assert "--model" not in argv

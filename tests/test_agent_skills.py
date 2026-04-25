@@ -2211,6 +2211,45 @@ async def test_list_models_skill_parameters_match_contract():
     assert skill.parameters["backend"].get("default") == ""
 
 
+async def test_list_models_uses_selector_provider_set_when_only_selector_injected():
+    """Test harnesses that inject only a selector get a registry derived
+    from that selector — never silent fallback to ``_build_default_registry``.
+
+    Without this, a harness that injects a fake provider under
+    ``"ollama"`` would have its ``list_models`` quietly enumerate the
+    real ClaudeCli/CodexCli/Ollama providers from
+    ``_build_default_registry``, defeating the harness isolation
+    contract and instantiating real subprocess-bound providers
+    inside unit tests.
+    """
+    fake_a = _RecordingProvider("backend_a", _make_result(backend="backend_a"))
+    fake_b = _RecordingProvider("backend_b", _make_result(backend="backend_b"))
+    selector = ProviderSelector(
+        {"backend_a": fake_a, "backend_b": fake_b},
+        SelectorConfig(default_backend="backend_a", default_model="x"),
+    )
+    # Critical: registry= NOT supplied. Only selector.
+    harness = AgentTestHarness(
+        ReviewerAgent,
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
+
+    result = await harness.call("list_models", {})
+
+    backends = sorted(p["backend"] for p in result["providers"])
+    # Exactly the selector's two fakes — NOT claude_cli/codex_cli/ollama
+    # which would appear if list_models had silently fallen through to
+    # the default registry.
+    assert backends == ["backend_a", "backend_b"]
+    # Derived registry has no metadata; default_model is "" and
+    # models tuple is empty. That's the truthful answer for a
+    # selector-only injection.
+    for entry in result["providers"]:
+        assert entry["default_model"] == ""
+        assert entry["models"] == []
+
+
 async def test_list_models_handler_error_path_is_structured(monkeypatch):
     """Registry-level failures surface as ``{"error": ..., "providers": []}``
     instead of crashing the skill call."""
