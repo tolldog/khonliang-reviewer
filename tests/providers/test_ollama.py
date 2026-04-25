@@ -476,6 +476,28 @@ def test_suggest_num_ctx_caps_at_largest_ladder_step():
     assert _suggest_num_ctx("x" * 1_000_000) == 131072
 
 
+def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
+    """Ceiling division must push borderline prompts over the override
+    threshold rather than rounding down and silently truncating.
+
+    With chars/3 floor division, len=9217 produces 3072 estimated
+    tokens (9217 // 3 == 3072 because 3*3072 == 9216 < 9217), and
+    3072+1024=4096 ≤ 4096 → no override → truncation risk on a prompt
+    that's actually one character over the line. With math.ceil the
+    same length produces 3073, and 3073+1024=4097 > 4096 → first
+    ladder step (8192). Locks the conservative-bias property the
+    docstring promises.
+    """
+    from reviewer.providers.ollama import _suggest_num_ctx
+
+    # Just at the boundary: 9216 chars / 3 = 3072 tokens exactly,
+    # plus 1024 = 4096 → no override (still inside default).
+    assert _suggest_num_ctx("x" * 9216) is None
+    # One character over: ceil pushes to 3073 tokens + 1024 = 4097 →
+    # first ladder step.
+    assert _suggest_num_ctx("x" * 9217) == 8192
+
+
 async def test_review_omits_extra_body_for_small_prompt():
     """When the prompt fits the default window the SDK call carries no extra_body."""
     client = _make_client(response=SUCCESS_RESPONSE)

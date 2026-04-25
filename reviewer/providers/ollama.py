@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -274,9 +275,17 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
 # model returns a near-empty response. Tuned conservatively so a real
 # clean review on a small diff (which legitimately produces few output
 # tokens) doesn't fire the warning. 2000 input is well above any
-# plausible "small diff"; 32 output is below any structured JSON
-# review envelope (which carries summary + at least the schema's
-# required keys).
+# plausible "small diff". 32 output captures the silent-truncation
+# signature observed in bug_reviewer_663d0d62 (8 output tokens on a
+# 500-line diff): a meaningful review — even a clean approval — emits
+# a real summary string, which alone runs longer than 32 tokens once
+# you account for word boundaries; near-empty envelopes
+# (``{"summary":"","findings":[]}``) only require ~12 tokens, so 32
+# strikes a balance between catching trunation noise and not firing
+# on legitimate-but-terse reviews. The schema only *requires*
+# ``summary`` (a single short string would technically satisfy it),
+# so the threshold is empirical — observed truncated outputs cluster
+# under 16 tokens; observed legitimate reviews cluster well above.
 _TRUNCATION_INPUT_THRESHOLD = 2000
 _TRUNCATION_OUTPUT_THRESHOLD = 32
 
@@ -317,12 +326,18 @@ def _suggest_num_ctx(prompt: str) -> int | None:
     might confuse smaller local models.
 
     The estimator is deliberately conservative
-    (:data:`_CHARS_PER_TOKEN` set low) to bias toward overshooting:
-    a slightly larger ``num_ctx`` costs a small amount of GPU memory,
-    while the bug this closes (``num_ctx`` too small) silently hides
-    review findings.
+    (:data:`_CHARS_PER_TOKEN` set low + ``math.ceil`` rather than
+    floor division) to bias toward overshooting: a slightly larger
+    ``num_ctx`` costs a small amount of GPU memory, while the bug
+    this closes (``num_ctx`` too small) silently hides review
+    findings. Ceiling division specifically prevents borderline
+    prompts (e.g. 9217 chars ≈ exactly the 4096-token boundary at
+    chars/3) from rounding *down* under the threshold and skipping
+    the override.
     """
-    estimated_tokens = len(prompt) // _CHARS_PER_TOKEN + _RESPONSE_TOKEN_HEADROOM
+    estimated_tokens = (
+        math.ceil(len(prompt) / _CHARS_PER_TOKEN) + _RESPONSE_TOKEN_HEADROOM
+    )
     if estimated_tokens <= _NUM_CTX_DEFAULT:
         return None
     for ctx in _NUM_CTX_LADDER:
