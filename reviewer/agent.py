@@ -56,6 +56,8 @@ from reviewer.providers import (
     ClaudeCliProviderConfig,
     CodexCliProvider,
     CodexCliProviderConfig,
+    GhCopilotProvider,
+    GhCopilotProviderConfig,
     OllamaProvider,
     OllamaProviderConfig,
 )
@@ -1298,6 +1300,7 @@ class ReviewerAgent(BaseAgent):
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
+        copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
 
         # Per-backend declared-models comes from the pricing YAML;
@@ -1335,6 +1338,19 @@ class ReviewerAgent(BaseAgent):
             ),
             default_model=str(codex_cfg.get("default_model") or ""),
             declared_models=declared_by_backend.get("codex_cli", []),
+        )
+        copilot_default = str(copilot_cfg.get("default_model") or "")
+        copilot_effort = str(copilot_cfg.get("reasoning_effort") or "")
+        registry.register(
+            GhCopilotProvider(
+                GhCopilotProviderConfig(
+                    binary=str(copilot_cfg.get("binary") or "copilot"),
+                    default_model=copilot_default,
+                    reasoning_effort=copilot_effort,
+                )
+            ),
+            default_model=copilot_default,
+            declared_models=declared_by_backend.get("gh_copilot", []),
         )
         # Source Ollama's provider-default model from
         # ``providers.ollama.default_model`` (per-provider config),
