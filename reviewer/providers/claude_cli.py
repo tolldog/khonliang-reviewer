@@ -140,12 +140,35 @@ class ClaudeCliProvider(ReviewProvider):
         started_wall = time.time()
         started_mono = time.monotonic()
 
+        # ``--permission-mode dontAsk`` denies any tool not in
+        # ``permissions.allow`` or the read-only command set. Review is
+        # text-in / verdict-out — the sub-Claude has no need to call
+        # tools — so locking this prevents an unexpected MCP/skill
+        # invocation from succeeding silently. Cheap defense-in-depth.
+        # Minimum supported claude CLI version: 2.1.119 (the version
+        # that introduced ``--permission-mode``). Older binaries reject
+        # the flag with a generic non-zero exit; the error path below
+        # detects "unknown option" / "unrecognized argument" stderr
+        # patterns and upgrades the error category to make that case
+        # diagnosable.
+        #
+        # Why no ``--bare``: as of claude 2.1.119, ``--bare`` is
+        # documented to read Anthropic auth strictly from
+        # ``ANTHROPIC_API_KEY`` (or ``apiKeyHelper`` via ``--settings``)
+        # — OAuth and keychain are never read. Combining ``--bare`` with
+        # ``claude -p`` therefore forces pay-per-token API billing,
+        # which defeats this provider's purpose of riding the
+        # ``CLAUDE_CODE_OAUTH_TOKEN`` subscription quota (see this
+        # module's docstring). Re-evaluate if Anthropic adds an
+        # OAuth-compatible bare mode.
         cmd = [
             self.config.binary,
             "-p",
             "--output-format=json",
             "--json-schema",
             json.dumps(REVIEW_RESPONSE_SCHEMA),
+            "--permission-mode",
+            "dontAsk",
         ]
         if self.config.append_system_prompt:
             cmd += ["--append-system-prompt", self.config.append_system_prompt]
@@ -194,17 +217,42 @@ class ClaudeCliProvider(ReviewProvider):
 
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()[:500]
-            category = (
-                "auth_not_provisioned"
-                if _stderr_suggests_auth_failure(stderr_text)
-                else "nonzero_exit"
-            )
-            return _errored(
-                request,
-                error=(
+            if _stderr_suggests_auth_failure(stderr_text):
+                category = "auth_not_provisioned"
+                error_message = (
                     f"claude -p exited with {proc.returncode}"
                     + (f": {stderr_text}" if stderr_text else "")
-                ),
+                )
+            elif _stderr_suggests_unknown_option(stderr_text):
+                # Older claude CLIs that don't recognize one of our
+                # required flags (most likely ``--permission-mode``,
+                # which entered the CLI at 2.1.119). The binary is
+                # present and ran — it just lacks the flag — so we
+                # keep ``error_category="nonzero_exit"`` (the technical
+                # truth from analytics' point of view) and rewrite the
+                # operator-facing message to name the version
+                # requirement and the right config knob. Adding a new
+                # ``binary_incompatible`` category would require
+                # changing the ``ErrorCategory`` enum in
+                # ``khonliang-reviewer-lib``; out of scope here.
+                category = "nonzero_exit"
+                error_message = (
+                    f"claude -p rejected an argument (exit {proc.returncode}); "
+                    f"this provider requires claude CLI >= 2.1.119 for "
+                    f"--permission-mode support. Upgrade the binary, or "
+                    f"point ``providers.claude_cli.binary`` in config.yaml "
+                    f"at a newer claude installation"
+                    + (f". stderr: {stderr_text}" if stderr_text else "")
+                )
+            else:
+                category = "nonzero_exit"
+                error_message = (
+                    f"claude -p exited with {proc.returncode}"
+                    + (f": {stderr_text}" if stderr_text else "")
+                )
+            return _errored(
+                request,
+                error=error_message,
                 error_category=category,
                 started_wall=started_wall,
                 duration_ms=duration_ms,
@@ -466,6 +514,35 @@ def _stderr_suggests_auth_failure(stderr_text: str) -> bool:
     """
     lowered = stderr_text.lower()
     return any(hint in lowered for hint in _AUTH_FAILURE_HINTS)
+
+
+_UNKNOWN_OPTION_HINTS = (
+    "unknown option",
+    "unrecognized option",
+    "unrecognized argument",
+    "unknown argument",
+    "invalid option",
+    "no such option",
+)
+
+
+def _stderr_suggests_unknown_option(stderr_text: str) -> bool:
+    """Heuristic: does a non-zero-exit stderr look like an unknown-flag rejection?
+
+    Older ``claude`` CLIs that predate ``--permission-mode`` (2.1.119)
+    will reject our argv with a generic non-zero exit. Detecting the
+    canonical "unknown option" / "unrecognized argument" wording lets
+    the provider rewrite the operator-facing error message to name
+    the version requirement and the right config knob to point at,
+    instead of leaving operators to grep for "unknown option" in a
+    truncated stderr to figure out it's a version problem. The
+    ``error_category`` itself stays ``nonzero_exit`` because the
+    binary is present and ran — adding a ``binary_incompatible``
+    category would expand scope to ``khonliang-reviewer-lib``'s
+    ``ErrorCategory`` enum.
+    """
+    lowered = stderr_text.lower()
+    return any(hint in lowered for hint in _UNKNOWN_OPTION_HINTS)
 
 
 def _elapsed_ms(started_mono: float) -> int:

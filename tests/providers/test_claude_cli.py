@@ -168,6 +168,11 @@ async def test_success_envelope_produces_posted_review(monkeypatch):
     assert "-p" in argv
     assert "--output-format=json" in argv
     assert "--json-schema" in argv
+    # Sub-Claude has no need for tools; --permission-mode dontAsk denies
+    # anything outside permissions.allow + the read-only command set.
+    assert "--permission-mode" in argv
+    pm_idx = argv.index("--permission-mode")
+    assert argv[pm_idx + 1] == "dontAsk"
     # prompt is NOT in argv — it's piped via stdin to avoid ARG_MAX and
     # the `ps`-listing leak for diff content
     assert not any("diff --git" in part for part in argv)
@@ -256,6 +261,38 @@ async def test_non_zero_exit_with_auth_hint_upgrades_category(monkeypatch):
 
     assert result.disposition == "errored"
     assert result.error_category == "auth_not_provisioned"
+
+
+async def test_non_zero_exit_with_unknown_option_rewrites_message(monkeypatch):
+    """Older claude CLIs that don't recognize --permission-mode get a clear diagnostic.
+
+    Category stays ``nonzero_exit`` because the binary is present and
+    ran — the ErrorCategory enum has no ``binary_incompatible`` slot
+    today. The operator-facing message is what carries the version
+    requirement and the right config knob to update.
+    """
+    proc = _FakeProc(
+        stdout=b"",
+        stderr=b"error: unknown option '--permission-mode'",
+        returncode=2,
+    )
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "errored"
+    # Same category as a generic non-zero exit; analytics see the
+    # technical truth (CLI exited non-zero), operators get the
+    # diagnostic message instead.
+    assert result.error_category == "nonzero_exit"
+    assert "rejected an argument" in result.error
+    assert ">= 2.1.119" in result.error
+    # Operator pointer references the actual config knob, not a
+    # nonexistent env var.
+    assert "providers.claude_cli.binary" in result.error
+    # Original stderr is preserved so operators can still see the
+    # underlying CLI message for context.
+    assert "unknown option" in result.error
 
 
 async def test_non_json_stdout_errored(monkeypatch):
