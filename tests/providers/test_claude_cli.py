@@ -168,6 +168,11 @@ async def test_success_envelope_produces_posted_review(monkeypatch):
     assert "-p" in argv
     assert "--output-format=json" in argv
     assert "--json-schema" in argv
+    # Sub-Claude has no need for tools; --permission-mode dontAsk denies
+    # anything outside permissions.allow + the read-only command set.
+    assert "--permission-mode" in argv
+    pm_idx = argv.index("--permission-mode")
+    assert argv[pm_idx + 1] == "dontAsk"
     # prompt is NOT in argv — it's piped via stdin to avoid ARG_MAX and
     # the `ps`-listing leak for diff content
     assert not any("diff --git" in part for part in argv)

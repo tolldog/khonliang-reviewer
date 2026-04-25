@@ -140,12 +140,27 @@ class ClaudeCliProvider(ReviewProvider):
         started_wall = time.time()
         started_mono = time.monotonic()
 
+        # ``--permission-mode dontAsk`` denies any tool not in
+        # ``permissions.allow`` or the read-only command set. Review is
+        # text-in / verdict-out — the sub-Claude has no need to call
+        # tools — so locking this prevents an unexpected MCP/skill
+        # invocation from succeeding silently. Cheap defense-in-depth.
+        #
+        # Why no ``--bare``: as of claude 2.1.119, ``--bare`` forces
+        # ``ANTHROPIC_API_KEY`` / ``apiKeyHelper`` auth and skips OAuth
+        # / keychain reads. That violates the per-token-cost rule from
+        # ``feedback_claude_subprocess_exception.md`` — the whole point
+        # of the CLI subprocess is to ride the subscription quota via
+        # ``CLAUDE_CODE_OAUTH_TOKEN``. Re-evaluate if Anthropic adds an
+        # OAuth-compatible bare mode.
         cmd = [
             self.config.binary,
             "-p",
             "--output-format=json",
             "--json-schema",
             json.dumps(REVIEW_RESPONSE_SCHEMA),
+            "--permission-mode",
+            "dontAsk",
         ]
         if self.config.append_system_prompt:
             cmd += ["--append-system-prompt", self.config.append_system_prompt]
