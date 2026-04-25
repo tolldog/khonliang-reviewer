@@ -166,6 +166,29 @@ async def test_review_text_caller_model_override_threads_to_metadata():
     assert fake.last_request.metadata["model"] == "kimi-k2.5:cloud"
 
 
+async def test_review_text_explicit_empty_model_reaches_provider():
+    """Caller passing ``model=""`` should reach the provider as ``""``.
+
+    The selector distinguishes ``model is None`` (not supplied → fall
+    through to default-resolution) from ``model == ""`` (explicit
+    "use the provider's own default"). Earlier shapes coalesced ``""``
+    to ``None`` at the bus-skill boundary, making the explicit-empty
+    semantic unreachable through the public skill API. Guard against
+    regressing back into that.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "backend": "ollama", "model": ""},
+    )
+
+    assert fake.last_request is not None
+    # Empty string is preserved through the agent → selector → provider chain.
+    assert fake.last_request.metadata["model"] == ""
+
+
 async def test_review_text_forwards_instructions_and_context():
     fake = _RecordingProvider("ollama", _make_result())
     harness = _make_harness({"ollama": fake})

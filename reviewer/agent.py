@@ -728,7 +728,16 @@ class ReviewerAgent(BaseAgent):
             return {"error": "content is required and must be a non-empty string"}
 
         caller_backend = args.get("backend") or None
-        caller_model = args.get("model") or None
+        # Preserve an explicit empty-string model: ``model=""`` means
+        # "let the provider apply its own default", which is the
+        # semantic ``ProviderSelector.select()`` honors when the
+        # caller passes ``model is not None``. Coalescing ``""`` to
+        # ``None`` here would silently route the caller back into the
+        # default-resolution rules, defeating the explicit signal.
+        # ``None`` (key absent / wrong type) still maps to ``None``;
+        # only non-string values are filtered out.
+        raw_model = args.get("model")
+        caller_model = raw_model if isinstance(raw_model, str) else None
         context = _as_dict(args.get("context"))
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the
@@ -1031,7 +1040,12 @@ class ReviewerAgent(BaseAgent):
                 "pr": metadata.to_dict(),
             },
             "backend": args.get("backend") or "",
-            "model": args.get("model") or "",
+            # Forward ``model`` verbatim so handle_review_text's empty-
+            # string-vs-None distinction reaches the selector. ``None``
+            # (caller omitted) and ``""`` (caller-explicit "use
+            # provider default") have different meanings; ``or ""``
+            # would conflate them.
+            "model": args.get("model"),
             "metadata": {"repo": repo, "pr_number": pr_number},
             # review_pr fetches via API (no local clone), so the
             # ``.reviewer/config.yaml`` layer can't activate here —
