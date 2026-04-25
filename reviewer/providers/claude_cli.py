@@ -58,6 +58,17 @@ class ClaudeCliProviderConfig:
     binary: str = "claude"
     timeout_seconds: float = 300.0
     append_system_prompt: str | None = None
+    #: Empty string causes the provider to omit ``--model`` from argv
+    #: when the caller doesn't supply ``request.metadata["model"]``,
+    #: in which case ``claude -p`` falls back to its own ambient
+    #: default (typically the user's ``claude`` CLI configuration).
+    #: Set this to a specific spec (alias or full id) when the
+    #: operator wants a deterministic per-provider default that
+    #: doesn't depend on the caller's request shape — symmetric with
+    #: :class:`CodexCliProviderConfig.default_model` and
+    #: :class:`OllamaProviderConfig.default_model` so the registry's
+    #: ``default_model`` advertisement actually means something.
+    default_model: str = ""
 
 
 class ClaudeCliProvider(ReviewProvider):
@@ -173,11 +184,17 @@ class ClaudeCliProvider(ReviewProvider):
         if self.config.append_system_prompt:
             cmd += ["--append-system-prompt", self.config.append_system_prompt]
         # Caller-specified model flows via request.metadata["model"].
-        # `claude -p --model <spec>` accepts either an alias (`opus`, `sonnet`)
-        # or a fully-qualified id (`claude-opus-4-7`).
+        # When absent, fall back to ``ClaudeCliProviderConfig.default_model``
+        # so the per-provider default the registry advertises is the
+        # one that actually fires. Empty default = omit ``--model`` and
+        # let ``claude -p`` apply its own ambient default. ``claude -p
+        # --model <spec>`` accepts an alias (``opus``, ``sonnet``) or a
+        # fully-qualified id (``claude-opus-4-7``).
         requested_model = request.metadata.get("model")
         if isinstance(requested_model, str) and requested_model:
             cmd += ["--model", requested_model]
+        elif self.config.default_model:
+            cmd += ["--model", self.config.default_model]
         # Prompt goes via stdin, not argv: diffs easily exceed OS ARG_MAX
         # (~128KB on Linux) and argv is visible to other users via `ps`.
 

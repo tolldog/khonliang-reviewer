@@ -60,6 +60,7 @@ from reviewer.providers import (
     OllamaProviderConfig,
 )
 from reviewer.pricing_seed import load_default_pricing
+from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyDecision, PolicyInput, decide
 from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
 from reviewer.storage import UsageStore, open_usage_store
@@ -615,6 +616,7 @@ class ReviewerAgent(BaseAgent):
         self,
         *,
         selector: ProviderSelector | None = None,
+        registry: ProviderRegistry | None = None,
         usage_store: UsageStore | None = None,
         github_client: ReviewerGithubClient | None = None,
         **kwargs: Any,
@@ -622,6 +624,8 @@ class ReviewerAgent(BaseAgent):
         super().__init__(**kwargs)
         self._injected_selector = selector
         self._cached_selector: ProviderSelector | None = None
+        self._injected_registry = registry
+        self._cached_registry: ProviderRegistry | None = None
         self._injected_store = usage_store
         self._cached_store: UsageStore | None = None
         self._injected_github = github_client
@@ -712,6 +716,22 @@ class ReviewerAgent(BaseAgent):
                     "model": {"type": "string", "default": ""},
                     "since": {"type": "number", "default": 0},
                     "until": {"type": "number", "default": 0},
+                },
+                since="0.1.0",
+            ),
+            Skill(
+                "list_models",
+                "Enumerate registered review backends + their declared "
+                "models. Each entry includes a cheap availability hint "
+                "(binary on PATH, auth file present, etc.) — does NOT "
+                "exercise any model. Use this to discover the surface "
+                "before picking a `backend` / `model` for review_text / "
+                "review_diff / review_pr, or to drive a benchmark sweep.",
+                {
+                    # Optional filter: when set, return only the matching
+                    # backend (or empty list when unknown). Empty string
+                    # means "no filter" (return all).
+                    "backend": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -1137,6 +1157,33 @@ class ReviewerAgent(BaseAgent):
             "total_cost_usd": sum(s.total_cost_usd for s in summaries),
         }
 
+    @handler("list_models")
+    async def handle_list_models(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Enumerate registered backends + declared models.
+
+        Optional ``backend`` filter narrows the response to a single
+        backend (or empty when unknown). The cheap availability probe
+        in :class:`ProviderRegistry` reports whether the binary / auth
+        is in place but does NOT exercise the model — that's what
+        :meth:`ReviewProvider.healthcheck` is for.
+        """
+        backend_filter = args.get("backend")
+        if isinstance(backend_filter, str) and backend_filter:
+            filt: str | None = backend_filter
+        else:
+            filt = None
+        try:
+            registrations = self._ensure_registry().list(backend=filt)
+        except Exception as exc:
+            logger.warning("list_models failed: %s", exc)
+            return {
+                "error": f"list_models failed: {exc}",
+                "providers": [],
+            }
+        return {
+            "providers": [r.to_dict() for r in registrations],
+        }
+
     # -- internals -----------------------------------------------------
 
     async def _record_usage(self, result: ReviewResult) -> None:
@@ -1212,50 +1259,116 @@ class ReviewerAgent(BaseAgent):
             self._cached_store = store
         return self._cached_store
 
-    def _build_default_selector(self) -> ProviderSelector:
+    def _ensure_registry(self) -> ProviderRegistry:
+        if self._injected_registry is not None:
+            return self._injected_registry
+        if self._injected_selector is not None:
+            # Test harnesses inject only a selector when they don't
+            # care about list_models metadata. Derive a minimal
+            # registry from the selector's provider map so
+            # ``list_models`` enumerates the SAME backends the
+            # selector resolves to. Without this, the agent would
+            # silently call ``_build_default_registry`` and
+            # instantiate real providers (claude/codex/ollama) under
+            # the hood — defeating the harness's isolation contract.
+            # The derived registry has no declared_models / default
+            # metadata; ``list_models`` callers see backends + a
+            # default-empty list, which is the truthful answer for
+            # an injection that didn't supply that information.
+            if self._cached_registry is None:
+                derived = ProviderRegistry()
+                for provider in self._injected_selector.providers.values():
+                    derived.register(provider)
+                self._cached_registry = derived
+            return self._cached_registry
+        if self._cached_registry is None:
+            self._cached_registry = self._build_default_registry()
+        return self._cached_registry
+
+    def _build_default_registry(self) -> ProviderRegistry:
+        """Construct the canonical ProviderRegistry from agent config.
+
+        Reads ``providers.<backend>`` blocks from the agent config and
+        ``default_pricing.yaml`` rows for declared-model lists, then
+        registers ClaudeCli / CodexCli / Ollama providers under their
+        canonical backend names. Registration order is insertion
+        order; ``list_models`` returns providers in that order.
+        """
         config = self._load_config()
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
-        providers = {
-            "claude_cli": ClaudeCliProvider(
+
+        # Per-backend declared-models comes from the pricing YAML;
+        # operators add a row per (backend, model) they care about,
+        # and list_models surfaces them. Falling through to an empty
+        # list is fine — the registry will just show the per-provider
+        # default in that case.
+        try:
+            pricing_rows = load_default_pricing()
+        except Exception as exc:
+            logger.warning("default pricing seed failed: %s", exc)
+            pricing_rows = []
+        declared_by_backend: dict[str, list[str]] = {}
+        for row in pricing_rows:
+            declared_by_backend.setdefault(row.backend, []).append(row.model)
+
+        registry = ProviderRegistry()
+        claude_default = str(claude_cfg.get("default_model") or "")
+        registry.register(
+            ClaudeCliProvider(
                 ClaudeCliProviderConfig(
                     binary=str(claude_cfg.get("binary") or "claude"),
+                    default_model=claude_default,
                 )
             ),
-            "codex_cli": CodexCliProvider(
+            default_model=claude_default,
+            declared_models=declared_by_backend.get("claude_cli", []),
+        )
+        registry.register(
+            CodexCliProvider(
                 CodexCliProviderConfig(
                     binary=str(codex_cfg.get("binary") or "codex"),
                     default_model=str(codex_cfg.get("default_model") or ""),
                 )
             ),
-            "ollama": OllamaProvider(
+            default_model=str(codex_cfg.get("default_model") or ""),
+            declared_models=declared_by_backend.get("codex_cli", []),
+        )
+        # Source Ollama's provider-default model from
+        # ``providers.ollama.default_model`` (per-provider config),
+        # falling back to the built-in qwen baseline. Decoupled from
+        # the global ``config.default_model`` so an operator who sets
+        # ``default_provider: claude_cli`` and ``default_model:
+        # claude-opus-4-7`` doesn't accidentally inject a Claude model
+        # id into Ollama when a caller picks ``backend: ollama``
+        # without specifying a model. The selector deliberately
+        # returns ``""`` for non-default-backend selections (see
+        # ``ProviderSelector.select``); each provider then applies its
+        # own config-level default.
+        ollama_default = str(
+            ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
+        )
+        registry.register(
+            OllamaProvider(
                 OllamaProviderConfig(
                     base_url=str(
-                        ollama_cfg.get("base_url") or "http://localhost:11434/v1"
+                        ollama_cfg.get("base_url")
+                        or "http://localhost:11434/v1"
                     ),
-                    # Source Ollama's provider-default model from
-                    # ``providers.ollama.default_model`` (per-provider
-                    # config), falling back to the built-in qwen
-                    # baseline. Decoupled from the global
-                    # ``config.default_model`` so an operator who sets
-                    # ``default_provider: claude_cli`` and
-                    # ``default_model: claude-opus-4-7`` doesn't
-                    # accidentally inject a Claude model id into Ollama
-                    # when a caller picks ``backend: ollama`` without
-                    # specifying a model. The selector deliberately
-                    # returns ``""`` for non-default-backend selections
-                    # (see ``ProviderSelector.select``); each provider
-                    # then applies its own config-level default.
-                    default_model=str(
-                        ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
-                    ),
+                    default_model=ollama_default,
                 )
             ),
-        }
+            default_model=ollama_default,
+            declared_models=declared_by_backend.get("ollama", []),
+        )
+        return registry
+
+    def _build_default_selector(self) -> ProviderSelector:
+        config = self._load_config()
         return ProviderSelector(
-            providers,
+            self._ensure_registry().providers,
             SelectorConfig(
                 default_backend=str(config.get("default_provider") or "ollama"),
                 default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),

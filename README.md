@@ -138,6 +138,34 @@ The `model` argument is honored on all three backends:
 aggregation) are also registered alongside `review_text` / `review_diff`
 as part of the current bus-skill surface.
 
+`list_models` returns the catalog of registered backends and their
+declared models, including a cheap availability hint per backend
+(binary on PATH, auth file present, env var set — no network probe,
+no model invocation):
+
+```python
+result = await bus.call("reviewer-primary.list_models", {})
+# {"providers": [
+#   {"backend": "claude_cli", "default_model": "",
+#    "models": ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+#    "available": true, "reason": ""},
+#   {"backend": "codex_cli", "default_model": "",
+#    "models": ["gpt-5"], "available": true, "reason": ""},
+#   {"backend": "ollama", "default_model": "qwen2.5-coder:14b",
+#    "models": ["qwen2.5-coder:14b", "glm-4.7-flash", ...],
+#    "available": true, "reason": ""}
+# ]}
+```
+
+Pass `{"backend": "<name>"}` to filter to a single backend (or get
+an empty list when unknown). The declared-models list is sourced
+from `default_pricing.yaml` rows for that backend, with the
+provider's own default model surfaced first when set. For real
+liveness checks, call the provider's `healthcheck()` method directly
+— the `available` flag from `list_models` is intentionally cheap
+and may report true for backends that are configured but currently
+down (e.g. an Ollama server that has stopped).
+
 ## Repository Boundaries
 
 - `khonliang-reviewer`: this repo — provider implementations, bus skills,
