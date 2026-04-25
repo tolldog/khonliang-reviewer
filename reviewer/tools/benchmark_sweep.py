@@ -229,6 +229,7 @@ async def _run_one(
     diff: str,
     kind: str,
     instructions: str,
+    output_dir: Path,
     artifact_dir: Path,
     registry: ProviderRegistry,
 ) -> _BenchmarkRow:
@@ -240,11 +241,15 @@ async def _run_one(
         # registry shape evolves.
         return _failed_row(reg.backend, model, "provider missing from registry")
 
+    # Always include the ``model`` key — even when empty — so the
+    # harness mirrors the bus/agent review path. Providers that
+    # distinguish "key absent" from "present but empty" see the same
+    # payload here as in production.
     request = ReviewRequest(
         kind=kind,
         content=diff,
         instructions=instructions,
-        metadata={"model": model} if model else {},
+        metadata={"model": model},
         request_id=f"bench-{uuid.uuid4().hex[:8]}",
     )
 
@@ -276,7 +281,7 @@ async def _run_one(
             finding_count_comment=0,
             finding_count_concern=0,
             summary_chars=0,
-            artifact_path=str(artifact_path),
+            artifact_path=str(artifact_path.relative_to(output_dir)),
         )
 
     artifact_path = artifact_dir / _safe_artifact_name(reg.backend, model, "result.json")
@@ -314,7 +319,7 @@ async def _run_one(
         finding_count_comment=severities["comment"],
         finding_count_concern=severities["concern"],
         summary_chars=len(result.summary or ""),
-        artifact_path=str(artifact_path),
+        artifact_path=str(artifact_path.relative_to(output_dir)),
     )
 
 
@@ -464,6 +469,7 @@ async def run(
             diff=diff,
             kind=kind,
             instructions=instructions,
+            output_dir=output_dir,
             artifact_dir=artifact_dir,
             registry=registry,
         )
@@ -532,7 +538,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--log-level",
         default="INFO",
-        help="Logging level for the sweep (DEBUG/INFO/WARNING). Default: INFO.",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=str.upper,
+        help="Logging level for the sweep. Default: INFO.",
     )
     return parser
 
@@ -540,7 +548,7 @@ def _build_argparser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
-    logging.basicConfig(level=args.log_level.upper(), format="%(message)s")
+    logging.basicConfig(level=args.log_level, format="%(message)s")
 
     output_dir = (
         Path(args.output)

@@ -451,6 +451,79 @@ async def test_run_writes_diff_payload_to_output(tmp_path):
     assert "old" in fake.last_request.content
 
 
+async def test_run_always_passes_model_key_in_metadata(tmp_path):
+    """``ReviewRequest.metadata`` must always carry a ``model`` key,
+    even when the harness is running the empty-sentinel row for a
+    backend with no declared models. Mirrors the bus/agent path so
+    providers that distinguish "key absent" from "present but empty"
+    see the same payload here as in production.
+    """
+    bare = _FakeProvider("bare", result=_make_result(backend="bare", model="x"))
+    declared = _FakeProvider(
+        "declared", result=_make_result(backend="declared", model="m")
+    )
+    registry = ProviderRegistry()
+    registry.register(bare)  # no declared models → empty-sentinel row
+    registry.register(declared, default_model="m", declared_models=["m"])
+
+    await benchmark_sweep.run(
+        diff_source=None,
+        output_dir=tmp_path / "out",
+        backends=[],
+        models=[],
+        kind="pr_diff",
+        instructions="t",
+        registry=registry,
+    )
+
+    assert bare.last_request is not None
+    assert bare.last_request.metadata == {"model": ""}
+    assert declared.last_request is not None
+    assert declared.last_request.metadata == {"model": "m"}
+
+
+async def test_run_writes_relative_artifact_paths_in_summary(tmp_path):
+    """``summary.jsonl`` should record artifact paths relative to
+    ``output_dir`` so the manifest is portable across machines and
+    reruns. Otherwise rows would carry absolute tmp paths that mean
+    nothing once the sweep directory moves.
+    """
+    fake = _FakeProvider("backend_a", result=_make_result(backend="backend_a", model="m"))
+    boom = _FakeProvider("boom", raises=RuntimeError("kaboom"))
+    registry = ProviderRegistry()
+    registry.register(fake, default_model="m", declared_models=["m"])
+    registry.register(boom, default_model="m", declared_models=["m"])
+
+    out_dir = tmp_path / "sweep"
+    jsonl_path, _, rows = await benchmark_sweep.run(
+        diff_source=None,
+        output_dir=out_dir,
+        backends=[],
+        models=[],
+        kind="pr_diff",
+        instructions="t",
+        registry=registry,
+    )
+
+    for row in rows:
+        assert not Path(row.artifact_path).is_absolute()
+        assert row.artifact_path.startswith("artifacts/")
+        # Resolves against output_dir to a real file.
+        assert (out_dir / row.artifact_path).exists()
+
+
+def test_main_log_level_rejects_unknown_value(capsys):
+    """``--log-level`` is constrained to argparse choices so unknown
+    strings exit with a friendly error instead of crashing inside
+    ``logging.basicConfig`` later.
+    """
+    with pytest.raises(SystemExit):
+        benchmark_sweep.main(["--log-level", "infoo"])
+    captured = capsys.readouterr()
+    assert "invalid choice" in captured.err
+    assert "INFOO" in captured.err
+
+
 # ---------------------------------------------------------------------------
 # Markdown rendering
 # ---------------------------------------------------------------------------
