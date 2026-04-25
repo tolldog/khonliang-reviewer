@@ -263,6 +263,26 @@ async def test_non_zero_exit_with_auth_hint_upgrades_category(monkeypatch):
     assert result.error_category == "auth_not_provisioned"
 
 
+async def test_non_zero_exit_with_unknown_option_upgrades_category(monkeypatch):
+    """Older claude CLIs that don't recognize --permission-mode get a clear diagnostic."""
+    proc = _FakeProc(
+        stdout=b"",
+        stderr=b"error: unknown option '--permission-mode'",
+        returncode=2,
+    )
+    _install_fake_proc(monkeypatch, proc)
+
+    result = await ClaudeCliProvider().review(_make_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "binary_not_found"
+    assert "rejected an argument" in result.error
+    assert ">= 2.1.119" in result.error
+    # Original stderr is preserved so operators can still see the
+    # underlying CLI message for context.
+    assert "unknown option" in result.error
+
+
 async def test_non_json_stdout_errored(monkeypatch):
     proc = _FakeProc(stdout=b"not json at all")
     _install_fake_proc(monkeypatch, proc)
