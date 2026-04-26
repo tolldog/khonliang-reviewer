@@ -63,14 +63,17 @@ def test_default_audience_returns_result_today():
     This test will start failing — by design — as each transform
     lands and starts shaping the result. At that point each
     transform PR is responsible for updating this test's expectations.
-    Until then it pins "the shell is wired in but inert".
+    Until then it pins "the shell is wired in but inert" — full
+    equality (not just findings equality) so any accidental shaping
+    of ``summary`` / ``disposition`` / ``usage`` / etc. trips the
+    test rather than slipping through silently.
     """
     result = _result_with_findings("nit", "concern")
     config = DistillConfig()  # audience defaults to agent_consumption
 
     out = run_pipeline(result, config)
 
-    assert out is result or out.findings == result.findings
+    assert out == result
 
 
 def test_run_pipeline_signature_is_stable():

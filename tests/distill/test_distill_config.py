@@ -72,12 +72,14 @@ def test_dataclass_is_frozen():
 
 
 def test_field_set_matches_spec():
-    """Pins the exact field names so transform-PRs can rely on the
-    contract. Adding a new field is fine (transform PRs may extend
-    it); removing or renaming an existing field is a contract break
-    that should fail this test loudly.
+    """Pins the existing field names so transform-PRs can rely on
+    the contract. Adding a new field is fine (transform PRs may
+    extend it) — the assertion is subset-not-equal, so additions
+    pass while removals/renames fail loudly. Removing or renaming
+    an existing field is a contract break for every transform PR
+    keyed off that field.
     """
-    expected = {
+    required = {
         "severity_floor",
         "body_mode",
         "consensus",
@@ -86,4 +88,5 @@ def test_field_set_matches_spec():
         "audience",
     }
     actual = {f.name for f in dataclasses.fields(DistillConfig)}
-    assert actual == expected, f"DistillConfig fields drifted: {actual ^ expected}"
+    missing = required - actual
+    assert not missing, f"DistillConfig dropped required field(s): {missing}"

@@ -43,9 +43,12 @@ SeverityFloor = Literal["nit", "comment", "concern"]
 #: the audience-shaping vocabulary stays consistent across agents.
 BodyMode = Literal["compact", "brief", "full"]
 
-#: Dedup strategy. ``semantic`` is reserved (raises at pipeline run-time
-#: until an embedding-similarity transform lands); the other three are
-#: the targets of the first transforms-PR.
+#: Dedup strategy. ``semantic`` is reserved for a future
+#: embedding-similarity transform; no dedup transforms or runtime
+#: validation are implemented in this shell yet — the dedup-transform
+#: PR will add the runtime guard that raises on ``semantic`` until
+#: that transform lands. The other three values are the targets of
+#: that same PR.
 DedupStrategy = Literal["none", "exact", "title_substring", "semantic"]
 
 
