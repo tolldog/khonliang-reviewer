@@ -51,7 +51,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, Iterable
@@ -187,7 +187,7 @@ def _fetch_pr_diff(repo: str, pr_number: int) -> str:
         ) from exc
     if proc.returncode != 0:
         raise RuntimeError(
-            f"gh pr diff {shlex.join(cmd[1:])} failed with code "
+            f"{shlex.join(cmd)} failed with code "
             f"{proc.returncode}: {proc.stderr.strip()[:500]}"
         )
     if not proc.stdout.strip():
