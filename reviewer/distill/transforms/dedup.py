@@ -31,6 +31,7 @@ concern surrounded by 20 nits survives every strategy.
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Callable
 
 from khonliang_reviewer import ReviewFinding, ReviewResult, severity_rank
 
@@ -84,7 +85,7 @@ def apply_dedup(result: ReviewResult, config: DistillConfig) -> ReviewResult:
 
 def _merge(
     findings: list[ReviewFinding],
-    is_duplicate: "callable[[ReviewFinding, ReviewFinding], bool]",  # type: ignore[name-defined]
+    is_duplicate: Callable[[ReviewFinding, ReviewFinding], bool],
 ) -> list[ReviewFinding]:
     """Walk findings in order; for each, either keep it (and let
     later duplicates merge into it) or merge it into the earliest
@@ -133,19 +134,38 @@ def _bumped(kept: ReviewFinding, candidate_severity: str) -> ReviewFinding:
     outranks the existing one. Otherwise return ``kept`` unchanged
     (identity-preserving in the common case).
 
-    Unknown severity strings on either side leave ``kept`` untouched
-    rather than crashing the pipeline. Severity is a trust-boundary
-    label (provider output, skill args); a malformed value is the
-    provider's bug to fix, not the dedup transform's data to drop.
-    The behavior matches the existing severity-floor filter in
-    ``reviewer/agent.py`` which keeps findings with unparseable
-    severities (see ``test_severity_floor_unknown_severity_in_finding_is_preserved``).
+    Unknown severity strings are tolerated rather than crashing the
+    pipeline; severity is a trust-boundary label (provider output,
+    skill args), and a malformed value is the provider's bug to fix
+    not the dedup transform's data to drop. Resolution per branch:
+
+    - Candidate severity unparseable → keep ``kept`` unchanged. We
+      can't reason about the candidate's rank so we don't disturb
+      the survivor.
+    - Candidate parses, kept's severity is unparseable → bump to
+      candidate. The survivor's existing label is malformed; a
+      parseable label from a duplicate is unambiguously better
+      data, so the survivor inherits it (still the "highest known
+      severity in the merged group" contract).
+    - Both parse, candidate higher → bump.
+    - Both parse, candidate not higher → keep.
+
+    Convention matches the existing severity-floor filter in
+    ``reviewer/agent.py:336-338`` which keeps findings with
+    unparseable severities (see
+    ``test_severity_floor_unknown_severity_in_finding_is_preserved``).
     """
     try:
         candidate_rank = severity_rank(candidate_severity)
-        kept_rank = severity_rank(kept.severity)
     except ValueError:
         return kept
+    try:
+        kept_rank = severity_rank(kept.severity)
+    except ValueError:
+        # Survivor's label is malformed but the candidate parses;
+        # promote to a known-good severity so the merged group's
+        # survivor carries a usable label.
+        return replace(kept, severity=candidate_severity)  # type: ignore[arg-type]
     if candidate_rank > kept_rank:
         return replace(kept, severity=candidate_severity)  # type: ignore[arg-type]
     return kept

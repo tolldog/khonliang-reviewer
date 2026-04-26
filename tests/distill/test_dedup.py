@@ -215,3 +215,27 @@ def test_unknown_severity_preserved_without_crash():
     out = apply_dedup(result, DistillConfig(dedup="exact"))
     assert len(out.findings) == 1
     assert out.findings[0].severity == "concern"
+
+
+def test_unknown_survivor_severity_promotes_to_known_candidate():
+    """Asymmetric edge case: when the *survivor's* existing severity
+    is malformed but a later duplicate carries a parseable label,
+    the merged group should inherit the parseable severity. The
+    survivor's malformed label is unambiguously worse data than a
+    known severity from the same merged group.
+
+    Without this, a finding emitted with a typo'd severity would
+    keep that typo even when subsequent duplicates carry valid
+    labels — defeating the "survivor severity is the highest known
+    severity in the group" contract.
+    """
+    result = _result(
+        _f("bogus_severity_value", "X"),  # type: ignore[arg-type]
+        _f("concern", "X"),
+    )
+    out = apply_dedup(result, DistillConfig(dedup="exact"))
+    assert len(out.findings) == 1
+    # Survivor's title/body still come from the earlier finding,
+    # but its severity is promoted to the candidate's known label.
+    assert out.findings[0].title == "X"
+    assert out.findings[0].severity == "concern"

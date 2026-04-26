@@ -3,10 +3,13 @@
 Receives a :class:`khonliang_reviewer.ReviewResult` plus a
 :class:`reviewer.rules.distill.DistillConfig` and returns a possibly-
 shaped result. Transforms compose in a fixed order (dedup →
-severity_filter → body_mode → max_findings); each lands in its own
-follow-up FR. The pipeline shell ships the ``audit_corpus`` audience
-short-circuit, the call shape the transforms plug into, and an
-identity-preserving guarantee on the inert-config path.
+severity_filter → body_mode → max_findings). The ``dedup`` transform
+ships in this module today (see
+:mod:`reviewer.distill.transforms.dedup`); ``severity_filter``,
+``body_mode``, and ``max_findings`` land in follow-up FRs. The
+pipeline shell carries the ``audit_corpus`` audience short-circuit,
+the call shape every transform plugs into, and an identity-preserving
+guarantee on the inert-config path.
 
 Consensus (``DistillConfig.consensus``) is *not* a transform — it
 runs at the selector layer ahead of the provider call. The
