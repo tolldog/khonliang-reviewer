@@ -32,12 +32,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from khonliang_reviewer import ReviewFinding, ReviewResult
+from khonliang_reviewer import ReviewFinding, ReviewResult, severity_rank
 
 from reviewer.rules.distill import DistillConfig
-
-
-_SEVERITY_RANK: dict[str, int] = {"nit": 0, "comment": 1, "concern": 2}
 
 
 def apply_dedup(result: ReviewResult, config: DistillConfig) -> ReviewResult:
@@ -135,8 +132,21 @@ def _bumped(kept: ReviewFinding, candidate_severity: str) -> ReviewFinding:
     """Return ``kept`` with its severity bumped if ``candidate_severity``
     outranks the existing one. Otherwise return ``kept`` unchanged
     (identity-preserving in the common case).
+
+    Unknown severity strings on either side leave ``kept`` untouched
+    rather than crashing the pipeline. Severity is a trust-boundary
+    label (provider output, skill args); a malformed value is the
+    provider's bug to fix, not the dedup transform's data to drop.
+    The behavior matches the existing severity-floor filter in
+    ``reviewer/agent.py`` which keeps findings with unparseable
+    severities (see ``test_severity_floor_unknown_severity_in_finding_is_preserved``).
     """
-    if _SEVERITY_RANK[candidate_severity] > _SEVERITY_RANK[kept.severity]:
+    try:
+        candidate_rank = severity_rank(candidate_severity)
+        kept_rank = severity_rank(kept.severity)
+    except ValueError:
+        return kept
+    if candidate_rank > kept_rank:
         return replace(kept, severity=candidate_severity)  # type: ignore[arg-type]
     return kept
 

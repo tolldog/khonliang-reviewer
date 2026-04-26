@@ -193,3 +193,25 @@ def test_severity_does_not_downgrade():
     out = apply_dedup(result, DistillConfig(dedup="exact"))
     assert len(out.findings) == 1
     assert out.findings[0].severity == "concern"
+
+
+def test_unknown_severity_preserved_without_crash():
+    """Severity is a trust-boundary label; a provider that emits an
+    unknown value (typo, future-version label, corrupt JSON) must
+    not crash the dedup transform when the finding happens to also
+    duplicate another. Matches the existing severity-floor convention
+    in ``reviewer/agent.py`` (see
+    ``test_severity_floor_unknown_severity_in_finding_is_preserved``).
+
+    Three duplicates: one normal nit, one with bogus severity, one
+    concern. The concern's severity must still propagate to the
+    survivor; the bogus row must not raise.
+    """
+    result = _result(
+        _f("nit", "X"),
+        _f("bogus_severity_value", "X"),  # type: ignore[arg-type]
+        _f("concern", "X"),
+    )
+    out = apply_dedup(result, DistillConfig(dedup="exact"))
+    assert len(out.findings) == 1
+    assert out.findings[0].severity == "concern"
