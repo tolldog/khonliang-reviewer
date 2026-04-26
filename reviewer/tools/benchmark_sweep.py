@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import logging
 import os
@@ -382,10 +383,21 @@ def _safe_artifact_name(backend: str, model: str, suffix: str) -> str:
     Replaces ``/``, ``\\``, and other separator-prone characters
     with ``_`` so model ids like ``kimi-k2.5:cloud`` or
     ``claude-opus-4-7[1m]`` don't break path resolution on Linux,
-    macOS, or Windows.
+    macOS, or Windows. Two raw model ids that collapse to the same
+    sanitized string (e.g. ``kimi-k2.5:cloud`` vs
+    ``kimi-k2/5/cloud``) would otherwise share an artifact path —
+    append a short stable hash of the raw ``backend+model`` so each
+    pair owns a unique filename even when sanitization is lossy.
     """
     raw = f"{backend}__{model or 'default'}__{suffix}"
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    digest = hashlib.sha256(
+        f"{backend}\x00{model}".encode("utf-8")
+    ).hexdigest()[:8]
+    stem, dot, ext = sanitized.rpartition(".")
+    if dot:
+        return f"{stem}__{digest}.{ext}"
+    return f"{sanitized}__{digest}"
 
 
 # ----------------------------------------------------------------------
@@ -584,11 +596,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=args.log_level, format="%(message)s")
 
-    output_dir = (
-        Path(args.output)
-        if args.output
-        else Path("benchmark-out") / dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
-    )
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        # Second-precision timestamp + short uuid suffix so two sweeps
+        # kicked off in the same second (or concurrently) don't share
+        # a directory and silently overwrite each other's
+        # summary.jsonl + artifacts. The uuid is short on purpose
+        # — readability matters; collision over 8 hex chars within
+        # the same second is statistically irrelevant.
+        stamp = dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+        output_dir = Path("benchmark-out") / f"{stamp}-{uuid.uuid4().hex[:8]}"
 
     try:
         jsonl_path, report_path, rows = asyncio.run(

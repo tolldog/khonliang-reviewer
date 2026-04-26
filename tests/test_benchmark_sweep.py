@@ -168,7 +168,24 @@ def test_safe_artifact_name_strips_problematic_chars():
     # debuggable from the file name alone.
     assert "ollama" in name
     assert "kimi-k2.5" in name
-    assert "result.json" in name
+    # Suffix preserved as the final extension (the disambiguating
+    # hash slots between the stem and the extension so the file is
+    # still recognized as JSON by tools that switch on suffix).
+    assert name.endswith(".json")
+
+
+def test_safe_artifact_name_disambiguates_sanitization_collisions():
+    """Two raw model ids that sanitize to the same string must still
+    produce distinct filenames — otherwise ``summary.jsonl`` would
+    point at an artifact silently overwritten by a sibling row.
+    """
+    a = benchmark_sweep._safe_artifact_name(
+        "ollama", "kimi-k2.5:cloud", "result.json"
+    )
+    b = benchmark_sweep._safe_artifact_name(
+        "ollama", "kimi-k2/5/cloud", "result.json"
+    )
+    assert a != b
 
 
 def test_safe_artifact_name_handles_empty_model():
