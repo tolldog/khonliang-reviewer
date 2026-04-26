@@ -54,8 +54,13 @@ def test_audit_corpus_short_circuits_with_unchanged_findings():
 
     out = run_pipeline(result, config)
 
-    assert [f.severity for f in out.findings] == ["nit", "comment", "concern"]
-    assert out.summary == result.summary
+    # Full identity: audit_corpus is the contract that lets aggressive
+    # shaping in other audiences stay safe (raw output is recoverable).
+    # Asserting object identity catches accidental clones / shaping of
+    # any ReviewResult field (usage / disposition / backend / model /
+    # summary / findings) — anything weaker would let drift slip
+    # through silently as transforms land.
+    assert out is result
 
 
 def test_default_audience_returns_result_today():
