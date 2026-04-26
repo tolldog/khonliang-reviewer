@@ -99,7 +99,7 @@ None of these are large; together they remove ~5 categories of friction.
 ## Acceptance Criteria
 
 1. **`SelectorConfig.default_models`**: a config with `default_models: {claude_cli: sonnet, ollama: qwen2.5-coder:14b}` and *no* legacy `default_model` field loads cleanly. `select(backend="claude_cli", model=None)` returns `("claude_cli", "sonnet")`. Legacy single-string config still loads.
-2. **`num_ctx` kwarg**: `review_diff(..., num_ctx=16384)` results in the Ollama HTTP request body carrying `options.num_ctx=16384`. `num_ctx=None` falls through to the auto-bump heuristic. `.reviewer/models/ollama/qwen2.5-coder_14b.yaml: num_ctx: 32768` overrides the heuristic (when the `.reviewer/` loader is reachable).
+2. **`num_ctx` kwarg**: `review_diff(..., num_ctx=16384)` results in the Ollama HTTP request body carrying `options.num_ctx=16384`. `num_ctx=None` falls through to the auto-bump heuristic. `.reviewer/models/ollama/qwen2.5-coder.yaml: num_ctx: 32768` overrides the heuristic (when the `.reviewer/` loader is reachable). Note: `_model_stem` strips the `:tag` suffix when resolving model id → on-disk YAML, so `qwen2.5-coder:14b` and `qwen2.5-coder:7b` both resolve to `qwen2.5-coder.yaml` in the MVP. Per-tag YAML files are a follow-up FR if the need materializes.
 3. **`format=json`**: with `OllamaProviderConfig.format="json"`, the Ollama HTTP request body carries `format: "json"`. A 3B model (`llama3.2:3b`) that fails JSON parsing without the constraint succeeds with it. (Validated against the live model; smoke test in tests/.)
 4. **`sign_off_trailer()`** returns the documented trailer format for each of the four verdict cases. Trailer parses cleanly via standard git trailer parser (`git interpret-trailers`). When called with a `result` containing 0 findings, returns `verdict: "approved"`. Result with 2 nits returns `verdict: "approved-with-findings", trailer_line: "Agent-Reviewed-by: khonliang-reviewer/<backend>/<model> approved-with-findings: 2 nits filtered"`.
 5. **Arg consistency**: `review_diff(diff="...")`, `review_diff(content="...")`, `review_text(diff="...")`, `review_text(content="...")` all succeed and review the same payload. Tests cover all four shapes.
@@ -138,3 +138,4 @@ None of these are large; together they remove ~5 categories of friction.
 ## Revision history
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. Per-FR scope distilled from each FR's description; common bundle rationale documented in the design principle.
+- **rev 2** (2026-04-26): correct YAML stem in acceptance #2 from `qwen2.5-coder_14b.yaml` to `qwen2.5-coder.yaml` and document the `_model_stem` tag-stripping rule explicitly (per Copilot R1 on PR#24, grounded in `reviewer/config/repo.py:421`).

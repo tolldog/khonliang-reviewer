@@ -6,7 +6,7 @@
 **FRs:**
 - `fr_reviewer_de1694a8` — Uniform distill-before-handoff pipeline driven by rule-table DistillConfig (anchor)
 - `fr_reviewer_cb081fa8` — Best-of-N local consensus + three-tier evaluator gate
-- `fr_reviewer_afd4bab1` — Populate `.reviewer/examples/` with repo-specific invariant patterns
+- `fr_reviewer_afd4bab1` — Populate `.reviewer/prompts/examples/` with repo-specific invariant patterns
 
 ## Problem
 
@@ -14,7 +14,7 @@ Today every reviewer-output quality concern wires itself into `review_text` dire
 
 1. **No composition order.** Two transforms that should run in a specific order (consensus before dedup, dedup before severity filter, severity before max-findings) have nowhere to live except inline in the agent.
 2. **No audience awareness.** A finding emitted to `github_comment` should be terser than the same finding emitted to an `audit_corpus`. The rule table picks `(backend, model)` per `(kind, profile, size)`; it does not pick *output shape*. So callers either get one shape for everything or each caller hand-shapes the result.
-3. **No prompt-side calibration data.** The `.reviewer/prompts/` loader (merged via PR#14) reads `severity_rubric.md`, `examples/<kind>/<severity>.md`, and `system_preamble.md` if they exist — but no consumer repo has any of those files. The loader has nothing real to validate against, and the calibration story stays theoretical.
+3. **No prompt-side calibration data.** The `.reviewer/prompts/` loader (merged via PR#14) reads `severity_rubric.md`, `examples/<kind>/<severity>.md` (one file per `(kind, severity)` cell — full file content becomes the few-shot block for that cell), and `system_preamble.md` if they exist — but no consumer repo has any of those files. The loader has nothing real to validate against, and the calibration story stays theoretical.
 4. **Consensus is structurally homeless.** `fr_reviewer_cb081fa8` (three-tier evaluator gate: local Best-of-N → claude_cli escalation) has no place to plug in; it would need its own pipeline, which is the third bolted-on step in a row.
 
 The connective tissue is missing. Until it lands, every quality-improvement FR re-litigates "where in the call path does this run?" instead of "what does this transform do?"
@@ -31,7 +31,7 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 **Reversibility.** Dropped findings are not destroyed; they live in `ReviewResult.dropped_findings` so audit corpora and benchmarks can still see what the model produced before the pipeline shaped it. This is what makes aggressive `github_comment`-mode tuning safe: the raw output is still recoverable.
 
-**Examples corpus seeds the prompt loader.** `fr_reviewer_afd4bab1` ships the first reference set of `.reviewer/examples/` files — drawn from milestone_store invariants since that's a real repo with real findings the reviewer agent has been generating. With concrete files in place, the prompts-loader's assertions become measurable: "given this severity rubric and these 3 examples, does qwen2.5-coder:14b's calibration improve on this held-out diff?"
+**Examples corpus seeds the prompt loader.** `fr_reviewer_afd4bab1` ships the first reference set of `.reviewer/prompts/examples/` files — drawn from milestone_store invariants since that's a real repo with real findings the reviewer agent has been generating. With concrete files in place, the prompts-loader's assertions become measurable: "given this severity rubric and these 3 examples, does qwen2.5-coder:14b's calibration improve on this held-out diff?"
 
 ## Scope
 
@@ -53,12 +53,12 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
   5. **max_findings** — sort findings by severity desc + first-position then truncate.
 - **`audit_corpus` audience** is a hard short-circuit: the pipeline returns `ReviewResult` with `findings` unchanged and `dropped_findings=[]`, regardless of the configured transforms.
 - **`ReviewResult.dropped_findings`** — new field on the result dataclass. Persists across the pipeline. Always populated (empty list when nothing dropped).
-- **`.reviewer/examples/` seed corpus** — populated against `tolldog/khonliang-reviewer-store` (or another representative milestone_store consumer). Files:
-  - `examples/pr_diff/nit.md` — 3 examples drawn from real reviewer output.
-  - `examples/pr_diff/comment.md` — 3 examples.
-  - `examples/pr_diff/concern.md` — 3 examples.
-  - `severity_rubric.md` — the 2026-04-22 dogfood-derived rubric (project_evaluator_gate_exp memory).
-  - `system_preamble.md` — `khonliang-reviewer-store` repo invariants the reviewer should know about (e.g. "store agents own artifact lifecycle; non-store callers must not write store DB").
+- **`.reviewer/prompts/examples/` seed corpus** — populated against `tolldog/khonliang-reviewer-store` (or another representative milestone_store consumer). Layout matches the existing prompts loader (one file per `(kind, severity)` cell; the entire file contents become the few-shot block for that cell):
+  - `.reviewer/prompts/examples/pr_diff/nit.md` — 3 examples drawn from real reviewer output, concatenated within one file (e.g. separated by `---` rules so a human reader can still tell them apart).
+  - `.reviewer/prompts/examples/pr_diff/comment.md` — 3 examples.
+  - `.reviewer/prompts/examples/pr_diff/concern.md` — 3 examples.
+  - `.reviewer/prompts/severity_rubric.md` — the 2026-04-22 dogfood-derived rubric (project_evaluator_gate_exp memory).
+  - `.reviewer/prompts/system_preamble.md` — `khonliang-reviewer-store` repo invariants the reviewer should know about (e.g. "store agents own artifact lifecycle; non-store callers must not write store DB").
 
 ### Out of scope
 
@@ -75,7 +75,7 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 3. Rule-table evaluation returns both `(ProviderDecision, DistillConfig)` in a single call. No caller assembles the two halves from separate queries.
 4. `.reviewer/config.yaml` loader supports `rules[].distill` with at least the field set listed in §Scope.
 5. `ReviewResult.dropped_findings` is populated (empty list when nothing dropped). Audit corpus runs (`audience: audit_corpus`) always have `dropped_findings == []` *and* the full original finding list.
-6. The first-corpus `.reviewer/examples/` set ships in this milestone. Existing prompt-loader unit tests already merged in PR#14 are extended to load from that real corpus and assert the merged prompt contains all expected sections in the documented order.
+6. The first-corpus `.reviewer/prompts/examples/` set ships in this milestone. Existing prompt-loader unit tests already merged in PR#14 are extended to load from that real corpus and assert the merged prompt contains all expected sections in the documented order.
 7. Three-tier evaluator gate behavior (per `fr_reviewer_cb081fa8`):
    - When `DistillConfig.consensus == False`: pipeline runs the configured single provider once, no escalation.
    - When `DistillConfig.consensus == True` and disagreement is below threshold: result is the consensus output of N=3 local runs.
@@ -92,7 +92,7 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 ## Dependencies
 
 - **Already merged:** `fr_reviewer_dfd27582` (severity_floor), `fr_reviewer_92453047` (`.reviewer/prompts/` loader), reviewer rule table (`fr_reviewer_2c02aaf8`).
-- **Composes with:** MS-C (`fr_reviewer_570aad54` auto-promote excellent findings) — that work *consumes* the `.reviewer/examples/` directory this milestone *produces*. MS-C is sequenced after MS-B for that reason.
+- **Composes with:** MS-C (`fr_reviewer_570aad54` auto-promote excellent findings) — that work *consumes* the `.reviewer/prompts/examples/` directory this milestone *produces*. MS-C is sequenced after MS-B for that reason.
 - **Blocks:** any future quality-improvement FR that needs to act on `ReviewResult` after the provider call. Until the pipeline exists, those FRs would have to add another bolted-on step.
 
 ## Implementation Notes (non-binding)
@@ -110,3 +110,4 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 ## Revision history
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. Open questions flagged for first review pass.
+- **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` (per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195`). Clarified the one-file-per-cell layout that the loader expects.

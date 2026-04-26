@@ -12,7 +12,7 @@
 The reviewer ships findings; some get acted on, most do not. Today there is no signal telling us *which* findings developers actually addressed — only the raw output and the LLM token cost. Two consequences:
 
 1. **Quality is invisible.** Two models could produce the same number of findings at the same severity distribution; one's findings get fixed, the other's get ignored. The benchmark sweep harness (PR#23) captures latency, token cost, and severity histograms — but not the only metric that ultimately matters: did the developer change the code in response?
-2. **The examples corpus stays static.** MS-B seeds `.reviewer/examples/` from human-curated milestone_store invariants. That's a fine starting point, but the corpus does not grow as the reviewer improves. Real-world high-signal findings stay buried in old PRs; the prompt loader keeps shipping the same handful of examples regardless of which kinds of findings actually move the needle.
+2. **The examples corpus stays static.** MS-B seeds `.reviewer/prompts/examples/` from human-curated milestone_store invariants. That's a fine starting point, but the corpus does not grow as the reviewer improves. Real-world high-signal findings stay buried in old PRs; the prompt loader keeps shipping the same handful of examples regardless of which kinds of findings actually move the needle.
 
 The two FRs in this milestone close the loop: address-rate becomes the quality signal, and that signal is what flags findings as "excellent" and worth promoting into the live examples library.
 
@@ -24,7 +24,7 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 
 **Promotion is conservative.** Auto-promote only fires when (a) the finding has a high address-rate against its severity-and-kind cohort, *and* (b) it is structurally distinct from existing examples (per a simple title/body similarity check). The library does not double up on the same lesson; the promotion threshold stays high enough that ~5–10 findings/quarter clear the bar, not hundreds.
 
-**Promoted examples are reviewable.** Auto-promote writes a candidate file to a `.reviewer/examples/_pending/` subdir; nothing lands in the live `examples/<kind>/<severity>.md` until the operator (or a future bus skill) accepts the candidate. This keeps a human in the loop for the calibration corpus while still automating the discovery and ranking step.
+**Promoted examples are reviewable.** The existing prompt loader expects ONE file per `(kind, severity)` cell at `.reviewer/prompts/examples/<kind>/<severity>.md` — the entire file content becomes the few-shot block for that cell. Auto-promotion can't be a per-finding `git mv`; it has to *append* a new example block into the existing severity file. To keep the human-in-the-loop step explicit, candidates first land as standalone files at `.reviewer/prompts/examples/_pending/<finding_id>.md` (one file per candidate, with frontmatter naming the target cell). Nothing reaches the live cell file until an operator (or a future bus skill) runs the promotion step, which appends the candidate's body into `<kind>/<severity>.md` and removes the pending file. The pending area is the staging line; promote-to-live is a deliberate separate action.
 
 ## Scope
 
@@ -40,13 +40,14 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 - **Aggregation rollup** — `address_rate_summary(model, repo, kind, severity)` returns the rolling 30-day percentage of `addressed` over `(addressed + not_addressed)` (excludes `inconclusive` from both numerator and denominator). Surface the summary via a new `reviewer.usage_summary` extension.
 - **Auto-promote candidate generator** — for each finding marked `addressed` in the last N=30 days:
   - Compute its rank within its `(model, repo, kind, severity)` cohort.
-  - When rank ≥ 90th percentile, run a structural-similarity check against existing `.reviewer/examples/<kind>/<severity>.md`. The check is deliberately simple: title token overlap < 40% *and* body token overlap < 30% (Jaccard, lowercased, stop-words removed).
-  - When both checks pass, write the candidate to `.reviewer/examples/_pending/<kind>__<severity>__<finding_id>.md`. The file format mirrors the live examples format so a manual move is one `git mv`.
-- **Operator skills** — three new MCP skills to drive the loop:
+  - When rank ≥ 90th percentile, run a structural-similarity check against the body of `.reviewer/prompts/examples/<kind>/<severity>.md` (the loaded few-shot block for that cell — concatenated example content). The check is deliberately simple: title token overlap < 40% *and* body token overlap < 30% (Jaccard, lowercased, stop-words removed) against the existing block as a whole.
+  - When both checks pass, write the candidate to `.reviewer/prompts/examples/_pending/<finding_id>.md` — one file per candidate. Frontmatter declares the target cell (`kind`, `severity`) so the promote step knows where to append.
+- **Operator skills** — four new MCP skills to drive the loop:
   - `compute_address_rates(repo, since_days=30)` — runs the scrape + classification + storage step; idempotent.
   - `address_rate_summary(model?, repo?, kind?, severity?, since_days=30)` — read-only rollup.
-  - `list_pending_examples()` — enumerates `.reviewer/examples/_pending/` so the operator can see what's queued.
-- **Composition with MS-B**: when MS-B's `.reviewer/examples/` corpus is in place, this milestone's promoted candidates land alongside it; nothing in MS-C requires changes to the prompt loader. MS-B is sequenced first.
+  - `list_pending_examples()` — enumerates `.reviewer/prompts/examples/_pending/` so the operator can see what's queued; surfaces age + cohort + percentile per candidate.
+  - `promote_pending_example(pending_id, *, separator='\n\n---\n\n')` — appends the candidate's body content into the target cell file (`.reviewer/prompts/examples/<kind>/<severity>.md`), creating the file + parent dirs if missing, with the configured separator between existing and new content; then removes the pending file. Returns the post-append target file path + a diff hash so the operator can verify the change.
+- **Composition with MS-B**: MS-B's `.reviewer/prompts/examples/` corpus is the seed; MS-C *appends* into the same cell files via the promote step. No prompt-loader changes required (it already concatenates the file contents into the few-shot block). MS-B is sequenced first.
 
 ### Out of scope
 
@@ -60,7 +61,8 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 
 1. `compute_address_rates(repo="tolldog/khonliang-reviewer", since_days=30)` runs end-to-end against the live repo and persists at least 5 classified rows in the `address_rate` table without raising. Re-running with the same args is a no-op (idempotent on `(finding_id, reviewed_sha, merge_sha)`).
 2. `address_rate_summary(model="qwen2.5-coder:14b", repo="tolldog/khonliang-reviewer", kind="pr_diff", severity="concern")` returns a percentage (0.0–100.0) plus the underlying `(addressed, not_addressed, inconclusive)` counts. Returns `null` percentage with non-zero counts when the denominator is zero.
-3. The auto-promote step writes at least one candidate file to `.reviewer/examples/_pending/` when run against the seed reviewer-store dataset. The file is formatted identically to live `.reviewer/examples/<kind>/<severity>.md` files (so a `git mv` is the only step needed to promote-to-live).
+3. The auto-promote step writes at least one candidate file to `.reviewer/prompts/examples/_pending/<finding_id>.md` when run against the seed reviewer-store dataset. Frontmatter on the candidate names the target cell (`kind`, `severity`); body is the few-shot block content suitable for appending into the live cell file.
+3a. `promote_pending_example(pending_id)` reads a pending candidate, appends its body (separated by the configured rule) into the target `.reviewer/prompts/examples/<kind>/<severity>.md`, removes the pending file, and returns the post-append target path. Re-running the prompt loader sees the new content as part of the cell's few-shot block without any loader code changes.
 4. The structural-similarity check rejects a candidate that overlaps an existing example at >40% title-Jaccard or >30% body-Jaccard. Tested with: pasting an existing example back in as a candidate → rejected with a clear "duplicate of <existing-id>" reason in the candidate file's frontmatter (so the operator sees why it was suppressed if they go looking).
 5. The 30-day rolling window respects the SQLite store's `created_at` semantics — re-running computation 90 days later does not re-classify findings already classified, and the rollup correctly excludes finding outside the window.
 6. **Privacy/leakage check**: scraped data persists *finding ids and SHAs only*, not full comment/reaction content. The address_rate table never stores PR comment bodies. (Reasoning: even within local trusted env, persisting third-party comment text bloats the DB and complicates eventual cross-machine sync.)
@@ -72,11 +74,11 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 1. **Address-rate vs. accept-rate for cross-vendor reviews.** Today reviewer findings post as PR comments. When a Copilot review *also* posts on the same PR, the address signal could conflate the two (a developer addressing a Copilot finding might be miscredited to a reviewer finding nearby). The classifier needs to disambiguate by author. Tentative: filter the comment-author check to `khonliang-reviewer-bot` (or whatever the configured PR-comment author is) before counting `addressed`. Document the assumption in the spec's first revision.
 2. **What counts as "the merge SHA"** when a PR is rebased + squashed? The reviewed SHA is in `UsageStore.review_records.commit_sha`; the merge SHA is the squash-merge commit on `main`. Heuristic: walk `git log --first-parent main` for the squash that introduced the PR's content, identified by `Merged-via` trailer or PR-number reference in the commit message. Edge: PRs merged via fast-forward have no distinct merge SHA. Tentative: collapse `addressed` and `inconclusive` into the same bucket when no distinct merge SHA exists.
 3. **Promotion threshold tuning.** 90th percentile within the cohort is a starting guess. Worth instrumenting the candidate generator to log the rank distribution for the first month so we can adjust before too many candidates accumulate (or too few).
-4. **`.reviewer/examples/_pending/` lifecycle.** When a candidate sits there for >90 days unreviewed, should it auto-expire? Tentative: surface in `list_pending_examples()` with an age field, but do not auto-delete (deletion is operator's choice).
+4. **`.reviewer/prompts/examples/_pending/` lifecycle.** When a candidate sits there for >90 days unreviewed, should it auto-expire? Tentative: surface in `list_pending_examples()` with an age field, but do not auto-delete (deletion is operator's choice).
 
 ## Dependencies
 
-- **Hard-blocks on:** MS-B (`fr_reviewer_afd4bab1` — `.reviewer/examples/` seed corpus). Auto-promote needs the live corpus structure to compare candidates against.
+- **Hard-blocks on:** MS-B (`fr_reviewer_afd4bab1` — `.reviewer/prompts/examples/` seed corpus). Auto-promote needs the live corpus structure to compare candidates against.
 - **Composes with:** existing `UsageStore` schema (`review_records`, `usage_records`). New `address_rate` table is a sibling; no migration of existing data needed.
 - **External:** `gh api` available on the host. No additional auth beyond what reviewer already requires.
 
@@ -99,13 +101,15 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
   );
   ```
 - Similarity check via `re.findall(r"\w+", text.lower())` + Python `set` Jaccard. No external dep on tokenizers / embeddings.
-- Candidate file format:
+- Candidate file format (`.reviewer/prompts/examples/_pending/<finding_id>.md`):
   ```markdown
   ---
   source_finding_id: fr_<id>
+  target_kind: pr_diff
+  target_severity: concern
   cohort: ollama/qwen2.5-coder:14b/pr_diff/concern
   rank_percentile: 94
-  promoted_at: 2026-04-26
+  proposed_at: 2026-04-26
   similarity_check: passed
   ---
 
@@ -119,3 +123,4 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 ## Revision history
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. MS-B sequencing dependency flagged. Open questions on cross-vendor disambiguation + merge-SHA semantics flagged for first review pass.
+- **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` and rework promotion model: the loader expects ONE file per `(kind, severity)` cell — not one file per finding — so promote-to-live can't be a `git mv`. Revised model: candidates land at `_pending/<finding_id>.md` (one file per candidate); a new `promote_pending_example` skill APPENDS the candidate's body into the target cell file with a configurable separator. Both fixes per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195-260`.
