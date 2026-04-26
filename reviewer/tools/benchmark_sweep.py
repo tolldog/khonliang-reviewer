@@ -1,0 +1,646 @@
+"""Benchmark sweep harness — calibrate every registered provider+model.
+
+Replaces the ad-hoc 2026-04-22 9-model sweep (see
+``project_benchmark_2026_04_22_full`` memory) with a re-runnable
+harness. Iterates the canonical :class:`reviewer.registry.ProviderRegistry`
+so any backend / model that lights up via the four shipped providers
+gets calibrated automatically — the same code path that powers the
+``list_models`` MCP skill.
+
+CLI
+---
+
+::
+
+    python -m reviewer.tools.benchmark_sweep \\
+        --diff <path-or-PR>      # default: bundled bus_lib_pr14.diff
+        --output <dir>           # default: ./benchmark-out/<UTC-stamp>/
+        --backend <name>         # filter to one backend (repeatable)
+        --model <id>             # filter to one model (repeatable)
+        --kind pr_diff           # ReviewRequest.kind; defaults to pr_diff
+        --instructions <text>    # extra review instructions
+
+Output
+------
+
+For each (backend, model) the harness writes a per-model artifact +
+a row in a top-level ``summary.jsonl``. A human-friendly markdown
+table lands at ``REPORT.md`` once the sweep completes; both are
+ready to drop into a PR description / memory entry.
+
+The harness deliberately does NOT call any bus surface — it
+constructs a real ``ProviderRegistry`` via
+``ReviewerAgent._build_default_registry()`` and exercises each
+``ReviewProvider`` in-process. That keeps the calibration matrix
+honest about the same code path the bus actually uses while
+sidestepping the bus-restart staleness that would otherwise
+surface here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import datetime as dt
+import hashlib
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from importlib import resources
+from pathlib import Path
+from typing import Any, Iterable
+
+from khonliang_reviewer import ReviewRequest
+
+from reviewer.agent import ReviewerAgent
+from reviewer.registry import ProviderRegistration, ProviderRegistry
+
+
+_DEFAULT_DIFF_PACKAGE = "reviewer.tools.benchmark_data"
+_DEFAULT_DIFF_NAME = "bus_lib_pr14.diff"
+_PR_REF_PATTERN = re.compile(r"^([\w.-]+)/([\w.-]+)#(\d+)$")
+_LOGGER = logging.getLogger("reviewer.tools.benchmark_sweep")
+
+
+# ----------------------------------------------------------------------
+# Result shapes
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class _BenchmarkRow:
+    """One row per (backend, model) pair the harness exercises."""
+
+    backend: str
+    model: str
+    disposition: str
+    error: str
+    error_category: str
+    duration_ms: int
+    input_tokens: int
+    output_tokens: int
+    finding_count_total: int
+    finding_count_nit: int
+    finding_count_comment: int
+    finding_count_concern: int
+    summary_chars: int
+    artifact_path: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# ----------------------------------------------------------------------
+# Diff loading
+# ----------------------------------------------------------------------
+
+
+def load_diff(source: str | None) -> tuple[str, str]:
+    """Resolve a ``--diff`` argument to ``(diff_text, label)``.
+
+    ``source`` may be:
+
+    - ``None`` / empty → bundled reference diff from
+      :data:`_DEFAULT_DIFF_PACKAGE` / :data:`_DEFAULT_DIFF_NAME`.
+      Label includes the file name so sweep reports stay
+      self-describing.
+    - A filesystem path to a unified-diff file.
+    - A ``<owner>/<repo>#<num>`` PR reference, fetched via the ``gh``
+      CLI (already required for the broader reviewer development
+      flow). Surfacing fetch errors as a friendly RuntimeError.
+    """
+    if not source:
+        # Use ``importlib.resources`` so the harness works regardless
+        # of installation layout (zipimport, packaged-resource, etc.)
+        # — matches the convention in :mod:`reviewer.pricing_seed`
+        # rather than poking ``Path(__file__).parent``. Catch the
+        # filesystem and module-resolution errors that surface when
+        # the package was installed without bundling the
+        # ``benchmark_data/`` payload, and surface a clearer hint.
+        try:
+            diff = (
+                resources.files(_DEFAULT_DIFF_PACKAGE)
+                .joinpath(_DEFAULT_DIFF_NAME)
+                .read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, ModuleNotFoundError, OSError) as exc:
+            raise RuntimeError(
+                f"bundled reference diff "
+                f"{_DEFAULT_DIFF_PACKAGE}/{_DEFAULT_DIFF_NAME} is "
+                f"unreadable: {exc}. The package may have been "
+                f"installed without ``benchmark_data/`` payload "
+                f"(check pyproject.toml ``package-data`` includes "
+                f"``reviewer.tools.benchmark_data = ['*.diff']``). "
+                f"Pass ``--diff <path>`` or a ``<owner>/<repo>#<num>`` "
+                f"PR reference to bypass."
+            ) from exc
+        return diff, f"bundled:{_DEFAULT_DIFF_NAME}"
+
+    pr_match = _PR_REF_PATTERN.match(source)
+    if pr_match:
+        owner, repo, num = pr_match.groups()
+        diff = _fetch_pr_diff(f"{owner}/{repo}", int(num))
+        return diff, f"gh:{owner}/{repo}#{num}"
+
+    path = Path(source)
+    if path.is_file():
+        return path.read_text(encoding="utf-8"), f"path:{path}"
+
+    raise RuntimeError(
+        f"--diff value {source!r} did not resolve to a file path or a "
+        f"<owner>/<repo>#<num> PR reference"
+    )
+
+
+def _fetch_pr_diff(repo: str, pr_number: int) -> str:
+    """Fetch a unified diff via ``gh pr diff``.
+
+    Uses subprocess rather than githubkit because the harness runs
+    standalone — it shouldn't take an HTTP dependency just to read a
+    diff that ``gh`` can produce in one process call.
+    """
+    cmd = ["gh", "pr", "diff", "--repo", repo, str(pr_number)]
+    try:
+        # Pin the decoder to UTF-8 with ``errors="replace"`` rather
+        # than relying on the process locale: ``gh`` emits diff bytes
+        # produced by GitHub (UTF-8) but the runtime locale can be C
+        # / POSIX (e.g. CI containers) where ``text=True`` would pick
+        # ASCII and raise ``UnicodeDecodeError`` on any non-ASCII
+        # byte. ``replace`` keeps the harness deterministic across
+        # hosts; the diff is for prompt input, not byte-exact replay.
+        proc = subprocess.run(  # noqa: S603 — fixed argv from internal call
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=60,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "gh CLI not found on PATH; install it or pass --diff <path>"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"gh pr diff {repo}#{pr_number} timed out after "
+            f"{exc.timeout}s — check network / gh auth, retry, or "
+            f"pass --diff <path>"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"gh pr diff {repo}#{pr_number} failed to spawn: {exc}. "
+            f"Pass --diff <path> to bypass."
+        ) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"{shlex.join(cmd)} failed with code "
+            f"{proc.returncode}: {proc.stderr.strip()[:500]}"
+        )
+    if not proc.stdout.strip():
+        raise RuntimeError(
+            f"gh pr diff {repo}#{pr_number} produced empty output"
+        )
+    return proc.stdout
+
+
+# ----------------------------------------------------------------------
+# Sweep
+# ----------------------------------------------------------------------
+
+
+def _filter_registry(
+    registry: ProviderRegistry,
+    *,
+    backends: Iterable[str],
+    models: Iterable[str],
+) -> list[tuple[ProviderRegistration, str]]:
+    """Expand the registry into a flat ``[(registration, model)]`` list.
+
+    Every (backend, model) pair we'd actually exercise. When the
+    registry has no declared models for a backend, fall back to
+    a single sentinel entry with ``model=""`` so the harness still
+    runs the provider once (it'll use whatever the provider's own
+    default model resolves to).
+    """
+    backend_filter = {b for b in backends if b}
+    model_filter = {m for m in models if m}
+    pairs: list[tuple[ProviderRegistration, str]] = []
+    for reg in registry.list():
+        if backend_filter and reg.backend not in backend_filter:
+            continue
+        if reg.models:
+            for m in reg.models:
+                if model_filter and m not in model_filter:
+                    continue
+                pairs.append((reg, m))
+        else:
+            # Backend with no declared models. When ``--model`` is
+            # set, the empty sentinel can't satisfy any filter — drop
+            # the row rather than running an unfiltered provider in
+            # what's supposed to be a model-scoped sweep. When
+            # ``--model`` is NOT set, run once with the empty
+            # sentinel so a freshly-registered backend with empty
+            # pricing YAML still appears in the matrix (its own
+            # config default_model resolves at provider time).
+            if not model_filter:
+                pairs.append((reg, ""))
+    return pairs
+
+
+async def _run_one(
+    reg: ProviderRegistration,
+    model: str,
+    *,
+    diff: str,
+    kind: str,
+    instructions: str,
+    output_dir: Path,
+    artifact_dir: Path,
+    registry: ProviderRegistry,
+) -> _BenchmarkRow:
+    """Exercise a single (backend, model) pair and write the artifact."""
+    provider = registry.get_provider(reg.backend)
+    if provider is None:
+        # Defensive — shouldn't happen given _filter_registry comes
+        # from registry.list() — but covers a future race where the
+        # registry shape evolves.
+        return _failed_row(reg.backend, model, "provider missing from registry")
+
+    # Always include the ``model`` key — even when empty — so the
+    # harness mirrors the bus/agent review path. Providers that
+    # distinguish "key absent" from "present but empty" see the same
+    # payload here as in production.
+    request = ReviewRequest(
+        kind=kind,
+        content=diff,
+        instructions=instructions,
+        metadata={"model": model},
+        request_id=f"bench-{uuid.uuid4().hex[:8]}",
+    )
+
+    start = time.monotonic()
+    try:
+        result = await provider.review(request)
+        # Capture wall-clock immediately so the fallback measurement
+        # tracks provider runtime only, not the artifact-write +
+        # finding-iteration that happens below. ``max(..., 1)`` keeps
+        # the row from reporting a misleading 0ms on extremely fast
+        # providers (the sub-millisecond clamp is purely cosmetic but
+        # makes "the harness measured something" unambiguous).
+        measured_ms = max(int((time.monotonic() - start) * 1000), 1)
+    except asyncio.CancelledError:
+        # Cancellation must propagate. ``Exception`` catches
+        # ``CancelledError`` on Python <3.8 and (more relevantly here)
+        # any future code that re-raises it as ``Exception``; an
+        # explicit re-raise keeps cancellation prompt under any async
+        # supervisor that runs the sweep.
+        raise
+    except Exception as exc:
+        duration_ms = max(int((time.monotonic() - start) * 1000), 1)
+        _LOGGER.warning(
+            "benchmark sweep: %s/%s raised %s: %s",
+            reg.backend,
+            model or "<provider-default>",
+            type(exc).__name__,
+            exc,
+        )
+        artifact_path = artifact_dir / _safe_artifact_name(reg.backend, model, "exception.txt")
+        artifact_path.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
+        return _BenchmarkRow(
+            backend=reg.backend,
+            model=model,
+            disposition="errored",
+            error=f"{type(exc).__name__}: {exc}",
+            error_category="harness_exception",
+            duration_ms=duration_ms,
+            input_tokens=0,
+            output_tokens=0,
+            finding_count_total=0,
+            finding_count_nit=0,
+            finding_count_comment=0,
+            finding_count_concern=0,
+            summary_chars=0,
+            artifact_path=str(artifact_path.relative_to(output_dir)),
+        )
+
+    artifact_path = artifact_dir / _safe_artifact_name(reg.backend, model, "result.json")
+    artifact_path.write_text(
+        json.dumps(result.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    severities = {"nit": 0, "comment": 0, "concern": 0}
+    for f in result.findings:
+        severities[f.severity] = severities.get(f.severity, 0) + 1
+
+    usage = result.usage
+    # ``measured_ms`` was captured immediately after ``await
+    # provider.review(...)`` so it reflects provider runtime only,
+    # not the artifact-write or finding-iteration that runs above.
+    # Prefer the provider's own reported duration (typically more
+    # accurate — it strips our argv-assembly overhead too); fall
+    # back to wall-clock when the provider didn't populate ``usage``
+    # or left ``duration_ms`` at 0.
+    if usage and usage.duration_ms:
+        duration_ms = usage.duration_ms
+    else:
+        duration_ms = measured_ms
+    return _BenchmarkRow(
+        backend=reg.backend,
+        model=model,
+        disposition=result.disposition,
+        error=result.error,
+        error_category=result.error_category,
+        duration_ms=duration_ms,
+        input_tokens=usage.input_tokens if usage else 0,
+        output_tokens=usage.output_tokens if usage else 0,
+        finding_count_total=len(result.findings),
+        finding_count_nit=severities["nit"],
+        finding_count_comment=severities["comment"],
+        finding_count_concern=severities["concern"],
+        summary_chars=len(result.summary or ""),
+        artifact_path=str(artifact_path.relative_to(output_dir)),
+    )
+
+
+def _failed_row(backend: str, model: str, error: str) -> _BenchmarkRow:
+    return _BenchmarkRow(
+        backend=backend,
+        model=model,
+        disposition="errored",
+        error=error,
+        error_category="harness_setup",
+        duration_ms=0,
+        input_tokens=0,
+        output_tokens=0,
+        finding_count_total=0,
+        finding_count_nit=0,
+        finding_count_comment=0,
+        finding_count_concern=0,
+        summary_chars=0,
+        artifact_path="",
+    )
+
+
+def _safe_artifact_name(backend: str, model: str, suffix: str) -> str:
+    """Build a stable per-row filename safe across filesystems.
+
+    Replaces ``/``, ``\\``, and other separator-prone characters
+    with ``_`` so model ids like ``kimi-k2.5:cloud`` or
+    ``claude-opus-4-7[1m]`` don't break path resolution on Linux,
+    macOS, or Windows. Two raw model ids that collapse to the same
+    sanitized string (e.g. ``kimi-k2.5:cloud`` vs
+    ``kimi-k2/5/cloud``) would otherwise share an artifact path —
+    append a short stable hash of the raw ``backend+model`` so each
+    pair owns a unique filename even when sanitization is lossy.
+    """
+    raw = f"{backend}__{model or 'default'}__{suffix}"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    digest = hashlib.sha256(
+        f"{backend}\x00{model}".encode("utf-8")
+    ).hexdigest()[:8]
+    stem, dot, ext = sanitized.rpartition(".")
+    if dot:
+        return f"{stem}__{digest}.{ext}"
+    return f"{sanitized}__{digest}"
+
+
+# ----------------------------------------------------------------------
+# Reporting
+# ----------------------------------------------------------------------
+
+
+def write_summary(rows: list[_BenchmarkRow], output_dir: Path) -> tuple[Path, Path]:
+    """Write ``summary.jsonl`` + ``REPORT.md``. Returns both paths."""
+    jsonl_path = output_dir / "summary.jsonl"
+    with jsonl_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row.to_dict(), sort_keys=True))
+            f.write("\n")
+
+    report_path = output_dir / "REPORT.md"
+    report_path.write_text(_render_markdown(rows), encoding="utf-8")
+    return jsonl_path, report_path
+
+
+def _render_markdown(rows: list[_BenchmarkRow]) -> str:
+    """Render a copy/paste-friendly markdown table.
+
+    Columns picked to mirror the 2026-04-22 sweep matrix shape:
+    backend, model, disposition (so errors stand out), duration,
+    token counts, finding counts split by severity. Wide enough to
+    spot calibration drift; narrow enough to read in a PR
+    description.
+    """
+    lines = [
+        "# Benchmark sweep",
+        "",
+        "| Backend | Model | Disposition | Duration ms | In tokens | Out tokens | Findings (total) | nit | comment | concern |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        disposition = row.disposition
+        if row.error_category:
+            disposition = f"{disposition} ({row.error_category})"
+        lines.append(
+            "| {b} | {m} | {d} | {dur} | {it} | {ot} | {ft} | {fn} | {fc} | {fk} |".format(
+                b=row.backend,
+                m=row.model or "_default_",
+                d=disposition,
+                dur=row.duration_ms,
+                it=row.input_tokens,
+                ot=row.output_tokens,
+                ft=row.finding_count_total,
+                fn=row.finding_count_nit,
+                fc=row.finding_count_comment,
+                fk=row.finding_count_concern,
+            )
+        )
+    if not rows:
+        # Emit a non-table paragraph rather than trying to fit a
+        # message-cell row into a 10-column table. Markdown
+        # renderers handle paragraphs after a table cleanly; spacer
+        # rows with mismatched cell counts render misaligned in
+        # GitHub's markdown.
+        lines.append("")
+        lines.append("_(no rows — registry was empty after filters)_")
+    return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
+
+
+async def run(
+    *,
+    diff_source: str | None,
+    output_dir: Path,
+    backends: Iterable[str],
+    models: Iterable[str],
+    kind: str,
+    instructions: str,
+    config_path: str = "",
+    registry: ProviderRegistry | None = None,
+) -> tuple[Path, Path, list[_BenchmarkRow]]:
+    """Run the sweep. Programmatic entry point used by tests + CLI.
+
+    When ``registry`` is supplied (tests), the agent isn't
+    instantiated; otherwise we build the canonical registry via
+    ``ReviewerAgent._build_default_registry()`` to match what the
+    bus skill path would see at boot.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = output_dir / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    diff, label = load_diff(diff_source)
+    (output_dir / "DIFF_SOURCE.txt").write_text(label + "\n", encoding="utf-8")
+    (output_dir / "diff.patch").write_text(diff, encoding="utf-8")
+
+    if registry is None:
+        agent = ReviewerAgent(
+            agent_id="benchmark-sweep",
+            bus_url="http://benchmark.invalid",  # never invoked
+            config_path=config_path,
+        )
+        registry = agent._ensure_registry()
+
+    pairs = _filter_registry(registry, backends=backends, models=models)
+    rows: list[_BenchmarkRow] = []
+    for reg, model in pairs:
+        _LOGGER.info(
+            "benchmark sweep: starting %s / %s",
+            reg.backend,
+            model or "<provider-default>",
+        )
+        row = await _run_one(
+            reg,
+            model,
+            diff=diff,
+            kind=kind,
+            instructions=instructions,
+            output_dir=output_dir,
+            artifact_dir=artifact_dir,
+            registry=registry,
+        )
+        rows.append(row)
+
+    jsonl_path, report_path = write_summary(rows, output_dir)
+    return jsonl_path, report_path, rows
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="reviewer.tools.benchmark_sweep",
+        description=(
+            "Calibrate every registered review provider+model against a "
+            "reference diff. Produces summary.jsonl + REPORT.md plus "
+            "per-row JSON artifacts."
+        ),
+    )
+    parser.add_argument(
+        "--diff",
+        default=None,
+        help=(
+            "Path to a unified-diff file, OR a `<owner>/<repo>#<num>` PR "
+            "reference (fetched via gh). Defaults to the bundled "
+            "bus_lib_pr14.diff so reruns are deterministic."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=(
+            "Output directory. Defaults to ./benchmark-out/<UTC-stamp>/."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        action="append",
+        default=[],
+        help="Filter to a single backend; pass multiple times for >1.",
+    )
+    parser.add_argument(
+        "--model",
+        action="append",
+        default=[],
+        help="Filter to a single model; pass multiple times for >1.",
+    )
+    parser.add_argument(
+        "--kind",
+        default="pr_diff",
+        help="ReviewRequest.kind passed to each provider (default: pr_diff).",
+    )
+    parser.add_argument(
+        "--instructions",
+        default="Review for correctness and security; flag concerns first.",
+        help="Review instructions threaded into ReviewRequest.instructions.",
+    )
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("KHONLIANG_REVIEWER_CONFIG", ""),
+        help=(
+            "Reviewer config.yaml path. Defaults to "
+            "$KHONLIANG_REVIEWER_CONFIG, then to an empty path (which "
+            "produces the built-in defaults)."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=str.upper,
+        help="Logging level for the sweep. Default: INFO.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_argparser()
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level, format="%(message)s")
+
+    if args.output:
+        output_dir = Path(args.output)
+    else:
+        # Second-precision timestamp + short uuid suffix so two sweeps
+        # kicked off in the same second (or concurrently) don't share
+        # a directory and silently overwrite each other's
+        # summary.jsonl + artifacts. The uuid is short on purpose
+        # — readability matters; collision over 8 hex chars within
+        # the same second is statistically irrelevant.
+        stamp = dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+        output_dir = Path("benchmark-out") / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+    try:
+        jsonl_path, report_path, rows = asyncio.run(
+            run(
+                diff_source=args.diff,
+                output_dir=output_dir,
+                backends=args.backend,
+                models=args.model,
+                kind=args.kind,
+                instructions=args.instructions,
+                config_path=args.config,
+            )
+        )
+    except RuntimeError as exc:
+        _LOGGER.error("benchmark sweep aborted: %s", exc)
+        return 2
+
+    _LOGGER.info("benchmark sweep complete: %d rows", len(rows))
+    _LOGGER.info("  summary: %s", jsonl_path)
+    _LOGGER.info("  report:  %s", report_path)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover — CLI entry point
+    sys.exit(main())
