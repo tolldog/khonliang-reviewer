@@ -62,7 +62,7 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 ### Out of scope
 
-- **Per-caller runtime overrides** of `DistillConfig`. First cut: rule-table produces a single config; callers cannot override individual fields inline. If real demand emerges, add a merge-with-caller-dict pass in a follow-up FR.
+- **Per-caller runtime overrides of `DistillConfig` fields.** First cut: rule-table produces a single config; callers cannot override individual fields like `severity_floor` / `body_mode` / `consensus` inline. If real demand emerges, add a merge-with-caller-dict pass in a follow-up FR. (Note: `audience` is *not* a DistillConfig override — it is a request-shape input that participates in rule-table key resolution; see Acceptance #1.)
 - **Semantic dedup.** `dedup: semantic` is reserved in the dataclass but not implemented. Real implementation needs an embedding-similarity step that's a separate FR (likely depends on librarian-primary indexing).
 - **Auto-generation of examples** from past addressed-findings. Out of scope here; consumed by `fr_reviewer_570aad54` in MS-C.
 - **Runtime example selection** ("pick 3 most-similar past findings as few-shot"). The loader stays static; dynamic retrieval is a later FR.
@@ -70,7 +70,7 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 ## Acceptance Criteria
 
-1. `review_text({..., audience: "github_comment"})` returns a terser, severity-floored result matching the rule-table entry for the given `(kind, profile, size)` with `audience: "github_comment"`. Same call with `audience: "audit_corpus"` returns the raw findings with `dropped_findings == []` (regardless of other rule-table fields).
+1. **`audience` is an explicit request input that participates in rule-table key resolution — not a per-call override of an individual `DistillConfig` field.** `review_text({..., audience: "github_comment"})` returns a terser, severity-floored result matching the rule-table entry for the given `(kind, profile, size)` with `audience: "github_comment"`. Same call with `audience: "audit_corpus"` returns the raw findings with `dropped_findings == []` (regardless of other rule-table fields, since audit_corpus is the hard short-circuit).
 2. The post-provider transforms (severity_floor, dedup, body_mode, max_findings) all plug into `reviewer.distill` — not into `review_text` directly. Each ships with a unit test for noise reduction *and* a feature-preservation test ("given an outlier concern alongside 20 nits, the concern survives unchanged"). Consensus runs in the selector layer ahead of the distill pipeline (per Open Question #2 resolution).
 3. Rule-table evaluation returns both `(ProviderDecision, DistillConfig)` in a single call. No caller assembles the two halves from separate queries.
 4. `.reviewer/config.yaml` loader supports `rules[].distill` with at least the field set listed in §Scope.
@@ -112,3 +112,4 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 - **rev 1** (2026-04-26): initial spec, author: Claude. Open questions flagged for first review pass.
 - **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` (per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195`). Clarified the one-file-per-cell layout that the loader expects.
 - **rev 3** (2026-04-26): resolve internal contradictions per Copilot R2 on PR#24. (a) Open Question #2 resolved: consensus is selector-layer, not a distill transform. Removed consensus from the §Scope pipeline list, updated Acceptance #2 + #7 to reflect the selector-layer placement, marked Open Question #2 as resolved with rationale, updated Implementation Notes accordingly. (b) Acceptance #1 reworded to not hard-code a `(github_comment, *, *, *)` shape (since rule-table key is `(kind, profile, size)` and audience routing is still an implementation choice).
+- **rev 4** (2026-04-26): clarify `audience` semantics per Copilot R6 on PR#24. The Out-of-scope "no per-caller runtime overrides of DistillConfig" line conflicted with Acceptance #1's `review_text({..., audience: "github_comment"})` shape. Reconciled: `audience` is a request-shape input that participates in rule-table key resolution (a fourth keying dimension under Open Question #1's still-pending answer), NOT a per-call override of an individual DistillConfig field like `severity_floor`. The other fields stay rule-table-only.
