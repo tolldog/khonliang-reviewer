@@ -106,9 +106,10 @@ def load_diff(source: str | None) -> tuple[str, str]:
 
     ``source`` may be:
 
-    - ``None`` / empty → bundled reference diff at
-      :data:`_DEFAULT_DIFF_PATH`. Label includes the file name so
-      sweep reports stay self-describing.
+    - ``None`` / empty → bundled reference diff from
+      :data:`_DEFAULT_DIFF_PACKAGE` / :data:`_DEFAULT_DIFF_NAME`.
+      Label includes the file name so sweep reports stay
+      self-describing.
     - A filesystem path to a unified-diff file.
     - A ``<owner>/<repo>#<num>`` PR reference, fetched via the ``gh``
       CLI (already required for the broader reviewer development
@@ -172,6 +173,17 @@ def _fetch_pr_diff(repo: str, pr_number: int) -> str:
     except FileNotFoundError as exc:
         raise RuntimeError(
             "gh CLI not found on PATH; install it or pass --diff <path>"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"gh pr diff {repo}#{pr_number} timed out after "
+            f"{exc.timeout}s — check network / gh auth, retry, or "
+            f"pass --diff <path>"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"gh pr diff {repo}#{pr_number} failed to spawn: {exc}. "
+            f"Pass --diff <path> to bypass."
         ) from exc
     if proc.returncode != 0:
         raise RuntimeError(

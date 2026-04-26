@@ -111,6 +111,27 @@ def test_load_diff_rejects_unresolvable_source():
     assert "did not resolve" in str(excinfo.value)
 
 
+def test_fetch_pr_diff_timeout_surfaces_runtime_error(monkeypatch):
+    """``subprocess.TimeoutExpired`` from ``gh pr diff`` becomes a
+    friendly :class:`RuntimeError` so the harness's documented
+    contract — "fetch errors as a friendly RuntimeError" — covers
+    the slow-network case, not just the missing-binary case.
+    """
+    import subprocess
+
+    def _raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=60)
+
+    monkeypatch.setattr(benchmark_sweep.subprocess, "run", _raise_timeout)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        benchmark_sweep._fetch_pr_diff("owner/repo", 42)
+
+    msg = str(excinfo.value)
+    assert "timed out" in msg
+    assert "--diff" in msg
+
+
 def test_load_diff_bundled_missing_raises_runtime_error_with_hint(monkeypatch):
     """Catch resource-load failure on the bundled-diff path, surface a hint.
 
