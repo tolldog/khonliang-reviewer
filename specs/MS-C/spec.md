@@ -30,13 +30,16 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 
 ### In scope
 
-- **`reviewer.scrape.address_rate`** module — periodic scrape against repos the reviewer has reviewed (tracked via `UsageStore.review_records`):
-  - For each finding posted as a PR review comment, fetch the comment thread + the commits between the reviewed SHA and the merge SHA via `gh api`.
-  - Heuristic-classify the finding as `addressed` / `not_addressed` / `inconclusive`:
+- **`reviewer.scrape.address_rate`** module — periodic scrape against repos / PRs the reviewer has reviewed, seeded from existing persisted `reviewer_usage` rows plus GitHub PR metadata (NOT from a new `review_records` table — `UsageStore` today persists only `reviewer_usage` + `model_pricing`):
+  - Use `reviewer_usage` to identify review runs that posted output for a GitHub PR, including at minimum the repo, PR number (or URL), and model. Those rows are the scrape seed set.
+  - For each seeded PR, fetch PR review comments, comment threads, and the commits between the reviewed SHA and the merge SHA via `gh api`.
+  - Recover individual findings from the posted PR review comments rather than from local per-finding persistence: each scraped finding is keyed by the GitHub review-comment id plus repo / PR number / reviewed SHA, and its classification inputs come from GitHub metadata (`path`, `line` or diff hunk position, thread replies/reactions, reviewed SHA) together with the finding `kind` / `severity` parsed from the comment-body format the reviewer already posts.
+  - If a PR is closed without merge, the review comment was deleted, or the posted comment body no longer contains enough structured data to recover `kind` / `severity`, skip classification for that finding and record it as `inconclusive` rather than inventing missing fields.
+  - Heuristic-classify each recovered finding as `addressed` / `not_addressed` / `inconclusive`:
     - `addressed`: the file mentioned in `finding.path` has a diff hunk between reviewed-SHA and merge-SHA that overlaps `finding.line ± 5` *and* the comment thread shows no rebuttal reaction (👎 / "out of scope" reply).
-    - `inconclusive`: file modified but region untouched, or comment thread shows mixed signal.
+    - `inconclusive`: file modified but region untouched, comment thread shows mixed signal, or GitHub metadata is insufficient to recover the finding cleanly.
     - `not_addressed`: file unchanged, or comment thread shows explicit "won't fix" / "out of scope" signal.
-  - Persist results in a new `address_rate` table in the existing reviewer SQLite store, keyed on `(finding_id, reviewed_sha, merge_sha)` so re-runs are idempotent.
+  - Persist results in a new `address_rate` table in the existing reviewer SQLite store, keyed on `(finding_id, reviewed_sha, merge_sha)` so re-runs are idempotent. Here `finding_id` is the stable scraper id derived from the GitHub review-comment id (or an equivalent deterministic id built from repo / PR / comment id).
 - **Aggregation rollup** — `address_rate_summary(model, repo, kind, severity)` returns the rolling 30-day percentage of `addressed` over `(addressed + not_addressed)` (excludes `inconclusive` from both numerator and denominator). Surface the summary via a new `reviewer.usage_summary` extension.
 - **Auto-promote candidate generator** — for each finding marked `addressed` in the last N=30 days:
   - Compute its rank within its `(model, repo, kind, severity)` cohort.
@@ -79,7 +82,7 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 ## Dependencies
 
 - **Hard-blocks on:** MS-B (`fr_reviewer_afd4bab1` — `.reviewer/prompts/examples/` seed corpus). Auto-promote needs the live corpus structure to compare candidates against.
-- **Composes with:** existing `UsageStore` schema (`review_records`, `usage_records`). New `address_rate` table is a sibling; no migration of existing data needed.
+- **Composes with:** existing `UsageStore` schema — `reviewer_usage` rows seed the scraper, and the new `address_rate` table is a sibling table in the same SQLite store. No migration of existing rows needed; no new persistence required for individual findings (they are recovered from GitHub on each scrape).
 - **External:** `gh api` available on the host. No additional auth beyond what reviewer already requires.
 
 ## Implementation Notes (non-binding)
@@ -127,3 +130,4 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 - **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` and rework promotion model: the loader expects ONE file per `(kind, severity)` cell — not one file per finding — so promote-to-live can't be a `git mv`. Revised model: candidates land at `_pending/<finding_id>.md` (one file per candidate); a new `promote_pending_example` skill APPENDS the candidate's body into the target cell file with a configurable separator. Both fixes per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195-260`.
 - **rev 3** (2026-04-26): correct skill count in §Implementation Notes from "three" to "four" — rev2 added `promote_pending_example` to §Scope but didn't update the module ownership line (per Copilot R2 on PR#24).
 - **rev 4** (2026-04-26): two structural cleanups per Copilot R3 on PR#24. (a) Replaced free-form `rationale TEXT` column in the `address_rate` table with a closed-enum `rationale_code` column — Acceptance #6's "finding ids and SHAs only" constraint is now enforced structurally by the schema rather than relying on convention to keep raw GitHub comment text out of the column. Human-readable rationale is derived at runtime from the enum. (b) Renamed candidate-file frontmatter `source_finding_id: fr_<id>` to `source_finding_id: finding_<id>` and explicitly noted the field is a `ReviewFinding` id (not an FR id) — earlier wording read like a functional-requirement reference.
+- **rev 5** (2026-04-26): correct scrape-seed reference per Copilot R4 on PR#24. Earlier revs cited `UsageStore.review_records` as the scrape seed, but that table doesn't exist — `UsageStore` today persists `reviewer_usage` + `model_pricing` only. Reworked §Scope to seed from existing `reviewer_usage` rows + GitHub PR metadata, recover findings from GitHub PR review comments (rather than per-finding local persistence), and key the new `address_rate` table by GitHub review-comment id. Removed implicit dependency on a new persistence layer; MS-C now requires only the new `address_rate` sibling table.
