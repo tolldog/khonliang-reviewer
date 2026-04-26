@@ -1,0 +1,121 @@
+# MS-C: Closed-loop reviewer calibration
+
+**Milestone:** `ms_reviewer_d6f9a46c`
+**Target:** `reviewer`
+**Status:** proposed
+**FRs:**
+- `fr_reviewer_eeebcba2` — Finding-address-rate tracking (scrape GitHub reactions/replies, aggregate per `(model, repo, kind)`)
+- `fr_reviewer_570aad54` — Flag excellent findings → auto-promote to `.reviewer/prompts/examples` library
+
+## Problem
+
+The reviewer ships findings; some get acted on, most do not. Today there is no signal telling us *which* findings developers actually addressed — only the raw output and the LLM token cost. Two consequences:
+
+1. **Quality is invisible.** Two models could produce the same number of findings at the same severity distribution; one's findings get fixed, the other's get ignored. The benchmark sweep harness (PR#23) captures latency, token cost, and severity histograms — but not the only metric that ultimately matters: did the developer change the code in response?
+2. **The examples corpus stays static.** MS-B seeds `.reviewer/examples/` from human-curated milestone_store invariants. That's a fine starting point, but the corpus does not grow as the reviewer improves. Real-world high-signal findings stay buried in old PRs; the prompt loader keeps shipping the same handful of examples regardless of which kinds of findings actually move the needle.
+
+The two FRs in this milestone close the loop: address-rate becomes the quality signal, and that signal is what flags findings as "excellent" and worth promoting into the live examples library.
+
+## Design Principle
+
+**Address-rate is a product metric, not a model metric.** A finding is "addressed" when the diff between the reviewed commit and a later merge commit shows that the file/region the finding pointed at was modified in a way consistent with the suggestion. That's a heuristic — false positives (developer changed that region for unrelated reasons) and false negatives (developer chose a different fix elsewhere) are unavoidable. The metric is useful in *aggregate* per `(model, repo, kind)`; it is *not* a per-finding ground truth. Treat it as a population statistic.
+
+**One signal source: GitHub.** Address-rate scraping reads PR review comments, commit history, and reactions/replies via `gh api`. We do not stand up a separate webhook listener or write a CI plugin — that's a different scale of investment. The reviewer agent already runs on dev hardware; periodic batched scrapes against repos the reviewer has touched are sufficient.
+
+**Promotion is conservative.** Auto-promote only fires when (a) the finding has a high address-rate against its severity-and-kind cohort, *and* (b) it is structurally distinct from existing examples (per a simple title/body similarity check). The library does not double up on the same lesson; the promotion threshold stays high enough that ~5–10 findings/quarter clear the bar, not hundreds.
+
+**Promoted examples are reviewable.** Auto-promote writes a candidate file to a `.reviewer/examples/_pending/` subdir; nothing lands in the live `examples/<kind>/<severity>.md` until the operator (or a future bus skill) accepts the candidate. This keeps a human in the loop for the calibration corpus while still automating the discovery and ranking step.
+
+## Scope
+
+### In scope
+
+- **`reviewer.scrape.address_rate`** module — periodic scrape against repos the reviewer has reviewed (tracked via `UsageStore.review_records`):
+  - For each finding posted as a PR review comment, fetch the comment thread + the commits between the reviewed SHA and the merge SHA via `gh api`.
+  - Heuristic-classify the finding as `addressed` / `not_addressed` / `inconclusive`:
+    - `addressed`: the file mentioned in `finding.path` has a diff hunk between reviewed-SHA and merge-SHA that overlaps `finding.line ± 5` *and* the comment thread shows no rebuttal reaction (👎 / "out of scope" reply).
+    - `inconclusive`: file modified but region untouched, or comment thread shows mixed signal.
+    - `not_addressed`: file unchanged, or comment thread shows explicit "won't fix" / "out of scope" signal.
+  - Persist results in a new `address_rate` table in the existing reviewer SQLite store, keyed on `(finding_id, reviewed_sha, merge_sha)` so re-runs are idempotent.
+- **Aggregation rollup** — `address_rate_summary(model, repo, kind, severity)` returns the rolling 30-day percentage of `addressed` over `(addressed + not_addressed)` (excludes `inconclusive` from both numerator and denominator). Surface the summary via a new `reviewer.usage_summary` extension.
+- **Auto-promote candidate generator** — for each finding marked `addressed` in the last N=30 days:
+  - Compute its rank within its `(model, repo, kind, severity)` cohort.
+  - When rank ≥ 90th percentile, run a structural-similarity check against existing `.reviewer/examples/<kind>/<severity>.md`. The check is deliberately simple: title token overlap < 40% *and* body token overlap < 30% (Jaccard, lowercased, stop-words removed).
+  - When both checks pass, write the candidate to `.reviewer/examples/_pending/<kind>__<severity>__<finding_id>.md`. The file format mirrors the live examples format so a manual move is one `git mv`.
+- **Operator skills** — three new MCP skills to drive the loop:
+  - `compute_address_rates(repo, since_days=30)` — runs the scrape + classification + storage step; idempotent.
+  - `address_rate_summary(model?, repo?, kind?, severity?, since_days=30)` — read-only rollup.
+  - `list_pending_examples()` — enumerates `.reviewer/examples/_pending/` so the operator can see what's queued.
+- **Composition with MS-B**: when MS-B's `.reviewer/examples/` corpus is in place, this milestone's promoted candidates land alongside it; nothing in MS-C requires changes to the prompt loader. MS-B is sequenced first.
+
+### Out of scope
+
+- **GitHub-side webhook listener** or CI integration. Pull-only scrape from dev hardware is sufficient; webhook architecture is a separate FR if scale demands it.
+- **Per-finding ground truth.** The classification is a population heuristic; we explicitly do not surface per-finding `addressed: true/false` to end users. The summary skill returns aggregates only.
+- **Demoting / removing existing examples** when their address rate drops. First cut: examples are append-only via promotion; the corpus is curated by humans on the way out. Future FR if examples ever go stale.
+- **Cross-repo signal pooling.** A finding from `tolldog/khonliang-reviewer` and a textually similar one from a sibling repo are treated as independent samples in this cut. Cross-repo "this lesson generalizes" detection is a follow-up.
+- **Auto-promotion to the live examples directory** without operator review. The `_pending/` staging area is the line; promotion-to-live is a deliberate separate action so the operator (currently the user) sees the candidate set and can reject anything off-base.
+
+## Acceptance Criteria
+
+1. `compute_address_rates(repo="tolldog/khonliang-reviewer", since_days=30)` runs end-to-end against the live repo and persists at least 5 classified rows in the `address_rate` table without raising. Re-running with the same args is a no-op (idempotent on `(finding_id, reviewed_sha, merge_sha)`).
+2. `address_rate_summary(model="qwen2.5-coder:14b", repo="tolldog/khonliang-reviewer", kind="pr_diff", severity="concern")` returns a percentage (0.0–100.0) plus the underlying `(addressed, not_addressed, inconclusive)` counts. Returns `null` percentage with non-zero counts when the denominator is zero.
+3. The auto-promote step writes at least one candidate file to `.reviewer/examples/_pending/` when run against the seed reviewer-store dataset. The file is formatted identically to live `.reviewer/examples/<kind>/<severity>.md` files (so a `git mv` is the only step needed to promote-to-live).
+4. The structural-similarity check rejects a candidate that overlaps an existing example at >40% title-Jaccard or >30% body-Jaccard. Tested with: pasting an existing example back in as a candidate → rejected with a clear "duplicate of <existing-id>" reason in the candidate file's frontmatter (so the operator sees why it was suppressed if they go looking).
+5. The 30-day rolling window respects the SQLite store's `created_at` semantics — re-running computation 90 days later does not re-classify findings already classified, and the rollup correctly excludes finding outside the window.
+6. **Privacy/leakage check**: scraped data persists *finding ids and SHAs only*, not full comment/reaction content. The address_rate table never stores PR comment bodies. (Reasoning: even within local trusted env, persisting third-party comment text bloats the DB and complicates eventual cross-machine sync.)
+7. The new `usage_summary` extension surfaces address-rate alongside existing latency / token / cost metrics, gated behind a `--include-address-rate` flag (so existing summary callers don't pay the rollup cost they don't ask for).
+8. Tests cover: classification heuristic (each of the three categories given a constructed mini-repo fixture), rollup math (zero-denominator, mixed cohort), structural-similarity false positive (different finding, same boilerplate phrasing), candidate-file formatting round-trip.
+
+## Open Questions
+
+1. **Address-rate vs. accept-rate for cross-vendor reviews.** Today reviewer findings post as PR comments. When a Copilot review *also* posts on the same PR, the address signal could conflate the two (a developer addressing a Copilot finding might be miscredited to a reviewer finding nearby). The classifier needs to disambiguate by author. Tentative: filter the comment-author check to `khonliang-reviewer-bot` (or whatever the configured PR-comment author is) before counting `addressed`. Document the assumption in the spec's first revision.
+2. **What counts as "the merge SHA"** when a PR is rebased + squashed? The reviewed SHA is in `UsageStore.review_records.commit_sha`; the merge SHA is the squash-merge commit on `main`. Heuristic: walk `git log --first-parent main` for the squash that introduced the PR's content, identified by `Merged-via` trailer or PR-number reference in the commit message. Edge: PRs merged via fast-forward have no distinct merge SHA. Tentative: collapse `addressed` and `inconclusive` into the same bucket when no distinct merge SHA exists.
+3. **Promotion threshold tuning.** 90th percentile within the cohort is a starting guess. Worth instrumenting the candidate generator to log the rank distribution for the first month so we can adjust before too many candidates accumulate (or too few).
+4. **`.reviewer/examples/_pending/` lifecycle.** When a candidate sits there for >90 days unreviewed, should it auto-expire? Tentative: surface in `list_pending_examples()` with an age field, but do not auto-delete (deletion is operator's choice).
+
+## Dependencies
+
+- **Hard-blocks on:** MS-B (`fr_reviewer_afd4bab1` — `.reviewer/examples/` seed corpus). Auto-promote needs the live corpus structure to compare candidates against.
+- **Composes with:** existing `UsageStore` schema (`review_records`, `usage_records`). New `address_rate` table is a sibling; no migration of existing data needed.
+- **External:** `gh api` available on the host. No additional auth beyond what reviewer already requires.
+
+## Implementation Notes (non-binding)
+
+- Module layout:
+  - `reviewer/scrape/address_rate.py` — scrape + classify + persist.
+  - `reviewer/scrape/promote.py` — candidate generator + similarity check.
+  - `reviewer/skills/address_rate.py` — three new MCP skills.
+- New `address_rate` table:
+  ```sql
+  CREATE TABLE address_rate (
+    finding_id TEXT NOT NULL,
+    reviewed_sha TEXT NOT NULL,
+    merge_sha TEXT,
+    classification TEXT NOT NULL,  -- addressed | not_addressed | inconclusive
+    classified_at REAL NOT NULL,
+    rationale TEXT NOT NULL,  -- short heuristic-evidence string, NOT comment bodies
+    PRIMARY KEY (finding_id, reviewed_sha, merge_sha)
+  );
+  ```
+- Similarity check via `re.findall(r"\w+", text.lower())` + Python `set` Jaccard. No external dep on tokenizers / embeddings.
+- Candidate file format:
+  ```markdown
+  ---
+  source_finding_id: fr_<id>
+  cohort: ollama/qwen2.5-coder:14b/pr_diff/concern
+  rank_percentile: 94
+  promoted_at: 2026-04-26
+  similarity_check: passed
+  ---
+
+  ## Title
+  ...
+
+  ## Body
+  ...
+  ```
+
+## Revision history
+
+- **rev 1** (2026-04-26): initial spec, author: Claude. MS-B sequencing dependency flagged. Open questions on cross-vendor disambiguation + merge-SHA semantics flagged for first review pass.
