@@ -2,9 +2,14 @@
 
 Markdown rubric prompts the reviewer agent loads when running an
 **artifact review** (FR / spec / milestone — distinct from code review).
-Mirrors the convention in `reviewer/data/default_pricing.yaml`: shipped
-inside the package as bundled defaults, overridable per-repo via
-`.reviewer/prompts/<rubric>.md`.
+Mirrors the convention in `reviewer/data/default_pricing.yaml`:
+shipped inside the package as bundled defaults. Repo-side overrides
+for these artifact-review rubrics are planned as part of
+`fr_reviewer_19c871ab` with the intended layout
+`.reviewer/prompts/<rubric>.md`, but the override path is not
+implemented yet — the existing `.reviewer/prompts/` loader at
+`reviewer/config/prompts.py:195` reads only `system_preamble.md`,
+`severity_rubric.md`, and `examples/<kind>/<severity>.md` today.
 
 The artifact-review pipeline that consumes these prompts is the subject
 of `fr_reviewer_19c871ab` (Artifact-review pipeline for FRs + specs +
