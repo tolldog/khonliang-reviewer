@@ -1,13 +1,18 @@
 """Tests for the post-provider distill-pipeline shell.
 
-The shell currently runs no transforms — those land in subsequent
-FRs. The tests pin the contract that lets transform-PRs land
-without re-litigating the integration shape:
+Pin the contract every transform-PR depends on:
 
-- ``audit_corpus`` audience returns the result unchanged.
-- Default audience returns the result unchanged today (will gain
-  transform behavior as each transform lands).
+- ``audit_corpus`` audience returns the result unchanged regardless
+  of any other config field (the short-circuit fires before any
+  transform runs).
+- The inert-config default path is identity-preserving — every
+  transform must return the same object on its inert slot
+  (``dedup="none"``, ``severity_floor="nit"``, etc.) so a
+  default-config review never pays for a no-op clone.
 - The function signature is ``(ReviewResult, DistillConfig) -> ReviewResult``.
+
+Active-transform behavior is tested in each transform's own
+``test_<transform>.py`` (e.g. ``test_dedup.py``).
 """
 
 from __future__ import annotations
@@ -63,22 +68,23 @@ def test_audit_corpus_short_circuits_with_unchanged_findings():
     assert out is result
 
 
-def test_default_audience_returns_result_today():
-    """Pre-transforms, the default-audience path is also a no-op.
-    This test will start failing — by design — as each transform
-    lands and starts shaping the result. At that point each
-    transform PR is responsible for updating this test's expectations.
-    Until then it pins "the shell is wired in but inert" — full
-    equality (not just findings equality) so any accidental shaping
-    of ``summary`` / ``disposition`` / ``usage`` / etc. trips the
-    test rather than slipping through silently.
+def test_default_config_path_is_identity_preserving():
+    """Inert-config invariant: every transform must return the same
+    object on its inert slot (``dedup="none"``, ``severity_floor="nit"``,
+    ``body_mode="full"``, ``max_findings=None``) so a default-config
+    review never pays for a no-op clone. The default ``DistillConfig()``
+    sets every slot inert by design — a misconfigured rule never
+    silently shapes findings.
+
+    Future transform PRs MUST keep returning ``result is`` on their
+    inert slot or this assertion trips.
     """
     result = _result_with_findings("nit", "concern")
-    config = DistillConfig()  # audience defaults to agent_consumption
+    config = DistillConfig()  # all slots inert by default
 
     out = run_pipeline(result, config)
 
-    assert out == result
+    assert out is result
 
 
 def test_run_pipeline_signature_is_stable():
