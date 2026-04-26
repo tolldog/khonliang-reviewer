@@ -168,8 +168,20 @@ def _fetch_pr_diff(repo: str, pr_number: int) -> str:
     """
     cmd = ["gh", "pr", "diff", "--repo", repo, str(pr_number)]
     try:
+        # Pin the decoder to UTF-8 with ``errors="replace"`` rather
+        # than relying on the process locale: ``gh`` emits diff bytes
+        # produced by GitHub (UTF-8) but the runtime locale can be C
+        # / POSIX (e.g. CI containers) where ``text=True`` would pick
+        # ASCII and raise ``UnicodeDecodeError`` on any non-ASCII
+        # byte. ``replace`` keeps the harness deterministic across
+        # hosts; the diff is for prompt input, not byte-exact replay.
         proc = subprocess.run(  # noqa: S603 — fixed argv from internal call
-            cmd, capture_output=True, text=True, check=False, timeout=60
+            cmd,
+            capture_output=True,
+            check=False,
+            timeout=60,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
