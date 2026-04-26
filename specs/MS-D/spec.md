@@ -116,7 +116,7 @@ None of these are large; together they remove ~5 categories of friction.
 
 ## Dependencies
 
-- **Soft-blocks on:** the `.reviewer/` loader (Milestone B) for `num_ctx` per-model config-file override. The kwarg + ProviderConfig path can ship without the loader; the `.reviewer/models/ollama/<model>.yaml` override path is gated on the loader landing first. Acceptance #2's last sentence is gated accordingly.
+- **Soft-blocks on:** *extending* the existing `.reviewer/` loader (`reviewer/config/repo.py`, already present and enumerating `.reviewer/models/<vendor>/<model>.yaml` per `_model_stem`) to expose a new `num_ctx` field through resolution into the OllamaProvider. The kwarg + ProviderConfig path can ship without the extension; the `.reviewer/models/ollama/<stem>.yaml: num_ctx:` override path is gated on the loader extension landing first. Acceptance #2's last sentence is gated accordingly. (The loader itself is *not* a dependency — it's already there; the dependency is on plumbing the new field through.)
 - **Composes with:** MS-B's distill pipeline. `format=json` reduces the output-shape variance the distill pipeline has to defend against; the two are complementary but neither blocks the other.
 - **External:** Ollama HTTP server reachable for `format=json` integration test; same as today for any Ollama provider work.
 
@@ -139,3 +139,4 @@ None of these are large; together they remove ~5 categories of friction.
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. Per-FR scope distilled from each FR's description; common bundle rationale documented in the design principle.
 - **rev 2** (2026-04-26): correct YAML stem in acceptance #2 from `qwen2.5-coder_14b.yaml` to `qwen2.5-coder.yaml` and document the `_model_stem` tag-stripping rule explicitly (per Copilot R1 on PR#24, grounded in `reviewer/config/repo.py:421`).
+- **rev 3** (2026-04-26): clarify the §Dependencies wording — the `.reviewer/` loader already exists (`reviewer/config/repo.py` enumerates per-model YAML today); the actual dependency is on *extending* the loader to surface a new `num_ctx` field through resolution into the OllamaProvider. Avoids implying the loader needs to be built from scratch (per Copilot R2 on PR#24).

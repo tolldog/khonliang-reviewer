@@ -87,7 +87,7 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 - Module layout:
   - `reviewer/scrape/address_rate.py` — scrape + classify + persist.
   - `reviewer/scrape/promote.py` — candidate generator + similarity check.
-  - `reviewer/skills/address_rate.py` — three new MCP skills.
+  - `reviewer/skills/address_rate.py` — four new MCP skills (`compute_address_rates`, `address_rate_summary`, `list_pending_examples`, `promote_pending_example`).
 - New `address_rate` table:
   ```sql
   CREATE TABLE address_rate (
@@ -124,3 +124,4 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. MS-B sequencing dependency flagged. Open questions on cross-vendor disambiguation + merge-SHA semantics flagged for first review pass.
 - **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` and rework promotion model: the loader expects ONE file per `(kind, severity)` cell — not one file per finding — so promote-to-live can't be a `git mv`. Revised model: candidates land at `_pending/<finding_id>.md` (one file per candidate); a new `promote_pending_example` skill APPENDS the candidate's body into the target cell file with a configurable separator. Both fixes per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195-260`.
+- **rev 3** (2026-04-26): correct skill count in §Implementation Notes from "three" to "four" — rev2 added `promote_pending_example` to §Scope but didn't update the module ownership line (per Copilot R2 on PR#24).

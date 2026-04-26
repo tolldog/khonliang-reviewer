@@ -45,12 +45,12 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
   - `dedup: "none" | "exact" | "title_substring" | "semantic"` — `semantic` is reserved (not implemented this milestone).
   - `max_findings: int | None` — post-filter cap.
   - `audience: "github_comment" | "developer_handoff" | "human_review" | "agent_consumption" | "audit_corpus"` — informs `body_mode` defaults but is independently inspectable (so transforms that care about audience without caring about body_mode can fork on it).
-- **`reviewer.distill` module** — pipeline order, fixed:
-  1. **consensus** — when `DistillConfig.consensus`, run N=3 Best-of-N against the configured local-tier model; converge findings via overlap; on disagreement above a threshold escalate to `claude_cli` per `fr_reviewer_cb081fa8`'s three-tier rubric.
-  2. **dedup** — collapse exact-text or title-substring duplicates into a single finding, preserving the highest severity among the merged set.
-  3. **severity_filter** — drop findings below `DistillConfig.severity_floor` (existing behavior, lifted into the pipeline).
-  4. **body_mode** — shape `summary` + finding `body` length per `body_mode`. `compact` strips finding bodies; `brief` keeps the first sentence; `full` no-op.
-  5. **max_findings** — sort findings by severity desc + first-position then truncate.
+- **`reviewer.distill` module** — post-provider pipeline. Fixed order:
+  1. **dedup** — collapse exact-text or title-substring duplicates into a single finding, preserving the highest severity among the merged set.
+  2. **severity_filter** — drop findings below `DistillConfig.severity_floor` (existing behavior, lifted into the pipeline).
+  3. **body_mode** — shape `summary` + finding `body` length per `body_mode`. `compact` strips finding bodies; `brief` keeps the first sentence; `full` no-op.
+  4. **max_findings** — sort findings by severity desc + first-position then truncate.
+- **Consensus is a selector-layer concern, not a distill transform.** When `DistillConfig.consensus` is true, `fr_reviewer_cb081fa8`'s three-tier evaluator gate runs *before* the distill pipeline: parallel-sample N=3 local-tier runs, converge findings via overlap, escalate to `claude_cli` on threshold disagreement. The single result that survives consensus then flows into the distill pipeline like any provider output. (Open Question #2 asked whether consensus is pipeline or selector; this spec decides selector. The `DistillConfig.consensus` field stays — it's how the rule-table tells the selector to engage consensus mode for a given `(kind, profile, size, audience)`.)
 - **`audit_corpus` audience** is a hard short-circuit: the pipeline returns `ReviewResult` with `findings` unchanged and `dropped_findings=[]`, regardless of the configured transforms.
 - **`ReviewResult.dropped_findings`** — new field on the result dataclass. Persists across the pipeline. Always populated (empty list when nothing dropped).
 - **`.reviewer/prompts/examples/` seed corpus** — populated against `tolldog/khonliang-reviewer-store` (or another representative milestone_store consumer). Layout matches the existing prompts loader (one file per `(kind, severity)` cell; the entire file contents become the few-shot block for that cell):
@@ -70,23 +70,23 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 ## Acceptance Criteria
 
-1. `review_text({..., audience: "github_comment"})` returns a terser, severity-floored result matching the rule-table entry for `(github_comment, *, *, *)`. Same call with `audience: "audit_corpus"` returns the raw findings with `dropped_findings == []` (regardless of other rule-table fields).
-2. The three transforms (severity_floor, consensus, dedup) all plug into `reviewer.distill` — not into `review_text` directly. Each ships with a unit test for noise reduction *and* a feature-preservation test ("given an outlier concern alongside 20 nits, the concern survives unchanged").
+1. `review_text({..., audience: "github_comment"})` returns a terser, severity-floored result matching the rule-table entry for the given `(kind, profile, size)` with `audience: "github_comment"`. Same call with `audience: "audit_corpus"` returns the raw findings with `dropped_findings == []` (regardless of other rule-table fields).
+2. The post-provider transforms (severity_floor, dedup, body_mode, max_findings) all plug into `reviewer.distill` — not into `review_text` directly. Each ships with a unit test for noise reduction *and* a feature-preservation test ("given an outlier concern alongside 20 nits, the concern survives unchanged"). Consensus runs in the selector layer ahead of the distill pipeline (per Open Question #2 resolution).
 3. Rule-table evaluation returns both `(ProviderDecision, DistillConfig)` in a single call. No caller assembles the two halves from separate queries.
 4. `.reviewer/config.yaml` loader supports `rules[].distill` with at least the field set listed in §Scope.
 5. `ReviewResult.dropped_findings` is populated (empty list when nothing dropped). Audit corpus runs (`audience: audit_corpus`) always have `dropped_findings == []` *and* the full original finding list.
 6. The first-corpus `.reviewer/prompts/examples/` set ships in this milestone. Existing prompt-loader unit tests already merged in PR#14 are extended to load from that real corpus and assert the merged prompt contains all expected sections in the documented order.
-7. Three-tier evaluator gate behavior (per `fr_reviewer_cb081fa8`):
-   - When `DistillConfig.consensus == False`: pipeline runs the configured single provider once, no escalation.
-   - When `DistillConfig.consensus == True` and disagreement is below threshold: result is the consensus output of N=3 local runs.
-   - When `DistillConfig.consensus == True` and disagreement is above threshold: result is the `claude_cli` escalation output (with `usage.disposition: "escalated-approved"` so the trailer convention can record it).
+7. Three-tier evaluator gate behavior (per `fr_reviewer_cb081fa8`, runs in selector layer before distill):
+   - When `DistillConfig.consensus == False`: selector picks one provider per the rule table, runs once. No escalation. Result flows into distill pipeline.
+   - When `DistillConfig.consensus == True` and disagreement is below threshold: selector parallel-samples N=3 local-tier runs, converges findings via overlap. Consensus result flows into distill pipeline.
+   - When `DistillConfig.consensus == True` and disagreement is above threshold: selector escalates to `claude_cli`; the escalation output (with `usage.disposition: "escalated-approved"` so the trailer convention can record it) flows into distill pipeline.
 8. Performance: distill pipeline overhead is below 50ms for a 10-finding result on local hardware (no LLM calls in the post-provider transforms; consensus's LLM cost is metered separately via the provider's own `UsageEvent`).
 9. Tests cover: each transform in isolation, the full pipeline ordering, the audit_corpus short-circuit, the consensus-disagreement escalation path, and the rule-table → DistillConfig → pipeline composition.
 
 ## Open Questions
 
 1. **Where does `audience` enter the rule-table inputs?** The current rule table keys on `(kind, profile, size)`. Adding `audience` as a fourth dimension makes the table 5× wider. Alternative: keep the existing key, attach a default `DistillConfig` per row, and let callers override `audience` via the request. Decision deferred to implementation; document the chosen path in this spec's first revision.
-2. **Should `consensus` transforms run before the provider call (parallel sampling) or after (post-hoc voting on cached single result)?** `fr_reviewer_cb081fa8` describes parallel sampling. That implies the "transform" is actually a *replacement* for the regular provider call — not a post-hoc shaper. Need to decide whether `consensus` lives in the pipeline at all, or whether it lives in the *selector* layer (with the pipeline running once on the consensus result). Tentative: consensus is a selector-layer concern; the pipeline runs once on whichever result the selector produces. Validate with `cb081fa8` author intent before coding.
+2. ~~**Should `consensus` transforms run before the provider call (parallel sampling) or after (post-hoc voting on cached single result)?**~~ **Resolved (rev 3): consensus runs in the selector layer**, ahead of the distill pipeline. `fr_reviewer_cb081fa8` describes parallel sampling, which is a *replacement* for the regular provider call — not a post-hoc shaper. Distill stays a pure post-provider pipeline. The `DistillConfig.consensus` field stays as the rule-table → selector signal.
 3. **`semantic` dedup placeholder** — should the dataclass field accept `semantic` and raise at runtime, or accept it and silently fall back to `title_substring`? Raising is more honest but causes hard breakage on misconfigured rules; falling back is friendlier but masks bugs. Tentative: raise with a clear "semantic dedup not implemented; use title_substring" error.
 
 ## Dependencies
@@ -99,11 +99,11 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 - The pipeline lives in `reviewer/distill/`:
   - `reviewer/distill/__init__.py` — module exports, `run_pipeline(result, config) -> ReviewResult`.
-  - `reviewer/distill/transforms/severity_filter.py`
   - `reviewer/distill/transforms/dedup.py`
+  - `reviewer/distill/transforms/severity_filter.py`
   - `reviewer/distill/transforms/body_mode.py`
   - `reviewer/distill/transforms/max_findings.py`
-- Consensus likely lives outside the distill module per Open Question #2.
+- Consensus runs in the selector (per Open Question #2 resolution) — likely as a new mode on `ProviderSelector` that returns a converged/escalated `ReviewResult` instead of calling a single provider once. The distill pipeline never sees the difference.
 - `DistillConfig` ships in `reviewer/policy/distill.py` (sibling to existing `reviewer/policy/rules.py`).
 - Audit-corpus short-circuit: `if config.audience == "audit_corpus": return result.with_dropped(())` — single early return at the top of `run_pipeline`.
 
@@ -111,3 +111,4 @@ The rule table's output shape grows from `PolicyDecision` to `(ProviderDecision,
 
 - **rev 1** (2026-04-26): initial spec, author: Claude. Open questions flagged for first review pass.
 - **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` (per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195`). Clarified the one-file-per-cell layout that the loader expects.
+- **rev 3** (2026-04-26): resolve internal contradictions per Copilot R2 on PR#24. (a) Open Question #2 resolved: consensus is selector-layer, not a distill transform. Removed consensus from the §Scope pipeline list, updated Acceptance #2 + #7 to reflect the selector-layer placement, marked Open Question #2 as resolved with rationale, updated Implementation Notes accordingly. (b) Acceptance #1 reworded to not hard-code a `(github_comment, *, *, *)` shape (since rule-table key is `(kind, profile, size)` and audience routing is still an implementation choice).
