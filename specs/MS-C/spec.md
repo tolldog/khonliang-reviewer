@@ -75,7 +75,7 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 ## Open Questions
 
 1. **Address-rate vs. accept-rate for cross-vendor reviews.** Today reviewer findings post as PR comments. When a Copilot review *also* posts on the same PR, the address signal could conflate the two (a developer addressing a Copilot finding might be miscredited to a reviewer finding nearby). The classifier needs to disambiguate by author. Tentative: filter the comment-author check to `khonliang-reviewer-bot` (or whatever the configured PR-comment author is) before counting `addressed`. Document the assumption in the spec's first revision.
-2. **What counts as "the merge SHA"** when a PR is rebased + squashed? The reviewed SHA is in `UsageStore.review_records.commit_sha`; the merge SHA is the squash-merge commit on `main`. Heuristic: walk `git log --first-parent main` for the squash that introduced the PR's content, identified by `Merged-via` trailer or PR-number reference in the commit message. Edge: PRs merged via fast-forward have no distinct merge SHA. Tentative: collapse `addressed` and `inconclusive` into the same bucket when no distinct merge SHA exists.
+2. **What counts as "the merge SHA"** when a PR is rebased + squashed? The reviewed SHA comes from GitHub review metadata / PR head SHA at review time — not from `UsageStore` persistence (the current `reviewer_usage` schema does not store a commit SHA). The merge SHA is the squash-merge commit on `main`. Heuristic: walk `git log --first-parent main` for the squash that introduced the PR's content, identified by `Merged-via` trailer or PR-number reference in the commit message. Edge: PRs merged via fast-forward have no distinct merge SHA — the table stores the sentinel `no_merge_sha` (see §Implementation Notes schema) so primary-key idempotency stays well-defined. Tentative: collapse `addressed` and `inconclusive` into the same bucket when no distinct merge SHA exists. If we later need the reviewed SHA in usage persistence, that would require explicitly extending `UsageEvent` + `reviewer_usage` (separate FR).
 3. **Promotion threshold tuning.** 90th percentile within the cohort is a starting guess. Worth instrumenting the candidate generator to log the rank distribution for the first month so we can adjust before too many candidates accumulate (or too few).
 4. **`.reviewer/prompts/examples/_pending/` lifecycle.** When a candidate sits there for >90 days unreviewed, should it auto-expire? Tentative: surface in `list_pending_examples()` with an age field, but do not auto-delete (deletion is operator's choice).
 
@@ -96,14 +96,25 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
   CREATE TABLE address_rate (
     finding_id TEXT NOT NULL,
     reviewed_sha TEXT NOT NULL,
-    merge_sha TEXT,
-    classification TEXT NOT NULL,  -- addressed | not_addressed | inconclusive
+    merge_sha TEXT NOT NULL,        -- sentinel 'no_merge_sha' when no merge commit exists (e.g. fast-forward merge)
+    classification TEXT NOT NULL CHECK (
+      classification IN ('addressed', 'not_addressed', 'inconclusive')
+    ),
     classified_at REAL NOT NULL,
-    rationale_code TEXT NOT NULL,  -- enum: file_unchanged | region_overlap | rebuttal_reaction | won't_fix_reply | mixed_signal | no_merge_sha | ...
+    rationale_code TEXT NOT NULL CHECK (
+      rationale_code IN (
+        'file_unchanged',
+        'region_overlap',
+        'rebuttal_reaction',
+        'wont_fix_reply',
+        'mixed_signal',
+        'no_merge_sha'
+      )
+    ),
     PRIMARY KEY (finding_id, reviewed_sha, merge_sha)
   );
   ```
-  Persists only finding ids, SHAs, classification, and a fixed enum code naming the heuristic that fired. Any human-readable rationale is derived at runtime from the enum + the row's other fields. **Raw GitHub comment / reaction text is never stored** in this table (or anywhere else by this milestone) — Acceptance Criterion #6 enforced structurally by limiting the column to a closed enum vocabulary rather than a free-form string.
+  Persists only finding ids, SHAs, classification, and a fixed enum code naming the heuristic that fired. The PK is `(finding_id, reviewed_sha, merge_sha)` and `merge_sha` is `NOT NULL` with a sentinel value (`'no_merge_sha'`) for the fast-forward case so re-runs stay idempotent under the composite key without nullable-PK semantics ambiguity. Any human-readable rationale is derived at runtime from the enum + the row's other fields. **Raw GitHub comment / reaction text is never stored** in this table (or anywhere else by this milestone) — Acceptance Criterion #6 enforced structurally by the `CHECK`-constrained closed-enum vocabulary, not by convention.
 - Similarity check via `re.findall(r"\w+", text.lower())` + Python `set` Jaccard. No external dep on tokenizers / embeddings.
 - Candidate file format (`.reviewer/prompts/examples/_pending/<finding_id>.md` — where `<finding_id>` is the review-finding id from the source `ReviewFinding`, NOT an FR id):
   ```markdown
@@ -131,3 +142,4 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 - **rev 3** (2026-04-26): correct skill count in §Implementation Notes from "three" to "four" — rev2 added `promote_pending_example` to §Scope but didn't update the module ownership line (per Copilot R2 on PR#24).
 - **rev 4** (2026-04-26): two structural cleanups per Copilot R3 on PR#24. (a) Replaced free-form `rationale TEXT` column in the `address_rate` table with a closed-enum `rationale_code` column — Acceptance #6's "finding ids and SHAs only" constraint is now enforced structurally by the schema rather than relying on convention to keep raw GitHub comment text out of the column. Human-readable rationale is derived at runtime from the enum. (b) Renamed candidate-file frontmatter `source_finding_id: fr_<id>` to `source_finding_id: finding_<id>` and explicitly noted the field is a `ReviewFinding` id (not an FR id) — earlier wording read like a functional-requirement reference.
 - **rev 5** (2026-04-26): correct scrape-seed reference per Copilot R4 on PR#24. Earlier revs cited `UsageStore.review_records` as the scrape seed, but that table doesn't exist — `UsageStore` today persists `reviewer_usage` + `model_pricing` only. Reworked §Scope to seed from existing `reviewer_usage` rows + GitHub PR metadata, recover findings from GitHub PR review comments (rather than per-finding local persistence), and key the new `address_rate` table by GitHub review-comment id. Removed implicit dependency on a new persistence layer; MS-C now requires only the new `address_rate` sibling table.
+- **rev 6** (2026-04-26): three schema-rigor cleanups per Copilot R5 on PR#24. (a) Open Question #2 still cited `UsageStore.review_records.commit_sha` despite rev5 already removing that reference from §Scope. Updated to source `reviewed_sha` from GitHub review metadata / PR head SHA at review time. (b) `merge_sha TEXT` (nullable) inside `PRIMARY KEY` left idempotency semantics ambiguous; bumped to `NOT NULL` with sentinel `'no_merge_sha'` for the fast-forward case. (c) `rationale_code` was claimed as "structural enforcement" but had no `CHECK` constraint; added explicit `CHECK (rationale_code IN (...))` plus `CHECK` on `classification` so the privacy-and-vocabulary invariants are DB-enforced rather than convention-enforced. Renamed `won't_fix_reply` → `wont_fix_reply` for SQL-literal compatibility.
