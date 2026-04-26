@@ -96,15 +96,16 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
     merge_sha TEXT,
     classification TEXT NOT NULL,  -- addressed | not_addressed | inconclusive
     classified_at REAL NOT NULL,
-    rationale TEXT NOT NULL,  -- short heuristic-evidence string, NOT comment bodies
+    rationale_code TEXT NOT NULL,  -- enum: file_unchanged | region_overlap | rebuttal_reaction | won't_fix_reply | mixed_signal | no_merge_sha | ...
     PRIMARY KEY (finding_id, reviewed_sha, merge_sha)
   );
   ```
+  Persists only finding ids, SHAs, classification, and a fixed enum code naming the heuristic that fired. Any human-readable rationale is derived at runtime from the enum + the row's other fields. **Raw GitHub comment / reaction text is never stored** in this table (or anywhere else by this milestone) — Acceptance Criterion #6 enforced structurally by limiting the column to a closed enum vocabulary rather than a free-form string.
 - Similarity check via `re.findall(r"\w+", text.lower())` + Python `set` Jaccard. No external dep on tokenizers / embeddings.
-- Candidate file format (`.reviewer/prompts/examples/_pending/<finding_id>.md`):
+- Candidate file format (`.reviewer/prompts/examples/_pending/<finding_id>.md` — where `<finding_id>` is the review-finding id from the source `ReviewFinding`, NOT an FR id):
   ```markdown
   ---
-  source_finding_id: fr_<id>
+  source_finding_id: finding_<id>
   target_kind: pr_diff
   target_severity: concern
   cohort: ollama/qwen2.5-coder:14b/pr_diff/concern
@@ -125,3 +126,4 @@ The two FRs in this milestone close the loop: address-rate becomes the quality s
 - **rev 1** (2026-04-26): initial spec, author: Claude. MS-B sequencing dependency flagged. Open questions on cross-vendor disambiguation + merge-SHA semantics flagged for first review pass.
 - **rev 2** (2026-04-26): correct loader path from `.reviewer/examples/` to `.reviewer/prompts/examples/` and rework promotion model: the loader expects ONE file per `(kind, severity)` cell — not one file per finding — so promote-to-live can't be a `git mv`. Revised model: candidates land at `_pending/<finding_id>.md` (one file per candidate); a new `promote_pending_example` skill APPENDS the candidate's body into the target cell file with a configurable separator. Both fixes per Copilot R1 on PR#24, grounded in `reviewer/config/prompts.py:195-260`.
 - **rev 3** (2026-04-26): correct skill count in §Implementation Notes from "three" to "four" — rev2 added `promote_pending_example` to §Scope but didn't update the module ownership line (per Copilot R2 on PR#24).
+- **rev 4** (2026-04-26): two structural cleanups per Copilot R3 on PR#24. (a) Replaced free-form `rationale TEXT` column in the `address_rate` table with a closed-enum `rationale_code` column — Acceptance #6's "finding ids and SHAs only" constraint is now enforced structurally by the schema rather than relying on convention to keep raw GitHub comment text out of the column. Human-readable rationale is derived at runtime from the enum. (b) Renamed candidate-file frontmatter `source_finding_id: fr_<id>` to `source_finding_id: finding_<id>` and explicitly noted the field is a `ReviewFinding` id (not an FR id) — earlier wording read like a functional-requirement reference.

@@ -40,15 +40,16 @@ None of these are large; together they remove ~5 categories of friction.
 - Add `SelectorConfig.default_models: dict[str, str]` field.
 - `ProviderSelector.select(backend, model)` resolution order:
   1. Caller-supplied non-empty `model`.
-  2. `SelectorConfig.default_models.get(chosen_backend)`.
-  3. Registry's `ProviderRegistration.default_model` for that backend.
+  2. Non-empty `SelectorConfig.default_models.get(chosen_backend)` — empty strings are treated as "unset at the selector layer" and **do not** stop resolution; resolution continues to step 3.
+  3. Registry's `ProviderRegistration.default_model` for that backend (also subject to non-empty check).
   4. `SelectorConfig.default_model` (legacy single-string global default).
+  5. If still unset, the effective model is `None`; provider invocation omits the model argument entirely and lets the provider choose. (E.g. `codex exec` with no `--model` flag uses codex's own default.)
 - Suggested defaults (operator-overridable in `config.yaml`):
   - `claude_cli: "sonnet"`
-  - `codex_cli: ""` (codex picks its own; empty means "let the binary choose").
-  - `gh_copilot: ""` (same).
+  - `codex_cli: ""` (empty → unset at selector; provider call omits `--model` and codex picks its own).
+  - `gh_copilot: ""` (same — let the binary choose).
   - `ollama: "qwen2.5-coder:14b"`.
-- `_build_default_selector` in `agent.py` reads `config["default_models"]` (dict) when present; falls back to `config["default_model"]` (string) for backward-compat. Logs a deprecation note (info level) when only the legacy key is present.
+- `_build_default_selector` in `agent.py` reads `config["default_models"]` (dict) when present; falls back to `config["default_model"]` (string) for backward-compat. Emits a one-time INFO-level migration notice on process startup (not per-request) when only the legacy single-string key is present, suggesting operators move to `default_models`.
 - `config.example.yaml` updated to show both the legacy and the new shape.
 
 **(2) `num_ctx` kwarg + per-model config — `fr_reviewer_2c751c3b`**
@@ -104,7 +105,7 @@ None of these are large; together they remove ~5 categories of friction.
 4. **`sign_off_trailer()`** returns the documented trailer format for each of the four verdict cases. Trailer parses cleanly via standard git trailer parser (`git interpret-trailers`). When called with a `result` containing 0 findings, returns `verdict: "approved"`. Result with 2 nits returns `verdict: "approved-with-findings", trailer_line: "Agent-Reviewed-by: khonliang-reviewer/<backend>/<model> approved-with-findings: 2 nits filtered"`.
 5. **Arg consistency**: `review_diff(diff="...")`, `review_diff(content="...")`, `review_text(diff="...")`, `review_text(content="...")` all succeed and review the same payload. Tests cover all four shapes.
 6. Tests: per-FR unit coverage as listed above; one integration test exercises `format=json` end-to-end against a containerized Ollama if the harness has one (otherwise mark skip-without-Ollama).
-7. **Backward compat**: every existing test passes unchanged. No deprecation warnings emitted on legacy paths.
+7. **Backward compat**: every existing test passes unchanged. Legacy paths remain functional without warning- or error-level deprecation noise; if only legacy `default_model` is present, a one-time process-startup INFO-level migration notice is allowed (not per-request).
 8. **Single PR shipping**: when 1–4 are independent file-level (no cross-FR conflicts), bundle into one PR. (5) is one-line + docs; bundles trivially. (3) `format=json` may peel off into its own PR if Ollama integration testing requires extra iteration.
 
 ## Open Questions
@@ -140,3 +141,4 @@ None of these are large; together they remove ~5 categories of friction.
 - **rev 1** (2026-04-26): initial spec, author: Claude. Per-FR scope distilled from each FR's description; common bundle rationale documented in the design principle.
 - **rev 2** (2026-04-26): correct YAML stem in acceptance #2 from `qwen2.5-coder_14b.yaml` to `qwen2.5-coder.yaml` and document the `_model_stem` tag-stripping rule explicitly (per Copilot R1 on PR#24, grounded in `reviewer/config/repo.py:421`).
 - **rev 3** (2026-04-26): clarify the §Dependencies wording — the `.reviewer/` loader already exists (`reviewer/config/repo.py` enumerates per-model YAML today); the actual dependency is on *extending* the loader to surface a new `num_ctx` field through resolution into the OllamaProvider. Avoids implying the loader needs to be built from scratch (per Copilot R2 on PR#24).
+- **rev 4** (2026-04-26): two reconciled inconsistencies per Copilot R3 on PR#24. (a) Selector resolution order made explicit: empty strings in `default_models.get(...)` are treated as "unset, fall through" rather than short-circuiting selection with the empty string — added an explicit non-empty check at step 2, added step 5 (effective model `None` → omit `--model` argument entirely so the provider chooses). (b) Reconciled the deprecation-notice contradiction: §Scope says emit a process-startup INFO-level migration notice when only legacy `default_model` is present; Acceptance #7 (which rev1 said "no deprecation warnings emitted") now explicitly allows the one-time INFO migration notice while still forbidding warning- or error-level noise on legacy paths.
