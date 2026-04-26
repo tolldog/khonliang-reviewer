@@ -31,6 +31,12 @@ include = ["reviewer*"]
 # (without ``--diff <path>``) on the same machine that imports the
 # package.
 "reviewer.tools.benchmark_data" = ["*.diff"]
+# Bundle the artifact-review rubric prompts so the future
+# artifact-review pipeline (``fr_reviewer_19c871ab``) can load
+# them via ``importlib.resources.files("reviewer.data.prompts")``
+# without each consumer repo having to ship its own
+# ``.reviewer/prompts/`` first.
+"reviewer.data.prompts" = ["*.md"]
 
 [build-system]
 requires = ["setuptools>=68"]
