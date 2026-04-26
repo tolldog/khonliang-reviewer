@@ -282,6 +282,13 @@ async def _run_one(
         # providers (the sub-millisecond clamp is purely cosmetic but
         # makes "the harness measured something" unambiguous).
         measured_ms = max(int((time.monotonic() - start) * 1000), 1)
+    except asyncio.CancelledError:
+        # Cancellation must propagate. ``Exception`` catches
+        # ``CancelledError`` on Python <3.8 and (more relevantly here)
+        # any future code that re-raises it as ``Exception``; an
+        # explicit re-raise keeps cancellation prompt under any async
+        # supervisor that runs the sweep.
+        raise
     except Exception as exc:
         duration_ms = max(int((time.monotonic() - start) * 1000), 1)
         _LOGGER.warning(

@@ -370,6 +370,30 @@ async def test_run_runs_once_when_registry_has_no_declared_models(tmp_path):
     assert fake.call_count == 1
 
 
+async def test_run_propagates_cancellation_through_broad_except(tmp_path):
+    """``asyncio.CancelledError`` must propagate, not get swallowed
+    by the broad ``except Exception`` that converts provider failures
+    into errored rows. Otherwise a sweep running under an async
+    supervisor wouldn't stop promptly when cancellation is requested.
+    """
+    import asyncio
+
+    cancelled = _FakeProvider("cancelled", raises=asyncio.CancelledError())
+    registry = ProviderRegistry()
+    registry.register(cancelled, default_model="m", declared_models=["m"])
+
+    with pytest.raises(asyncio.CancelledError):
+        await benchmark_sweep.run(
+            diff_source=None,
+            output_dir=tmp_path / "out",
+            backends=[],
+            models=[],
+            kind="pr_diff",
+            instructions="t",
+            registry=registry,
+        )
+
+
 async def test_run_captures_provider_exception_as_errored_row(tmp_path):
     """An uncaught provider exception becomes a structured errored row.
 
