@@ -3342,6 +3342,49 @@ async def test_consensus_finding_anchor_uses_path_and_line_when_set():
     assert out["findings"] == []
 
 
+async def test_consensus_path_only_finding_anchors_as_summary_level():
+    """Per Copilot R4 PR#37: a finding with ``path`` set but
+    ``line=None`` (or vice versa) MUST anchor as summary-level (empty
+    path, 0 line) rather than producing a partial-anchor key that
+    contradicts the docstring and groups with nothing.
+
+    Concretely: two findings with the same severity + same title +
+    same path-but-no-line across two runs MUST consolidate (because
+    their key collapses to the summary-level shape), not stay
+    separate as "near-inline" findings.
+    """
+    path_only_a = ReviewFinding(
+        severity="comment",  # type: ignore[arg-type]
+        title="missing rate-limit handling",
+        body="body a",
+        path="src/api.py",
+        line=None,
+    )
+    path_only_b = ReviewFinding(
+        severity="comment",  # type: ignore[arg-type]
+        title="missing rate-limit handling",
+        body="body b",
+        path="src/api.py",
+        line=None,
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([path_only_a]), _consensus_result([path_only_b])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 2},
+    )
+
+    # Both findings collapse to (comment, "", 0, "missing rate-limit
+    # handling") under the summary-anchor rule, so the group has size
+    # 2 and survives min=2.
+    titles = [f["title"] for f in out["findings"]]
+    assert titles == ["missing rate-limit handling"]
+
+
 async def test_consensus_title_normalization_groups_minor_drift():
     """Title normalization (lowercase + whitespace collapse) groups
     findings with trivial wording differences, which is the common

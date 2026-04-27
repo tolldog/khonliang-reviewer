@@ -263,12 +263,21 @@ def _consensus_finding_key(
 ) -> tuple[str, str, int, str]:
     """Anchor key used to detect "same finding" across consensus runs.
 
-    Inline findings (path + line both set) anchor on
+    Inline findings (path **and** line both set) anchor on
     ``(severity, path, line, normalized_title)`` — the line gives the
     strongest signal that two findings refer to the same code site.
     Summary-level findings (path / line absent) anchor on
     ``(severity, "", 0, normalized_title)`` so the title carries the
     overlap detection alone.
+
+    Findings with ``path`` set but ``line=None`` (or vice versa) are
+    treated as summary-level — same as the both-absent case — so they
+    consolidate with other summary-level findings sharing the same
+    title rather than producing a third "weird" key shape that
+    nothing else groups with. (Copilot R4 PR#37: the prior code
+    used ``finding.path or ""`` and ``finding.line or 0`` independently,
+    which silently created a partial-anchor key for the path-only /
+    line-only case and contradicted the docstring.)
 
     Title normalization (lowercase + whitespace collapse) tolerates
     minor wording drift across runs without softening the
@@ -277,12 +286,9 @@ def _consensus_finding_key(
     unrelated finding.
     """
     title_norm = " ".join(finding.title.lower().split())
-    return (
-        finding.severity,
-        finding.path or "",
-        finding.line or 0,
-        title_norm,
-    )
+    if finding.path and finding.line is not None:
+        return (finding.severity, finding.path, finding.line, title_norm)
+    return (finding.severity, "", 0, title_norm)
 
 
 def _consolidate_consensus_results(
