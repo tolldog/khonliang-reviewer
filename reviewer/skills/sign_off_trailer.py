@@ -273,11 +273,10 @@ def _append_filtered(base: str, filtered_count: int) -> str:
     """
     if filtered_count <= 0:
         return base
-    suffix = (
-        f"{filtered_count} filtered"
-        if filtered_count == 1
-        else f"{filtered_count} filtered"
-    )
+    # ``filtered`` is an adjective on the elided noun "findings" —
+    # doesn't pluralize, so a single template covers count == 1
+    # and count > 1 alike.
+    suffix = f"{filtered_count} filtered"
     if not base:
         return suffix
     return f"{base} + {suffix}"
