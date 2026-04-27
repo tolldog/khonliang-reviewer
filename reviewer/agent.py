@@ -31,7 +31,7 @@ import sys
 import uuid
 from typing import Any
 
-from khonliang_bus import BaseAgent, Skill, handler
+from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
 from khonliang_reviewer import (
     SEVERITY_ORDER,
     ReviewFinding,
@@ -609,6 +609,46 @@ class ReviewerAgent(BaseAgent):
     ``selector=`` kwarg to avoid touching real Ollama / Claude CLI
     subprocesses.
     """
+
+    # Cold-start orientation surface (fr_khonliang-bus-lib_6a82732c).
+    WELCOME = Welcome(
+        role="cross-vendor code review authority",
+        mission=(
+            "Reviews diffs, PRs, and free-form code/text via pluggable LLM "
+            "backends (Ollama / Claude CLI / OpenAI). Produces structured "
+            "findings (severity / category / location / observation / "
+            "suggestion). Hot path is local Ollama (qwen2.5-coder:14b "
+            "default — 83% accuracy / 0 external tokens per the 2026-04-22 "
+            "benchmark). External LLMs are escalation, not default."
+        ),
+        not_responsible_for=[
+            "code authorship (Claude session via developer)",
+            "FR / spec / milestone lifecycle (developer)",
+            "ingestion (researcher)",
+        ],
+        delegates_to={
+            "developer": "PR + branch lifecycle around the review",
+            "store": "review-finding artifacts (planned per fr_reviewer_127af052)",
+        },
+        entry_points=[
+            WelcomeEntryPoint(
+                skill="review_diff",
+                when_to_use="review a raw git diff (preferred for pre-push checks; pass diff bytes, not summaries)",
+            ),
+            WelcomeEntryPoint(
+                skill="review_pr",
+                when_to_use="review a GitHub PR by URL — fetches the diff and PR metadata",
+            ),
+            WelcomeEntryPoint(
+                skill="review_text",
+                when_to_use="review free-form code or text snippets that aren't a diff or PR",
+            ),
+            WelcomeEntryPoint(
+                skill="usage_summary",
+                when_to_use="token + cost summary across recent calls; useful for budget tracking",
+            ),
+        ],
+    )
 
     agent_id = "reviewer-primary"
     agent_type = "reviewer"
