@@ -32,11 +32,14 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
+from dataclasses import replace as dataclass_replace
+
 from khonliang_reviewer import (
     SEVERITY_ORDER,
     ReviewFinding,
     ReviewRequest,
     ReviewResult,
+    UsageEvent,
     severity_rank,
 )
 
@@ -185,6 +188,178 @@ def _validate_severity_floor(value: str, *, source: str) -> str:
             f"expected one of {list(SEVERITY_ORDER)}"
         )
     return value
+
+
+class ConsensusError(ValueError):
+    """Raised when caller-supplied ``consensus_runs`` / ``consensus_min``
+    fail validation.
+
+    Subclass of :class:`ValueError` so existing ``except ValueError``
+    blocks catch it, but distinct enough that callers wanting to branch
+    on "validation error vs. other ValueError" can key on the class.
+    """
+
+
+def _coerce_consensus_int(value: Any, *, default: int) -> int:
+    """Return a positive int if ``value`` is one, else ``default``.
+
+    The bus boundary delivers ints as JSON; the schema default is ``1``
+    (effectively absent — single-pass review). Treat any non-int /
+    non-positive payload as absent rather than crashing the handler;
+    explicit out-of-range values still get rejected by
+    :func:`_validate_consensus` so callers don't silently land in a
+    weird state. Accepts ``int`` only (rejects ``bool`` because
+    ``bool`` is an ``int`` subclass and ``consensus_runs=True`` would
+    otherwise quietly become 1).
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int) and value > 0:
+        return value
+    return default
+
+
+def _validate_consensus(runs: int, min_count: int) -> None:
+    """Cross-validate the consensus pair after coercion.
+
+    ``runs >= 1`` and ``min_count >= 1`` are guaranteed by
+    :func:`_coerce_consensus_int`. The cross-check ``min_count <= runs``
+    catches caller bugs like ``consensus_runs=2, consensus_min=3``
+    where no finding could ever survive — fail fast with a clear
+    message rather than silently dropping every finding.
+    """
+    if min_count > runs:
+        raise ConsensusError(
+            f"consensus_min={min_count} cannot exceed "
+            f"consensus_runs={runs}; no finding could survive"
+        )
+
+
+def _consensus_finding_key(
+    finding: ReviewFinding,
+) -> tuple[str, str, int, str]:
+    """Anchor key used to detect "same finding" across consensus runs.
+
+    Inline findings (path + line both set) anchor on
+    ``(severity, path, line, normalized_title)`` — the line gives the
+    strongest signal that two findings refer to the same code site.
+    Summary-level findings (path / line absent) anchor on
+    ``(severity, "", 0, normalized_title)`` so the title carries the
+    overlap detection alone.
+
+    Title normalization (lowercase + whitespace collapse) tolerates
+    minor wording drift across runs without softening the
+    "10×-outlier survives unchanged" property — a unique outlier
+    still has a unique normalized title and is never grouped with an
+    unrelated finding.
+    """
+    title_norm = " ".join(finding.title.lower().split())
+    return (
+        finding.severity,
+        finding.path or "",
+        finding.line or 0,
+        title_norm,
+    )
+
+
+def _consolidate_consensus_results(
+    results: list[ReviewResult],
+    *,
+    min_count: int,
+    base_request_id: str,
+) -> ReviewResult:
+    """Merge N successful results into one via finding-overlap consolidation.
+
+    Findings are grouped by :func:`_consensus_finding_key`; groups
+    smaller than ``min_count`` are dropped. Surviving groups
+    contribute their first-occurring finding verbatim — no body
+    merging, no severity averaging. Picking the first occurrence (in
+    run order) is deterministic and preserves the canonical bytes the
+    model produced rather than synthesizing prose that no model wrote.
+
+    Usage records are summed (tokens, cost) except for ``duration_ms``
+    which takes the max (the runs are concurrent so wall-clock is the
+    longest, not the sum). The returned result reports the base
+    ``request_id`` and the first run's ``backend`` / ``model`` /
+    ``disposition`` — they're identical across runs in the typical
+    case (same provider, same model, same outcome).
+    """
+    groups: dict[tuple[str, str, int, str], list[ReviewFinding]] = {}
+    insertion_order: list[tuple[str, str, int, str]] = []
+    for result in results:
+        for finding in result.findings:
+            key = _consensus_finding_key(finding)
+            if key not in groups:
+                groups[key] = []
+                insertion_order.append(key)
+            groups[key].append(finding)
+
+    surviving = [
+        groups[key][0]
+        for key in insertion_order
+        if len(groups[key]) >= min_count
+    ]
+
+    base = results[0]
+    summary = next((r.summary for r in results if r.summary), "")
+    usage_events = [r.usage for r in results if r.usage is not None]
+    usage = _merge_usage_events(usage_events, base_request_id) if usage_events else None
+
+    return ReviewResult(
+        request_id=base_request_id,
+        summary=summary,
+        findings=surviving,
+        disposition=base.disposition,
+        error="",
+        error_category="",
+        usage=usage,
+        backend=base.backend,
+        model=base.model,
+    )
+
+
+def _merge_usage_events(
+    events: list[UsageEvent],
+    base_request_id: str,
+) -> UsageEvent:
+    """Sum cost-bearing fields, ``max`` wall-clock, preserve identity.
+
+    Caller guarantees ``events`` is non-empty (we error out before
+    consolidation if any run errored, so the surviving runs each
+    carry a usage event under the current provider implementations).
+    Token / cost fields sum across runs (true compute spend);
+    ``duration_ms`` is the max of the per-run durations (concurrent
+    wall-clock, not serial). Identity fields (``backend``, ``model``,
+    ``repo``, ``pr_number``, ``timestamp``, ``disposition``) take the
+    first run's value — they're invariant across runs in the typical
+    case, and the first-run pick keeps the trace anchored at the
+    earliest start time.
+
+    ``request_id`` is rewritten to ``base_request_id`` (sans the
+    ``-rN`` per-run suffix) so the usage record is searchable under
+    the same id the caller asked for.
+    """
+    base = events[0]
+    return UsageEvent(
+        timestamp=base.timestamp,
+        backend=base.backend,
+        model=base.model,
+        input_tokens=sum(e.input_tokens for e in events),
+        output_tokens=sum(e.output_tokens for e in events),
+        cache_read_tokens=sum(e.cache_read_tokens for e in events),
+        cache_creation_tokens=sum(e.cache_creation_tokens for e in events),
+        duration_ms=max(e.duration_ms for e in events),
+        disposition=base.disposition,
+        request_id=base_request_id,
+        repo=base.repo,
+        pr_number=base.pr_number,
+        estimated_api_cost_usd=sum(e.estimated_api_cost_usd for e in events),
+        error="",
+        error_category="",
+        # Reset to 0 — the severity_floor pass that runs after
+        # consensus will bump this on the merged result.
+        findings_filtered_count=0,
+    )
 
 
 def _load_repo_prompts_from_context(
@@ -789,6 +964,20 @@ class ReviewerAgent(BaseAgent):
                     # mixed output (per the 2026-04-22 evaluator-gate
                     # experiment). Other backends ignore this field.
                     "format": {"type": "string", "default": ""},
+                    # consensus_runs: number of parallel provider
+                    # invocations whose findings get consolidated by
+                    # overlap. 1 (default) = no consensus; single
+                    # provider call. >1 = run N times concurrently and
+                    # keep findings appearing in >= consensus_min runs.
+                    "consensus_runs": {"type": "integer", "default": 1},
+                    # consensus_min: minimum run count a finding must
+                    # appear in (under the same anchor key) to survive
+                    # consolidation. Must be in [1, consensus_runs].
+                    # 1 (default) = keep all findings (no real
+                    # filtering), useful for warming up the consensus
+                    # path; majority is consensus_min = ceil(runs/2)+1
+                    # — operators decide.
+                    "consensus_min": {"type": "integer", "default": 1},
                 },
                 since="0.1.0",
             ),
@@ -813,6 +1002,8 @@ class ReviewerAgent(BaseAgent):
                     "severity_floor": {"type": "string", "default": ""},
                     "num_ctx": {"type": "integer", "default": 0},
                     "format": {"type": "string", "default": ""},
+                    "consensus_runs": {"type": "integer", "default": 1},
+                    "consensus_min": {"type": "integer", "default": 1},
                 },
                 since="0.1.0",
             ),
@@ -1043,7 +1234,28 @@ class ReviewerAgent(BaseAgent):
             request_id=str(args.get("request_id") or _generate_request_id()),
         )
 
-        result = await provider.review(request)
+        # Consensus path (fr_reviewer_cb081fa8 first cut). When
+        # ``consensus_runs > 1`` the same request goes through the
+        # provider N times in parallel and the surviving findings are
+        # those that appeared (under the same anchor key) in at least
+        # ``consensus_min`` runs. Single-run (the default) skips the
+        # whole orchestration and follows the pre-FR fast path.
+        consensus_runs = _coerce_consensus_int(
+            args.get("consensus_runs"), default=1
+        )
+        consensus_min = _coerce_consensus_int(
+            args.get("consensus_min"), default=1
+        )
+        if consensus_runs > 1:
+            try:
+                _validate_consensus(consensus_runs, consensus_min)
+            except ConsensusError as exc:
+                return {"error": str(exc)}
+            result = await self._run_consensus(
+                provider, request, consensus_runs, consensus_min
+            )
+        else:
+            result = await provider.review(request)
         # Apply the severity_floor post-filter at the edge of the return
         # path, AFTER the provider returns but BEFORE usage recording.
         # The usage event gets the filtered count so downstream
@@ -1052,6 +1264,49 @@ class ReviewerAgent(BaseAgent):
         self._apply_severity_floor(result, effective_floor)
         await self._record_usage(result)
         return result.to_dict()
+
+    async def _run_consensus(
+        self,
+        provider: Any,
+        request: ReviewRequest,
+        runs: int,
+        min_count: int,
+    ) -> ReviewResult:
+        """Run ``provider.review`` ``runs`` times in parallel, consolidate
+        findings by overlap.
+
+        First-cut behavior (the simple correct version):
+
+        - Per-run requests get a ``-r{i+1}`` suffix appended to
+          ``request_id`` so usage records remain disambiguatable in
+          the storage layer; the consolidated result keeps the base id.
+        - If ANY run errors, return that run's result verbatim and
+          skip consolidation. This is intentionally simple — partial-
+          consensus over a degraded set is a future refinement.
+        - Surviving findings preserve the canonical body from the first
+          run that produced them. No body merging — averaging text
+          would smooth features (see ``project_reviewer_distill_principle``).
+        - Usage tokens sum across runs (true compute spend);
+          ``duration_ms`` is the max (concurrent wall-clock).
+        """
+        per_run_requests = [
+            dataclass_replace(request, request_id=f"{request.request_id}-r{i + 1}")
+            for i in range(runs)
+        ]
+        results = await asyncio.gather(
+            *(provider.review(r) for r in per_run_requests)
+        )
+        for r in results:
+            if r.error:
+                # Propagate as-is — the request_id will carry the per-run
+                # suffix, which is acceptable for the error case (the
+                # caller can correlate with the per-run usage record).
+                return r
+        return _consolidate_consensus_results(
+            results,
+            min_count=min_count,
+            base_request_id=request.request_id,
+        )
 
     def _resolve_severity_floor(
         self, args: dict[str, Any], cfg: RepoConfig | None
