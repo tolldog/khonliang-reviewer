@@ -923,6 +923,64 @@ def test_default_selector_honors_config_yaml(tmp_path):
     assert selector.config.default_model == "claude-opus-4-7"
 
 
+def test_default_selector_loads_default_models_dict(tmp_path):
+    """``default_models`` in config.yaml flows into
+    ``SelectorConfig.default_models`` so per-backend defaults are
+    operator-configurable. Closes the cross-backend misconfiguration
+    bug per MS-D rev6 — a caller asking for claude_cli without a model
+    gets the operator-supplied 'sonnet' instead of the legacy
+    Ollama-shaped default.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_provider: ollama\n"
+        "default_model: qwen2.5-coder:14b\n"
+        "default_models:\n"
+        "  claude_cli: sonnet\n"
+        "  codex_cli: ''\n"  # empty → unset at selector layer
+        "  ollama: qwen2.5-coder:14b\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.config.default_models == {
+        "claude_cli": "sonnet",
+        "codex_cli": "",
+        "ollama": "qwen2.5-coder:14b",
+    }
+    # Resolution: claude_cli picks 'sonnet' from the dict;
+    # codex_cli's empty entry falls through to the empty-string
+    # sentinel (codex_cli != default_backend).
+    _, claude_model = selector.select(backend="claude_cli")
+    assert claude_model == "sonnet"
+    _, codex_model = selector.select(backend="codex_cli")
+    assert codex_model == ""
+
+
+def test_default_selector_tolerates_malformed_default_models(tmp_path):
+    """Bus boundary: ``default_models`` may arrive as a list, a string,
+    or a nested dict instead of the expected flat ``str -> str`` map.
+    The agent's coercion drops malformed entries silently rather than
+    crashing the selector — same "treat malformed as absent" pattern
+    the legacy fields use.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "default_models:\n"
+        "  - not_a_dict_key\n"  # whole field is a list
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.config.default_models == {}
+
+
 def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     """Ollama's provider-default model must NOT inherit a non-Ollama global default.
 

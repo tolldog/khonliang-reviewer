@@ -13,6 +13,22 @@ bus_url: http://localhost:8787
 default_provider: ollama
 default_model: qwen2.5-coder:14b
 
+# Per-backend default models. Preferred over the legacy single-string
+# `default_model` above: each backend ships its own sensible default so
+# a caller asking for `claude_cli` without a model gets `sonnet` rather
+# than the qwen-shaped global default. Empty-string entries mean
+# "unset at the selector layer" — selection falls through to the
+# legacy `default_model` (only if the chosen backend matches
+# `default_provider`) or finally to the empty-string sentinel that
+# tells providers to apply their own default. The legacy
+# `default_model` field above stays valid for backward compat;
+# operators with existing configs keep working without changes.
+default_models:
+  claude_cli: sonnet
+  codex_cli: ""        # codex_cli picks its own default
+  gh_copilot: ""       # gh_copilot picks its own default
+  ollama: qwen2.5-coder:14b
+
 # Provider-specific configuration. Each provider is implemented in a later
 # work unit; the keys below are placeholders documenting the eventual shape.
 providers:
