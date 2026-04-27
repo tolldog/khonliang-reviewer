@@ -658,6 +658,206 @@ async def test_review_diff_missing_both_payload_args_returns_error():
     assert "content" in result["error"]
 
 
+# ---------------------------------------------------------------------------
+# sign_off_trailer (fr_reviewer_b846a19c)
+# ---------------------------------------------------------------------------
+
+
+async def test_sign_off_trailer_result_only_path():
+    """Result-only shape: caller passes a serialized ReviewResult and
+    gets back the formatted trailer without re-running a review.
+    This is the common case — pre-push subagents that already ran
+    review_diff and just need the canonical trailer.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    # Build a result independently and serialize it like the bus
+    # boundary would.
+    result_dict = _make_result(
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        findings=[ReviewFinding(severity="nit", title="t", body="b")],
+    ).to_dict()
+
+    out = await harness.call("sign_off_trailer", {"result": result_dict})
+
+    assert out["verdict"] == "approved-with-findings"
+    # Spec-locked shape: "<histogram> filtered" suffix, where the
+    # histogram counts the surviving findings.
+    assert (
+        out["trailer_line"]
+        == "Agent-Reviewed-by: khonliang-reviewer/ollama/qwen2.5-coder:14b "
+        "approved-with-findings: 1 nit filtered"
+    )
+    # Result-only path doesn't call the provider.
+    assert fake.last_request is None
+
+
+async def test_sign_off_trailer_passthrough_path_runs_review():
+    """Pass-through shape: caller passes review_text-style args; the
+    handler runs a review internally and formats the trailer from
+    the result. Saves the round-trip when the caller wants both
+    in one call.
+    """
+    fake = _RecordingProvider(
+        "ollama",
+        _make_result(
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            findings=[],
+        ),
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {"kind": "pr_diff", "content": "diff body"},
+    )
+
+    assert out["verdict"] == "approved"
+    assert (
+        out["trailer_line"]
+        == "Agent-Reviewed-by: khonliang-reviewer/ollama/qwen2.5-coder:14b approved"
+    )
+    # Pass-through path DID call the provider.
+    assert fake.last_request is not None
+
+
+async def test_sign_off_trailer_passthrough_with_diff_alias():
+    """The pass-through path inherits review_text's content/diff
+    alias from fr_reviewer_8fb104e9, so callers can pass either
+    field name on sign_off_trailer too.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {"diff": "diff --git a/x b/x", "kind": "pr_diff"},
+    )
+
+    assert "verdict" in out
+    assert fake.last_request is not None
+    assert fake.last_request.content.startswith("diff --git")
+
+
+async def test_sign_off_trailer_passthrough_defaults_kind_to_pr_diff():
+    """Convenience: a caller that only passes a diff (no kind) gets
+    the kind defaulted to ``pr_diff``, same defaulting review_diff
+    already does for its own callers. Common case for pre-push
+    sign-off where the diff IS the work-descriptor.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {"diff": "diff --git a/x b/x"},
+    )
+
+    assert "verdict" in out
+    assert fake.last_request is not None
+    assert fake.last_request.kind == "pr_diff"
+
+
+async def test_sign_off_trailer_passthrough_forwards_review_error():
+    """When the inner review_text call fails (e.g. malformed args
+    that bypass the kind/payload check), the trailer skill returns
+    the same error envelope rather than crashing or silently
+    inventing a trailer.
+    """
+    harness = _make_harness()
+    out = await harness.call("sign_off_trailer", {"kind": "pr_diff"})  # no payload
+    assert "error" in out
+
+
+async def test_sign_off_trailer_malformed_result_returns_error():
+    """Result-only path: caller hands the skill a malformed dict;
+    the handler surfaces a structured error rather than crashing.
+    """
+    harness = _make_harness()
+    out = await harness.call(
+        "sign_off_trailer",
+        {"result": {"not_a_review_result": True}},
+    )
+    assert "error" in out
+    assert "malformed" in out["error"]
+
+
+async def test_sign_off_trailer_errored_result_returns_error_envelope():
+    """Result-only path: caller passes a ReviewResult with
+    disposition='errored'. The handler must NOT produce an
+    'approved' trailer for a review that didn't run; surface the
+    error envelope instead so the caller sees the failure.
+    """
+    harness = _make_harness()
+    errored_result = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    errored_result.disposition = "errored"
+    errored_result.error = "provider unreachable"
+    errored_result.findings = []
+
+    out = await harness.call(
+        "sign_off_trailer", {"result": errored_result.to_dict()}
+    )
+    assert "error" in out
+    assert "errored" in out["error"]
+
+
+async def test_sign_off_trailer_passthrough_errored_review_returns_error():
+    """Pass-through path: review_text returns a ReviewResult with
+    disposition='errored' (e.g. backend unreachable). build_trailer
+    raises and the handler converts to an error envelope rather
+    than committing a misleading 'approved' sign-off (built from
+    the zero findings of the failed review).
+    """
+    errored = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    errored.disposition = "errored"
+    errored.error = "backend unreachable"
+    errored.findings = []
+    fake = _RecordingProvider("ollama", errored)
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {"kind": "pr_diff", "content": "diff body"},
+    )
+    assert "error" in out
+    assert "errored" in out["error"]
+
+
+async def test_sign_off_trailer_caller_role_and_reason_override():
+    """Custom ``role`` + ``reason`` are forwarded to build_trailer.
+    Lets a future cross-vendor sign-off path (e.g. claude-cli
+    escalation) record its own role on the trailer line.
+    """
+    harness = _make_harness()
+    result_dict = _make_result(
+        backend="ollama", model="qwen2.5-coder:14b"
+    ).to_dict()
+    # Add a finding so the verdict gives us a reason segment to
+    # exercise the override.
+    result_dict["findings"] = [
+        {"severity": "concern", "title": "race", "body": "b", "category": ""}
+    ]
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {
+            "result": result_dict,
+            "role": "claude-via-codex",
+            "reason": "false positive after manual check",
+        },
+    )
+
+    assert out["verdict"] == "concerns-raised"
+    assert "claude-via-codex" in out["trailer_line"]
+    assert "false positive after manual check" in out["trailer_line"]
+    # Auto-derived 'race' anchor should NOT appear because reason
+    # was caller-supplied.
+    assert "1 concern: race" not in out["trailer_line"]
+
+
 async def test_review_text_empty_content_falls_through_to_diff():
     """Edge case: ``content=""`` (explicitly empty) falls through to
     the ``diff`` alias rather than failing immediately. Subagents
