@@ -139,10 +139,13 @@ def test_approved_with_findings_trailer_includes_count():
     r = _result(findings=[_f("nit"), _f("nit"), _f("comment")])
     out = build_trailer(r)
     assert out["verdict"] == "approved-with-findings"
-    # Auto-reason names both buckets in count order; trailer carries
-    # the full string.
+    # Auto-reason enumerates non-zero buckets in fixed severity
+    # order (comments before nits) regardless of count — the
+    # trailer reads with the higher-severity headline first.
     assert "1 comment" in out["trailer_line"]
     assert "2 nits" in out["trailer_line"]
+    # And specifically: comments bucket appears before nits bucket.
+    assert out["trailer_line"].index("comment") < out["trailer_line"].index("nit")
 
 
 def test_concerns_raised_trailer_uses_first_concern_anchor():
@@ -360,6 +363,49 @@ def test_newline_in_role_sanitized():
     out = build_trailer(r, role="role-with\nnewline")
     line = out["trailer_line"]
     assert "\n" not in line
+
+
+def test_slash_in_model_id_sanitized():
+    """Model ids in this ecosystem can carry "/" (e.g.
+    ``kimi-k2/5/cloud`` per tests/test_benchmark_sweep.py). The
+    trailer's locked ``role/backend/model`` shape needs the model
+    id to be a single segment — the path-segment sanitizer
+    rewrites "/" to "-" so the trailer keeps its three-part
+    shape and remains unambiguously parseable.
+    """
+    r = _result(model="kimi-k2/5/cloud")
+    out = build_trailer(r)
+    # Trailer still has exactly three "/" — between role+backend
+    # and backend+model. (No spurious extras from the model id.)
+    # The trailer line is "Agent-Reviewed-by: <role>/<backend>/<model>..."
+    # so we expect 2 "/" in the role/backend/model triple.
+    after_key = out["trailer_line"].split(": ", 1)[1]
+    triple = after_key.split(" ", 1)[0]
+    assert triple.count("/") == 2
+    # Model segment carries the rewritten id.
+    assert "kimi-k2-5-cloud" in triple
+
+
+def test_backslash_in_segment_sanitized():
+    """Symmetric to the "/" case — backslash is also a path
+    separator on the platforms this trailer might be parsed on,
+    so it gets the same treatment.
+    """
+    r = _result(model="weird\\model\\id")
+    out = build_trailer(r)
+    assert "\\" not in out["trailer_line"]
+    assert "weird-model-id" in out["trailer_line"]
+
+
+def test_slash_in_reason_preserved():
+    """The reason segment keeps "/" — operator-supplied reasons
+    often carry path references like "reviewer/agent.py:42" that
+    should survive intact for ``git log --oneline`` readability.
+    The path-sanitizer is path-segment-only.
+    """
+    r = _result(findings=[_f("concern", "race")])
+    out = build_trailer(r, reason="see reviewer/agent.py:42")
+    assert "reviewer/agent.py:42" in out["trailer_line"]
 
 
 def test_trailer_parses_via_git_trailer_regex():

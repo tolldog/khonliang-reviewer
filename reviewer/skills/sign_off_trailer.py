@@ -130,12 +130,23 @@ def build_trailer(
     overrides the auto-derived one for both shapes.
     """
     verdict = compute_verdict(result)
-    backend = _sanitize_segment(result.backend or "unknown-backend")
-    model = _sanitize_segment(result.model or "unknown-model")
-    role = _sanitize_segment(role)
+    # role/backend/model are joined by "/" in the trailer's locked
+    # ``role/backend/model`` shape, so a "/" inside any of them would
+    # add phantom path segments and break unambiguous parsing.
+    # Model ids in this repo can carry "/" (see
+    # tests/test_benchmark_sweep.py's "kimi-k2/5/cloud" example);
+    # _sanitize_path_segment normalizes those to "-" alongside the
+    # newline-strip every segment gets.
+    backend = _sanitize_path_segment(result.backend or "unknown-backend")
+    model = _sanitize_path_segment(result.model or "unknown-model")
+    role = _sanitize_path_segment(role)
 
     if not reason:
         reason = _auto_reason(result, verdict)
+    # ``reason`` keeps "/" — operator-supplied reasons often carry
+    # path references like "reviewer/agent.py:42" that should
+    # survive intact. Newlines / tabs are still collapsed (the
+    # injection-prevention concern).
     reason = _sanitize_segment(reason)
 
     # The trailer emits the ``: <reason>`` segment whenever a
@@ -302,6 +313,29 @@ def _sanitize_segment(value: str) -> str:
     # Collapse every whitespace run (CR, LF, tab, multiple spaces)
     # into a single space, then strip leading/trailing space.
     return " ".join(value.split())
+
+
+def _sanitize_path_segment(value: str) -> str:
+    """Sanitize a segment that's joined into the locked
+    ``role/backend/model`` path of the trailer line.
+
+    Stricter than :func:`_sanitize_segment`: in addition to the
+    newline / whitespace normalization, replaces ``/`` and ``\\``
+    with ``-`` so a model id like ``kimi-k2/5/cloud`` doesn't add
+    phantom path segments to the trailer's three-part shape.
+    Operator-supplied roles, provider-reported backend names, and
+    model ids all run through this — provider names are usually
+    plain (``ollama``, ``claude_cli``, ``gh_copilot``) but model
+    ids carry the most variability.
+    """
+    cleaned = _sanitize_segment(value)
+    if not cleaned:
+        return cleaned
+    # Translate the path-separator chars to ``-``; preserves the
+    # rest of the segment's characters (digits, dots, colons,
+    # underscores) so canonical-but-slash-bearing model ids stay
+    # readable in the trailer.
+    return cleaned.replace("/", "-").replace("\\", "-")
 
 
 def _truncate_reason(reason: str) -> str:
