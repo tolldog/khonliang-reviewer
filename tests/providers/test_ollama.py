@@ -632,6 +632,168 @@ async def test_config_num_ctx_threads_to_extra_body_when_no_caller_override():
     assert captured.get("extra_body") == {"options": {"num_ctx": 8192}}
 
 
+# ---------------------------------------------------------------------------
+# Format resolution (fr_reviewer_d8556085)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_format_caller_metadata_wins_over_config():
+    """``request.metadata['format']`` outranks ``config.format`` when both
+    set. Mirrors the num_ctx resolution order — caller intent beats
+    operator default.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_format
+
+    cfg = OllamaProviderConfig(format="some-other-format")
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x",
+        metadata={"format": "json"},
+        request_id="req-test",
+    )
+
+    assert _resolve_format(request, cfg) == "json"
+
+
+def test_resolve_format_config_default_used_when_no_caller_override():
+    """Without ``request.metadata['format']`` the operator-pinned config
+    value is returned. The reason this exists: a deployment that wants
+    every Ollama call to enforce JSON formatting can set it once in
+    ``config.yaml`` and skip threading the kwarg per-call.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_format
+
+    cfg = OllamaProviderConfig(format="json")
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x",
+        metadata={},
+        request_id="req-test",
+    )
+
+    assert _resolve_format(request, cfg) == "json"
+
+
+def test_resolve_format_falls_through_to_none_when_neither_set():
+    """No caller value, no config value → ``None`` (unconstrained).
+    Matches the pre-FR behavior so existing deployments observe no
+    behavior change after this lands.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_format
+
+    cfg = OllamaProviderConfig()
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x",
+        metadata={},
+        request_id="req-test",
+    )
+
+    assert _resolve_format(request, cfg) is None
+
+
+def test_resolve_format_ignores_invalid_caller_value():
+    """Bus boundary may deliver ``format`` as None / int / bool / list /
+    empty string. Each falls through to the next layer rather than
+    crashing the provider — same defensive convention as
+    ``_resolve_num_ctx`` and ``severity_filter``.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_format
+
+    cfg = OllamaProviderConfig(format="json")
+
+    for bad_value in (None, 1, 0, True, False, "", [], {}, 1.5):
+        request = ReviewRequest(
+            kind="pr_diff",
+            content="x",
+            metadata={"format": bad_value},
+            request_id="req-test",
+        )
+        # Falls through to config layer ("json").
+        assert _resolve_format(request, cfg) == "json", (
+            f"bad value {bad_value!r} should fall through to config"
+        )
+
+
+async def test_caller_format_threads_to_extra_body():
+    """End-to-end through the provider: a caller-supplied ``format`` in
+    request.metadata lands on the Ollama HTTP request as
+    ``extra_body['format']`` (top-level, not nested under ``options``).
+    The wire-level contract.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    provider = OllamaProvider(client=client)
+    request = _make_request(metadata={"format": "json"})
+
+    await provider.review(request)
+
+    captured = client._create.last_call
+    assert captured is not None
+    assert captured.get("extra_body") == {"format": "json"}
+
+
+async def test_config_format_threads_to_extra_body_when_no_caller_override():
+    """Operator-pinned ``OllamaProviderConfig.format`` lands on the
+    Ollama HTTP request as ``extra_body['format']`` when the caller
+    doesn't supply one.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    provider = OllamaProvider(OllamaProviderConfig(format="json"), client=client)
+    request = _make_request(metadata={"repo": "tolldog/example"})
+
+    await provider.review(request)
+
+    captured = client._create.last_call
+    assert captured is not None
+    assert captured.get("extra_body") == {"format": "json"}
+
+
+async def test_format_and_num_ctx_compose_in_extra_body():
+    """Both knobs are independent and must compose into a single
+    ``extra_body`` payload — ``options.num_ctx`` for the context
+    window AND top-level ``format`` for grammar-constrained decoding.
+    The two parameters live at different nesting levels per the native
+    Ollama API; this test guards against a refactor that conflates them.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    provider = OllamaProvider(
+        OllamaProviderConfig(num_ctx=8192, format="json"),
+        client=client,
+    )
+    request = _make_request(metadata={})
+
+    await provider.review(request)
+
+    captured = client._create.last_call
+    assert captured is not None
+    assert captured.get("extra_body") == {
+        "options": {"num_ctx": 8192},
+        "format": "json",
+    }
+
+
+async def test_review_omits_extra_body_format_when_unset():
+    """When neither caller nor config supplies ``format`` AND no
+    ``num_ctx`` override fires, ``extra_body`` is omitted entirely.
+    The pre-FR wire shape — guards against a regression where every
+    call gains an empty extra_body.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    await OllamaProvider(client=client).review(_make_request())
+
+    last = client._create.last_call
+    assert last is not None
+    assert "extra_body" not in last
+
+
 def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
     """Ceiling division must push borderline prompts over the override
     threshold rather than rounding down and silently truncating.

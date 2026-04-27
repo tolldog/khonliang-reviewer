@@ -779,6 +779,16 @@ class ReviewerAgent(BaseAgent):
                     # measurement runs that hold the axis constant).
                     # Other backends ignore this field.
                     "num_ctx": {"type": "integer", "default": 0},
+                    # format: per-call Ollama structured-output toggle.
+                    # "" / unset = no skill-arg override; provider
+                    # falls through to its config default. "json" =
+                    # enforce JSON-formatted output via Ollama's
+                    # native ``format`` parameter (grammar-constrained
+                    # decoding). Used by callers that route findings
+                    # through small models which otherwise produce
+                    # mixed output (per the 2026-04-22 evaluator-gate
+                    # experiment). Other backends ignore this field.
+                    "format": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -802,6 +812,7 @@ class ReviewerAgent(BaseAgent):
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
                     "num_ctx": {"type": "integer", "default": 0},
+                    "format": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -989,6 +1000,14 @@ class ReviewerAgent(BaseAgent):
         num_ctx_arg = args.get("num_ctx")
         if isinstance(num_ctx_arg, int) and not isinstance(num_ctx_arg, bool) and num_ctx_arg > 0:
             metadata["num_ctx"] = num_ctx_arg
+        # ``format`` is plumbed the same way for Ollama's native
+        # grammar-constrained decoding. Empty string = no skill-arg
+        # override; any non-empty string is forwarded verbatim and
+        # the provider's resolution order treats absence identically
+        # to "key not present". Ollama validates the value server-side.
+        format_arg = args.get("format")
+        if isinstance(format_arg, str) and format_arg:
+            metadata["format"] = format_arg
 
         # Repo-side prompt merge (FR fr_reviewer_92453047). Loaded here
         # rather than inside the provider so both Ollama and Claude-CLI

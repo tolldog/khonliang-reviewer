@@ -895,6 +895,43 @@ async def test_review_text_zero_num_ctx_omitted_from_metadata():
     assert "num_ctx" not in fake.last_request.metadata
 
 
+async def test_review_text_threads_format_into_request_metadata():
+    """Caller-supplied ``format`` arg lands on ``ReviewRequest.metadata``.
+
+    The provider reads ``metadata['format']`` (caller layer of the
+    resolution order) before consulting config defaults. This test
+    guards the agent-side wiring; provider-side resolution is covered
+    in :mod:`tests.providers.test_ollama`.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "format": "json"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("format") == "json"
+
+
+async def test_review_text_empty_format_omitted_from_metadata():
+    """``format=""`` is the schema default (absence sentinel); the
+    handler must NOT forward it. Otherwise a default-valued arg would
+    override config defaults in the provider.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "format": ""},
+    )
+
+    assert fake.last_request is not None
+    assert "format" not in fake.last_request.metadata
+
+
 async def test_review_text_empty_content_falls_through_to_diff():
     """Edge case: ``content=""`` (explicitly empty) falls through to
     the ``diff`` alias rather than failing immediately. Subagents
