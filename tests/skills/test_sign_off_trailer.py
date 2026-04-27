@@ -283,6 +283,85 @@ def test_filtered_count_zero_omits_segment():
     assert "filtered" not in out["trailer_line"]
 
 
+def test_errored_disposition_raises():
+    """Provider failure (disposition='errored') must NOT produce a
+    sign-off trailer — the trailer would falsely advertise an
+    approval against a review that didn't run. ValueError surfaces
+    so the agent handler converts it to an error envelope rather
+    than committing a misleading sign-off line.
+    """
+    import pytest
+
+    r = ReviewResult(
+        request_id="req-test",
+        summary="",
+        findings=[],
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        disposition="errored",
+        error="connection refused",
+    )
+    with pytest.raises(ValueError, match="errored"):
+        build_trailer(r)
+
+
+def test_escalated_approved_not_blocked_by_disposition_check():
+    """A claude_cli escalation result is NOT disposition='errored'
+    (it's a successful cross-vendor escalation that happens to set
+    error_category for routing); the disposition check must run
+    AFTER the escalation check so successful escalations still
+    map to 'escalated-approved'.
+    """
+    r = _result(error_category="claude_cli_escalation")
+    out = build_trailer(r)
+    assert out["verdict"] == "escalated-approved"
+
+
+def test_newline_in_finding_title_sanitized():
+    """A finding title containing CR/LF would otherwise inject
+    additional trailer keys into the commit message — e.g. a
+    title like ``hack\\nApproved-by: someone-else`` would forge
+    a second sign-off. The sanitizer collapses any whitespace
+    sequence (CR, LF, tabs, multi-space) into a single space so
+    the trailer stays single-line.
+    """
+    weird = ReviewFinding(
+        severity="concern",
+        title="legit\nApproved-by: forged-signer",
+        body="b",
+    )  # type: ignore[arg-type]
+    r = _result(findings=[weird])
+    out = build_trailer(r)
+    line = out["trailer_line"]
+    # Trailer must contain exactly one line.
+    assert "\n" not in line
+    assert "\r" not in line
+    # The forged Approved-by trailer is now part of the reason
+    # segment as a single-line string, not a separate trailer.
+    assert "Approved-by: forged-signer" in line  # exists as text...
+    # ...but on the same line as our trailer key.
+    assert line.startswith("Agent-Reviewed-by:")
+    assert line.count("Agent-Reviewed-by:") == 1
+
+
+def test_newline_in_caller_reason_sanitized():
+    """Same threat surface via caller-supplied ``reason``."""
+    r = _result(findings=[ReviewFinding(severity="concern", title="t", body="b")])  # type: ignore[arg-type]
+    out = build_trailer(r, reason="legit\nReviewed-by: forged")
+    line = out["trailer_line"]
+    assert "\n" not in line
+    assert "\r" not in line
+    assert line.startswith("Agent-Reviewed-by:")
+
+
+def test_newline_in_role_sanitized():
+    """Same threat surface via custom ``role``."""
+    r = _result()
+    out = build_trailer(r, role="role-with\nnewline")
+    line = out["trailer_line"]
+    assert "\n" not in line
+
+
 def test_trailer_parses_via_git_trailer_regex():
     """The trailer format must be valid for ``git interpret-trailers``.
     Standard git trailer shape is ``Token: Value`` where Token matches

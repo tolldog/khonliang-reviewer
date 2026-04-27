@@ -783,6 +783,47 @@ async def test_sign_off_trailer_malformed_result_returns_error():
     assert "malformed" in out["error"]
 
 
+async def test_sign_off_trailer_errored_result_returns_error_envelope():
+    """Result-only path: caller passes a ReviewResult with
+    disposition='errored'. The handler must NOT produce an
+    'approved' trailer for a review that didn't run; surface the
+    error envelope instead so the caller sees the failure.
+    """
+    harness = _make_harness()
+    errored_result = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    errored_result.disposition = "errored"
+    errored_result.error = "provider unreachable"
+    errored_result.findings = []
+
+    out = await harness.call(
+        "sign_off_trailer", {"result": errored_result.to_dict()}
+    )
+    assert "error" in out
+    assert "errored" in out["error"]
+
+
+async def test_sign_off_trailer_passthrough_errored_review_returns_error():
+    """Pass-through path: review_text returns a ReviewResult with
+    disposition='errored' (e.g. backend unreachable). build_trailer
+    raises and the handler converts to an error envelope rather
+    than committing a misleading 'approved' sign-off (built from
+    the zero findings of the failed review).
+    """
+    errored = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    errored.disposition = "errored"
+    errored.error = "backend unreachable"
+    errored.findings = []
+    fake = _RecordingProvider("ollama", errored)
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "sign_off_trailer",
+        {"kind": "pr_diff", "content": "diff body"},
+    )
+    assert "error" in out
+    assert "errored" in out["error"]
+
+
 async def test_sign_off_trailer_caller_role_and_reason_override():
     """Custom ``role`` + ``reason`` are forwarded to build_trailer.
     Lets a future cross-vendor sign-off path (e.g. claude-cli

@@ -20,9 +20,29 @@ Where:
 - ``verdict`` is computed from finding severity counts and the
   result's error_category — see :func:`compute_verdict`.
 - ``reason`` is required for ``approved-with-findings`` and
-  ``concerns-raised``; omitted for ``approved`` and
-  ``escalated-approved``. Capped at ~80 chars so ``git log
-  --oneline`` stays readable.
+  ``concerns-raised``. For ``approved`` and ``escalated-approved``
+  the reason is normally omitted, but the trailer DOES surface a
+  filtered-count reason (``approved: 4 filtered``) when
+  ``ReviewResult.usage.findings_filtered_count`` is > 0, so a
+  pre-floor payload doesn't ship an unmarked ``approved``
+  trailer. Reason capped at ~80 chars so ``git log --oneline``
+  stays readable.
+
+Errored review results (``disposition == "errored"``) raise
+:class:`ValueError` from :func:`compute_verdict` /
+:func:`build_trailer` rather than producing a trailer — committing
+an ``Agent-Reviewed-by`` line for a review that didn't actually
+run is misleading sign-off provenance. Agent handlers catch the
+exception and surface ``{error: ...}`` to the caller. The
+``claude_cli_escalation`` case is NOT an errored disposition (it's
+a successful cross-vendor escalation result that happens to set
+``error_category`` for routing purposes); it still maps to
+``escalated-approved`` per spec.
+
+All trailer segments (role, backend, model, reason) are sanitized
+against newline characters before interpolation so a malicious or
+malformed provider output can't inject additional trailer lines
+into the commit message.
 
 Parses cleanly under ``git interpret-trailers`` (the trailer key
 ``Agent-Reviewed-by`` is a custom key, intentionally distinct from
@@ -66,9 +86,22 @@ def compute_verdict(result: ReviewResult) -> Verdict:
     Findings with non-string or unrecognized severity are treated as
     concerns (kept loud) so a malformed-severity row never silently
     downgrades the verdict.
+
+    Raises :class:`ValueError` when the result's disposition is
+    ``"errored"`` — committing a sign-off trailer for a review
+    that didn't actually run would be misleading provenance. The
+    ``claude_cli_escalation`` case is checked first so a
+    successful escalation result (which sets ``error_category``
+    for routing but is NOT disposition=errored) still maps to
+    ``escalated-approved``.
     """
     if result.error_category == "claude_cli_escalation":
         return "escalated-approved"
+    if result.disposition == "errored":
+        message = result.error or "(no error message)"
+        raise ValueError(
+            f"cannot format sign-off trailer for errored review: {message}"
+        )
 
     counts = _severity_counts(result)
     if counts["concern"] > 0 or counts["unknown"] > 0:
@@ -97,11 +130,13 @@ def build_trailer(
     overrides the auto-derived one for both shapes.
     """
     verdict = compute_verdict(result)
-    backend = result.backend or "unknown-backend"
-    model = result.model or "unknown-model"
+    backend = _sanitize_segment(result.backend or "unknown-backend")
+    model = _sanitize_segment(result.model or "unknown-model")
+    role = _sanitize_segment(role)
 
     if not reason:
         reason = _auto_reason(result, verdict)
+    reason = _sanitize_segment(reason)
 
     # The trailer emits the ``: <reason>`` segment whenever a
     # non-empty reason exists, regardless of verdict. The spec
@@ -246,6 +281,28 @@ def _append_filtered(base: str, filtered_count: int) -> str:
     if not base:
         return suffix
     return f"{base} + {suffix}"
+
+
+def _sanitize_segment(value: str) -> str:
+    """Collapse whitespace + strip newlines from a trailer segment.
+
+    The trailer format is single-line. A malicious or malformed
+    provider output that injects ``\\n`` / ``\\r`` into a finding
+    title (which feeds the auto-reason anchor) or a backend / model
+    string could otherwise forge additional trailer keys in the
+    commit message — e.g. an attacker-supplied finding titled
+    ``hack\\nApproved-by: someone-else`` would produce a trailer
+    block claiming a second sign-off. Replace any whitespace
+    sequence (including CR/LF and tabs) with a single space and
+    strip the result.
+
+    Idempotent: re-sanitizing already-clean input is a no-op.
+    """
+    if not value:
+        return value
+    # Collapse every whitespace run (CR, LF, tab, multiple spaces)
+    # into a single space, then strip leading/trailing space.
+    return " ".join(value.split())
 
 
 def _truncate_reason(reason: str) -> str:

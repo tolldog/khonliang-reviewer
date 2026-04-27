@@ -1277,7 +1277,14 @@ class ReviewerAgent(BaseAgent):
                 result = ReviewResult.from_dict(result_dict)
             except (TypeError, ValueError, KeyError) as exc:
                 return {"error": f"sign_off_trailer: malformed result: {exc}"}
-            return build_trailer(result, role=role, reason=reason)
+            try:
+                return build_trailer(result, role=role, reason=reason)
+            except ValueError as exc:
+                # build_trailer raises on errored ReviewResults so the
+                # caller doesn't ship a sign-off for a review that
+                # didn't actually run. Surface the standard error
+                # envelope.
+                return {"error": f"sign_off_trailer: {exc}"}
 
         # Pass-through path: run review_text first, then format.
         # Strip the trailer-only fields so the review-call arg
@@ -1306,7 +1313,15 @@ class ReviewerAgent(BaseAgent):
             result = ReviewResult.from_dict(review_outcome)
         except (TypeError, ValueError, KeyError) as exc:
             return {"error": f"sign_off_trailer: malformed review result: {exc}"}
-        return build_trailer(result, role=role, reason=reason)
+        try:
+            return build_trailer(result, role=role, reason=reason)
+        except ValueError as exc:
+            # The review ran but disposition is "errored" (e.g.
+            # backend unreachable). Don't ship a trailer for a
+            # failed review — surface the error envelope so the
+            # caller sees the failure rather than a misleading
+            # ``approved`` sign-off built from zero findings.
+            return {"error": f"sign_off_trailer: {exc}"}
 
     @handler("usage_summary")
     async def handle_usage_summary(self, args: dict[str, Any]) -> dict[str, Any]:
