@@ -2838,6 +2838,10 @@ class _ScriptedProvider(ReviewProvider):
     """
 
     def __init__(self, name: str, responses: list[ReviewResult]):
+        if not responses:
+            raise ValueError(
+                "_ScriptedProvider requires at least one scripted response"
+            )
         self.name = name
         self._responses = list(responses)
         self.requests: list[ReviewRequest] = []
@@ -3062,9 +3066,13 @@ async def test_consensus_invalid_runs_falls_back_to_default():
 
 
 async def test_consensus_first_error_propagates_without_consolidation():
-    """If any run errors, return that errored result verbatim and skip
-    consolidation. Partial-consensus over a degraded set is a future
-    refinement; the first cut keeps semantics simple.
+    """If any run errors, surface the first error verbatim and skip
+    finding-consolidation — partial-consensus over a degraded set is
+    a future refinement.
+
+    Per Copilot R1 PR#37: usage is MERGED across all runs even on the
+    error path, so cost-accounting captures the real spend (runs that
+    completed before the error already burned tokens).
     """
     errored = ReviewResult(
         request_id="run-2",
@@ -3075,14 +3083,21 @@ async def test_consensus_first_error_propagates_without_consolidation():
         error_category="backend_error",
         backend="ollama",
         model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=1.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=50,  # the failing call still spent tokens before erroring
+            output_tokens=0,
+        ),
     )
     f = _consensus_finding()
     fake = _ScriptedProvider(
         "ollama",
         [
-            _consensus_result([f]),  # run 1: ok
-            errored,                  # run 2: error
-            _consensus_result([f]),  # run 3: ok (would consensus)
+            _consensus_result([f], input_tokens=100, output_tokens=50),  # run 1: ok
+            errored,                                                      # run 2: error
+            _consensus_result([f], input_tokens=120, output_tokens=70),  # run 3: ok
         ],
     )
     harness = _make_harness({"ollama": fake})
@@ -3095,6 +3110,63 @@ async def test_consensus_first_error_propagates_without_consolidation():
     assert out["error"] == "provider blew up"
     assert out["disposition"] == "errored"
     assert out["findings"] == []
+    # Usage merged across all runs (100+50+120=270 input, 50+0+70=120 output)
+    # so the consuming UsageStore captures real spend even on error.
+    assert out["usage"]["input_tokens"] == 270
+    assert out["usage"]["output_tokens"] == 120
+
+
+async def test_consensus_min_greater_than_runs_runs_1_returns_error():
+    """``consensus_runs=1, consensus_min=2`` must fail validation just
+    like ``runs=2, min=3`` — the cross-check is unconditional and
+    fires before the single-call fast path. Per Copilot R1 PR#37:
+    previously this payload silently took the single-call branch and
+    skipped validation.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 1, "consensus_min": 2},
+    )
+
+    assert "error" in out
+    assert "consensus_min=2" in out["error"]
+    assert "consensus_runs=1" in out["error"]
+    # Validation fires before any provider call.
+    assert fake.requests == []
+
+
+async def test_consensus_runs_above_max_returns_error():
+    """``consensus_runs`` above the hard cap (16) refuses to spawn the
+    flood — typo / abuse guard. Per Copilot R1 PR#37.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 1000, "consensus_min": 1},
+    )
+
+    assert "error" in out
+    assert "consensus_runs=1000" in out["error"]
+    assert "max" in out["error"].lower()
+    # Validation fires before any provider call (zero burst at the backend).
+    assert fake.requests == []
+
+
+def test_scripted_provider_rejects_empty_responses():
+    """Test-helper hardening per Copilot R1 PR#37: constructing
+    ``_ScriptedProvider`` with no scripted responses must fail at
+    construction time with a clear error rather than at first
+    ``review()`` call with a confusing IndexError.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="at least one scripted response"):
+        _ScriptedProvider("ollama", [])
 
 
 async def test_consensus_aggregates_usage_tokens_sum_duration_max():

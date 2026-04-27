@@ -219,15 +219,38 @@ def _coerce_consensus_int(value: Any, *, default: int) -> int:
     return default
 
 
+#: Hard cap on ``consensus_runs`` to keep a typo from spawning a
+#: cluster of concurrent provider calls. 16 is generous — best-of-N
+#: literature typically uses 3-7; the cb081fa8 FR's token-budget
+#: calculation assumes N ≤ 5. Above 16 is almost certainly a mistake
+#: or an abuse vector and the agent fails fast rather than overloading
+#: the local Ollama (or burning subscription quota on Claude-CLI).
+_CONSENSUS_RUNS_MAX = 16
+
+
 def _validate_consensus(runs: int, min_count: int) -> None:
     """Cross-validate the consensus pair after coercion.
 
     ``runs >= 1`` and ``min_count >= 1`` are guaranteed by
-    :func:`_coerce_consensus_int`. The cross-check ``min_count <= runs``
-    catches caller bugs like ``consensus_runs=2, consensus_min=3``
-    where no finding could ever survive — fail fast with a clear
-    message rather than silently dropping every finding.
+    :func:`_coerce_consensus_int`. This function performs the
+    cross-checks that don't fit in the per-field coercion:
+
+    - ``runs <= _CONSENSUS_RUNS_MAX`` — typo / abuse guard against
+      spawning a flood of concurrent calls.
+    - ``min_count <= runs`` — catches caller bugs like
+      ``consensus_runs=2, consensus_min=3`` where no finding could
+      ever survive (and the trickier
+      ``consensus_runs=1, consensus_min=2`` which would otherwise
+      silently take the single-call fast path).
+
+    Raises :class:`ConsensusError` with a message naming the
+    offending pair so callers can act on the validation failure.
     """
+    if runs > _CONSENSUS_RUNS_MAX:
+        raise ConsensusError(
+            f"consensus_runs={runs} exceeds max {_CONSENSUS_RUNS_MAX}; "
+            f"refusing to spawn more concurrent provider calls"
+        )
     if min_count > runs:
         raise ConsensusError(
             f"consensus_min={min_count} cannot exceed "
@@ -1246,11 +1269,16 @@ class ReviewerAgent(BaseAgent):
         consensus_min = _coerce_consensus_int(
             args.get("consensus_min"), default=1
         )
+        # Cross-validation runs unconditionally (after coercion) so a
+        # caller passing ``consensus_runs=1, consensus_min=2`` fails
+        # fast rather than silently taking the single-call fast path —
+        # ``min > runs`` is unsatisfiable regardless of which branch
+        # would have executed. (Copilot R1 PR#37.)
+        try:
+            _validate_consensus(consensus_runs, consensus_min)
+        except ConsensusError as exc:
+            return {"error": str(exc)}
         if consensus_runs > 1:
-            try:
-                _validate_consensus(consensus_runs, consensus_min)
-            except ConsensusError as exc:
-                return {"error": str(exc)}
             result = await self._run_consensus(
                 provider, request, consensus_runs, consensus_min
             )
@@ -1296,12 +1324,31 @@ class ReviewerAgent(BaseAgent):
         results = await asyncio.gather(
             *(provider.review(r) for r in per_run_requests)
         )
-        for r in results:
-            if r.error:
-                # Propagate as-is — the request_id will carry the per-run
-                # suffix, which is acceptable for the error case (the
-                # caller can correlate with the per-run usage record).
-                return r
+        first_errored = next((r for r in results if r.error), None)
+        if first_errored is not None:
+            # Surface the first error verbatim, but merge usage across
+            # ALL runs so the cost-accounting reflects the real spend
+            # — runs that completed successfully before the error
+            # already burned tokens. (Copilot R1 PR#37: previously
+            # we returned the errored result alone and dropped the
+            # other runs' usage events.)
+            usage_events = [r.usage for r in results if r.usage is not None]
+            merged_usage = (
+                _merge_usage_events(usage_events, request.request_id)
+                if usage_events
+                else None
+            )
+            return ReviewResult(
+                request_id=request.request_id,
+                summary=first_errored.summary,
+                findings=[],
+                disposition=first_errored.disposition,
+                error=first_errored.error,
+                error_category=first_errored.error_category,
+                usage=merged_usage,
+                backend=first_errored.backend,
+                model=first_errored.model,
+            )
         return _consolidate_consensus_results(
             results,
             min_count=min_count,
