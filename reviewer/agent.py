@@ -771,6 +771,14 @@ class ReviewerAgent(BaseAgent):
                     # override (fall through to config then default
                     # "nit"). Valid values: "nit"|"comment"|"concern".
                     "severity_floor": {"type": "string", "default": ""},
+                    # num_ctx: per-call Ollama context-window override.
+                    # 0 / unset = no skill-arg override; provider falls
+                    # through to its config default and then the
+                    # auto-bump heuristic. Positive int pins the
+                    # provider's num_ctx for this call (useful for
+                    # measurement runs that hold the axis constant).
+                    # Other backends ignore this field.
+                    "num_ctx": {"type": "integer", "default": 0},
                 },
                 since="0.1.0",
             ),
@@ -793,6 +801,7 @@ class ReviewerAgent(BaseAgent):
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
+                    "num_ctx": {"type": "integer", "default": 0},
                 },
                 since="0.1.0",
             ),
@@ -971,6 +980,15 @@ class ReviewerAgent(BaseAgent):
             **_strip_reserved_metadata(_as_dict(args.get("metadata"))),
             "model": chosen_model,
         }
+        # ``num_ctx`` is plumbed through metadata so providers that
+        # care about it (Ollama) can read it without changing the
+        # ReviewRequest dataclass shape. Other backends ignore it.
+        # 0 / unset = no skill-arg override; only forward positive
+        # ints so the provider's resolution order treats the absent
+        # case identically to "key not present".
+        num_ctx_arg = args.get("num_ctx")
+        if isinstance(num_ctx_arg, int) and not isinstance(num_ctx_arg, bool) and num_ctx_arg > 0:
+            metadata["num_ctx"] = num_ctx_arg
 
         # Repo-side prompt merge (FR fr_reviewer_92453047). Loaded here
         # rather than inside the provider so both Ollama and Claude-CLI
