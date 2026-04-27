@@ -158,13 +158,14 @@ def build_trailer(
     reason = _sanitize_segment(reason)
 
     # The trailer emits the ``: <reason>`` segment whenever a
-    # non-empty reason exists, regardless of verdict. The spec
-    # describes the reason as REQUIRED for approved-with-findings /
-    # concerns-raised but only OPTIONAL for approved /
-    # escalated-approved — the auto-reason logic returns empty for
-    # the latter cases unless ``findings_filtered_count`` is > 0,
-    # in which case the trailer still surfaces the filtered-count
-    # so subagents see that severity_filter shaped the payload.
+    # non-empty reason exists, regardless of verdict. Per the spec,
+    # ``approved`` and ``escalated-approved`` get an empty
+    # auto-reason (clean two-segment trailer), while
+    # ``approved-with-findings`` and ``concerns-raised`` get a
+    # populated auto-reason from the surviving-finding histogram.
+    # Caller-supplied ``reason`` is honored on every verdict — a
+    # caller can attach prose to a clean approval if they want, the
+    # auto-reason logic just doesn't generate one.
     if reason:
         reason = _truncate_reason(reason)
         trailer_line = (
