@@ -32,11 +32,14 @@ import uuid
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
+from dataclasses import replace as dataclass_replace
+
 from khonliang_reviewer import (
     SEVERITY_ORDER,
     ReviewFinding,
     ReviewRequest,
     ReviewResult,
+    UsageEvent,
     severity_rank,
 )
 
@@ -185,6 +188,220 @@ def _validate_severity_floor(value: str, *, source: str) -> str:
             f"expected one of {list(SEVERITY_ORDER)}"
         )
     return value
+
+
+class ConsensusError(ValueError):
+    """Raised when caller-supplied ``consensus_runs`` / ``consensus_min``
+    fail validation.
+
+    Subclass of :class:`ValueError` so existing ``except ValueError``
+    blocks catch it, but distinct enough that callers wanting to branch
+    on "validation error vs. other ValueError" can key on the class.
+    """
+
+
+def _coerce_consensus_int(value: Any, *, default: int) -> int:
+    """Return a positive int if ``value`` is one, else ``default``.
+
+    The bus boundary delivers ints as JSON; the schema default is ``1``
+    (effectively absent — single-pass review). Treat any non-int /
+    non-positive payload as absent rather than crashing the handler;
+    explicit out-of-range values still get rejected by
+    :func:`_validate_consensus` so callers don't silently land in a
+    weird state. Accepts ``int`` only (rejects ``bool`` because
+    ``bool`` is an ``int`` subclass and ``consensus_runs=True`` would
+    otherwise quietly become 1).
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int) and value > 0:
+        return value
+    return default
+
+
+#: Hard cap on ``consensus_runs`` to keep a typo from spawning a
+#: cluster of concurrent provider calls. 16 is generous — best-of-N
+#: literature typically uses 3-7; the cb081fa8 FR's token-budget
+#: calculation assumes N ≤ 5. Above 16 is almost certainly a mistake
+#: or an abuse vector and the agent fails fast rather than overloading
+#: the local Ollama (or burning subscription quota on Claude-CLI).
+_CONSENSUS_RUNS_MAX = 16
+
+
+def _validate_consensus(runs: int, min_count: int) -> None:
+    """Cross-validate the consensus pair after coercion.
+
+    ``runs >= 1`` and ``min_count >= 1`` are guaranteed by
+    :func:`_coerce_consensus_int`. This function performs the
+    cross-checks that don't fit in the per-field coercion:
+
+    - ``runs <= _CONSENSUS_RUNS_MAX`` — typo / abuse guard against
+      spawning a flood of concurrent calls.
+    - ``min_count <= runs`` — catches caller bugs like
+      ``consensus_runs=2, consensus_min=3`` where no finding could
+      ever survive (and the trickier
+      ``consensus_runs=1, consensus_min=2`` which would otherwise
+      silently take the single-call fast path).
+
+    Raises :class:`ConsensusError` with a message naming the
+    offending pair so callers can act on the validation failure.
+    """
+    if runs > _CONSENSUS_RUNS_MAX:
+        raise ConsensusError(
+            f"consensus_runs={runs} exceeds max {_CONSENSUS_RUNS_MAX}; "
+            f"refusing to spawn more concurrent provider calls"
+        )
+    if min_count > runs:
+        raise ConsensusError(
+            f"consensus_min={min_count} cannot exceed "
+            f"consensus_runs={runs}; no finding could survive"
+        )
+
+
+def _consensus_finding_key(
+    finding: ReviewFinding,
+) -> tuple[str, str, int, str]:
+    """Anchor key used to detect "same finding" across consensus runs.
+
+    Inline findings (path **and** line both set) anchor on
+    ``(severity, path, line, normalized_title)`` — the line gives the
+    strongest signal that two findings refer to the same code site.
+    Summary-level findings (path / line absent) anchor on
+    ``(severity, "", 0, normalized_title)`` so the title carries the
+    overlap detection alone.
+
+    Findings with ``path`` set but ``line=None`` (or vice versa) are
+    treated as summary-level — same as the both-absent case — so they
+    consolidate with other summary-level findings sharing the same
+    title rather than producing a third "weird" key shape that
+    nothing else groups with. (Copilot R4 PR#37: the prior code
+    used ``finding.path or ""`` and ``finding.line or 0`` independently,
+    which silently created a partial-anchor key for the path-only /
+    line-only case and contradicted the docstring.)
+
+    Title normalization (lowercase + whitespace collapse) tolerates
+    minor wording drift across runs without softening the
+    "10×-outlier survives unchanged" property — a unique outlier
+    still has a unique normalized title and is never grouped with an
+    unrelated finding.
+    """
+    title_norm = " ".join(finding.title.lower().split())
+    if finding.path and finding.line is not None:
+        return (finding.severity, finding.path, finding.line, title_norm)
+    return (finding.severity, "", 0, title_norm)
+
+
+def _consolidate_consensus_results(
+    results: list[ReviewResult],
+    *,
+    min_count: int,
+    base_request_id: str,
+) -> ReviewResult:
+    """Merge N successful results into one via finding-overlap consolidation.
+
+    Findings are grouped by :func:`_consensus_finding_key`; groups
+    smaller than ``min_count`` are dropped. Surviving groups
+    contribute their first-occurring finding verbatim — no body
+    merging, no severity averaging. Picking the first occurrence (in
+    run order) is deterministic and preserves the canonical bytes the
+    model produced rather than synthesizing prose that no model wrote.
+
+    Usage records are summed (tokens, cost) except for ``duration_ms``
+    which takes the max (the runs are concurrent so wall-clock is the
+    longest, not the sum). The returned result reports the base
+    ``request_id`` and the first run's ``backend`` / ``model`` /
+    ``disposition`` — they're identical across runs in the typical
+    case (same provider, same model, same outcome).
+    """
+    groups: dict[tuple[str, str, int, str], list[ReviewFinding]] = {}
+    insertion_order: list[tuple[str, str, int, str]] = []
+    for result in results:
+        for finding in result.findings:
+            key = _consensus_finding_key(finding)
+            if key not in groups:
+                groups[key] = []
+                insertion_order.append(key)
+            groups[key].append(finding)
+
+    surviving = [
+        groups[key][0]
+        for key in insertion_order
+        if len(groups[key]) >= min_count
+    ]
+
+    base = results[0]
+    summary = next((r.summary for r in results if r.summary), "")
+    usage_events = [r.usage for r in results if r.usage is not None]
+    usage = _merge_usage_events(usage_events, base_request_id) if usage_events else None
+
+    return ReviewResult(
+        request_id=base_request_id,
+        summary=summary,
+        findings=surviving,
+        disposition=base.disposition,
+        error="",
+        error_category="",
+        usage=usage,
+        backend=base.backend,
+        model=base.model,
+    )
+
+
+def _merge_usage_events(
+    events: list[UsageEvent],
+    base_request_id: str,
+) -> UsageEvent:
+    """Merge the available usage events for a consensus request.
+
+    Caller guarantees ``events`` is non-empty, but the originating
+    review runs need not all have succeeded or emitted usage. Two
+    call sites exercise this helper:
+
+    1. Success path (:func:`_consolidate_consensus_results`) — every
+       run completed successfully and contributes a usage event.
+    2. Error path (:meth:`ReviewerAgent._run_consensus`) — the
+       first errored run is surfaced, but usage from runs that
+       completed before the error is still merged so cost-accounting
+       captures real spend. The error-path caller subsequently
+       overrides ``disposition`` / ``error`` / ``error_category``
+       from the failing run on the returned ``UsageEvent`` because
+       this helper inherits those fields from the first event
+       (typically a successful run).
+
+    Token / cost fields sum across the provided usage events (true
+    compute spend for the usage we observed); ``duration_ms`` is the
+    max of the per-run durations (concurrent wall-clock, not serial).
+    Identity fields (``backend``, ``model``, ``repo``, ``pr_number``,
+    ``timestamp``, ``disposition``) take the first event's value —
+    they're invariant across runs in the typical case, and the
+    first-event pick keeps the trace anchored at the earliest start
+    time.
+
+    ``request_id`` is rewritten to ``base_request_id`` (sans the
+    ``-rN`` per-run suffix) so the usage record is searchable under
+    the same id the caller asked for.
+    """
+    base = events[0]
+    return UsageEvent(
+        timestamp=base.timestamp,
+        backend=base.backend,
+        model=base.model,
+        input_tokens=sum(e.input_tokens for e in events),
+        output_tokens=sum(e.output_tokens for e in events),
+        cache_read_tokens=sum(e.cache_read_tokens for e in events),
+        cache_creation_tokens=sum(e.cache_creation_tokens for e in events),
+        duration_ms=max(e.duration_ms for e in events),
+        disposition=base.disposition,
+        request_id=base_request_id,
+        repo=base.repo,
+        pr_number=base.pr_number,
+        estimated_api_cost_usd=sum(e.estimated_api_cost_usd for e in events),
+        error="",
+        error_category="",
+        # Reset to 0 — the severity_floor pass that runs after
+        # consensus will bump this on the merged result.
+        findings_filtered_count=0,
+    )
 
 
 def _load_repo_prompts_from_context(
@@ -789,6 +1006,20 @@ class ReviewerAgent(BaseAgent):
                     # mixed output (per the 2026-04-22 evaluator-gate
                     # experiment). Other backends ignore this field.
                     "format": {"type": "string", "default": ""},
+                    # consensus_runs: number of parallel provider
+                    # invocations whose findings get consolidated by
+                    # overlap. 1 (default) = no consensus; single
+                    # provider call. >1 = run N times concurrently and
+                    # keep findings appearing in >= consensus_min runs.
+                    "consensus_runs": {"type": "integer", "default": 1},
+                    # consensus_min: minimum run count a finding must
+                    # appear in (under the same anchor key) to survive
+                    # consolidation. Must be in [1, consensus_runs].
+                    # 1 (default) = keep all findings (no real
+                    # filtering), useful for warming up the consensus
+                    # path; a strict majority is
+                    # consensus_min = floor(runs/2)+1 — operators decide.
+                    "consensus_min": {"type": "integer", "default": 1},
                 },
                 since="0.1.0",
             ),
@@ -813,6 +1044,8 @@ class ReviewerAgent(BaseAgent):
                     "severity_floor": {"type": "string", "default": ""},
                     "num_ctx": {"type": "integer", "default": 0},
                     "format": {"type": "string", "default": ""},
+                    "consensus_runs": {"type": "integer", "default": 1},
+                    "consensus_min": {"type": "integer", "default": 1},
                 },
                 since="0.1.0",
             ),
@@ -1043,7 +1276,33 @@ class ReviewerAgent(BaseAgent):
             request_id=str(args.get("request_id") or _generate_request_id()),
         )
 
-        result = await provider.review(request)
+        # Consensus path (fr_reviewer_cb081fa8 first cut). When
+        # ``consensus_runs > 1`` the same request goes through the
+        # provider N times in parallel and the surviving findings are
+        # those that appeared (under the same anchor key) in at least
+        # ``consensus_min`` runs. Single-run (the default) skips the
+        # whole orchestration and follows the pre-FR fast path.
+        consensus_runs = _coerce_consensus_int(
+            args.get("consensus_runs"), default=1
+        )
+        consensus_min = _coerce_consensus_int(
+            args.get("consensus_min"), default=1
+        )
+        # Cross-validation runs unconditionally (after coercion) so a
+        # caller passing ``consensus_runs=1, consensus_min=2`` fails
+        # fast rather than silently taking the single-call fast path —
+        # ``min > runs`` is unsatisfiable regardless of which branch
+        # would have executed. (Copilot R1 PR#37.)
+        try:
+            _validate_consensus(consensus_runs, consensus_min)
+        except ConsensusError as exc:
+            return {"error": str(exc)}
+        if consensus_runs > 1:
+            result = await self._run_consensus(
+                provider, request, consensus_runs, consensus_min
+            )
+        else:
+            result = await provider.review(request)
         # Apply the severity_floor post-filter at the edge of the return
         # path, AFTER the provider returns but BEFORE usage recording.
         # The usage event gets the filtered count so downstream
@@ -1052,6 +1311,99 @@ class ReviewerAgent(BaseAgent):
         self._apply_severity_floor(result, effective_floor)
         await self._record_usage(result)
         return result.to_dict()
+
+    async def _run_consensus(
+        self,
+        provider: Any,
+        request: ReviewRequest,
+        runs: int,
+        min_count: int,
+    ) -> ReviewResult:
+        """Run ``provider.review`` ``runs`` times in parallel, consolidate
+        findings by overlap.
+
+        First-cut behavior (the simple correct version):
+
+        - Per-run requests carry a ``-r{i+1}`` suffix on
+          ``request_id`` for the provider calls; the returned result
+          always uses the base request id (per-run suffixes are
+          internal plumbing only — see the merged-usage call below
+          which rewrites ``request_id`` back to the base).
+        - If ANY run errors, skip consolidation and return a new
+          ``ReviewResult`` carrying the errored run's summary,
+          disposition, error metadata, backend, and model, with
+          ``findings=[]`` and usage merged across all completed runs
+          (with disposition / error fields overridden from the
+          failing run so failure analytics stay accurate). This is
+          intentionally simple — partial-consensus over a degraded
+          set is a future refinement.
+        - Surviving findings preserve the canonical body from the
+          first run that produced them. No body merging — averaging
+          text would smooth features (see
+          ``project_reviewer_distill_principle``).
+        - Usage is recorded as a single merged event on the base
+          ``request_id``; token counts sum across runs (true compute
+          spend) and ``duration_ms`` is the max (concurrent
+          wall-clock).
+        """
+        per_run_requests = [
+            dataclass_replace(request, request_id=f"{request.request_id}-r{i + 1}")
+            for i in range(runs)
+        ]
+        results = await asyncio.gather(
+            *(provider.review(r) for r in per_run_requests)
+        )
+        first_errored = next((r for r in results if r.error), None)
+        if first_errored is not None:
+            # Surface the first error verbatim, but merge usage across
+            # ALL runs so the cost-accounting reflects the real spend
+            # — runs that completed successfully before the error
+            # already burned tokens. (Copilot R1 PR#37: previously
+            # we returned the errored result alone and dropped the
+            # other runs' usage events.)
+            #
+            # Then override the merged usage's disposition / error
+            # fields from the errored run so the persisted usage row
+            # reflects the FAILURE outcome — without this override
+            # the merged usage would silently inherit the first
+            # successful run's disposition ("posted", empty error)
+            # even though the returned ReviewResult is errored, and
+            # failure-rate analytics would undercount.
+            # (Copilot R2 PR#37.)
+            usage_events = [r.usage for r in results if r.usage is not None]
+            merged_usage = (
+                _merge_usage_events(usage_events, request.request_id)
+                if usage_events
+                else None
+            )
+            if merged_usage is not None and first_errored.usage is not None:
+                merged_usage.disposition = first_errored.usage.disposition
+                merged_usage.error = first_errored.usage.error
+                merged_usage.error_category = first_errored.usage.error_category
+            elif merged_usage is not None:
+                # Errored run had no usage event (some providers
+                # return None on hard transport failure). Fall back
+                # to the result-level error fields so the usage row
+                # still reflects failure.
+                merged_usage.disposition = first_errored.disposition
+                merged_usage.error = first_errored.error
+                merged_usage.error_category = first_errored.error_category
+            return ReviewResult(
+                request_id=request.request_id,
+                summary=first_errored.summary,
+                findings=[],
+                disposition=first_errored.disposition,
+                error=first_errored.error,
+                error_category=first_errored.error_category,
+                usage=merged_usage,
+                backend=first_errored.backend,
+                model=first_errored.model,
+            )
+        return _consolidate_consensus_results(
+            results,
+            min_count=min_count,
+            base_request_id=request.request_id,
+        )
 
     def _resolve_severity_floor(
         self, args: dict[str, Any], cfg: RepoConfig | None

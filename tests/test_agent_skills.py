@@ -2819,3 +2819,592 @@ async def test_list_models_handler_error_path_is_structured(monkeypatch):
     assert "error" in result
     assert "registry boom" in result["error"]
     assert result["providers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Consensus runs + min consolidation (fr_reviewer_cb081fa8 first cut)
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedProvider(ReviewProvider):
+    """Provider that yields a scripted list of responses across calls.
+
+    Captures every :class:`ReviewRequest` it sees in ``self.requests``
+    so consensus tests can assert N calls happened and that each used
+    a unique per-run ``request_id``. Returns each scripted result
+    exactly once in order; falls back to repeating the last result
+    if the script runs short (so a test that expects 3 calls but
+    only writes 2 scripted results doesn't crash on call 3).
+    """
+
+    def __init__(self, name: str, responses: list[ReviewResult]):
+        if not responses:
+            raise ValueError(
+                "_ScriptedProvider requires at least one scripted response"
+            )
+        self.name = name
+        self._responses = list(responses)
+        self.requests: list[ReviewRequest] = []
+        self._call_index = 0
+
+    async def review(self, request: ReviewRequest) -> ReviewResult:
+        self.requests.append(request)
+        idx = min(self._call_index, len(self._responses) - 1)
+        self._call_index += 1
+        return self._responses[idx]
+
+
+def _consensus_finding(
+    severity: str = "concern",
+    title: str = "race condition in handler",
+    path: str = "src/api.py",
+    line: int = 42,
+) -> ReviewFinding:
+    return ReviewFinding(
+        severity=severity,  # type: ignore[arg-type]
+        title=title,
+        body=f"body for {title}",
+        path=path,
+        line=line,
+    )
+
+
+def _consensus_result(
+    findings: list[ReviewFinding],
+    *,
+    input_tokens: int = 100,
+    output_tokens: int = 50,
+    duration_ms: int = 1000,
+) -> ReviewResult:
+    return ReviewResult(
+        request_id="will-be-overwritten",
+        summary="ok",
+        findings=findings,
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=1.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_ms=duration_ms,
+        ),
+    )
+
+
+async def test_consensus_runs_default_takes_single_call_path():
+    """``consensus_runs`` defaulting to 1 must skip orchestration entirely.
+
+    Regression guard: existing call sites that never set the field
+    observe identical behavior to pre-FR (one provider call, no
+    consolidation). The default path is the hot path.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "x"}
+    )
+
+    assert len(fake.requests) == 1
+    assert out.get("error", "") == ""
+    assert len(out["findings"]) == 1
+
+
+async def test_consensus_runs_3_invokes_provider_3_times():
+    """``consensus_runs=3`` calls ``provider.review`` exactly 3 times,
+    each with a unique per-run ``request_id`` suffix so usage records
+    remain disambiguatable.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])] * 3)
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    assert len(fake.requests) == 3
+    request_ids = [r.request_id for r in fake.requests]
+    assert request_ids[0].endswith("-r1")
+    assert request_ids[1].endswith("-r2")
+    assert request_ids[2].endswith("-r3")
+    # Base request_id (everything before -rN) is identical across runs
+    base_ids = {rid.rsplit("-r", 1)[0] for rid in request_ids}
+    assert len(base_ids) == 1
+
+
+async def test_consensus_keeps_finding_appearing_in_min_or_more_runs():
+    """A finding seen in ``min_count`` runs (under the same anchor key)
+    survives consolidation. The "majority vote" core property.
+    """
+    same_finding = _consensus_finding(title="null pointer in foo")
+    other = _consensus_finding(title="missing error handling", line=99)
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([same_finding, other]),  # run 1
+            _consensus_result([same_finding]),         # run 2 — same finding
+            _consensus_result([]),                     # run 3 — empty
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 2},
+    )
+
+    titles = sorted(f["title"] for f in out["findings"])
+    # ``same_finding`` appears in 2 runs → kept (>= 2)
+    # ``other`` appears in 1 run → dropped (< 2)
+    assert titles == ["null pointer in foo"]
+
+
+async def test_consensus_drops_finding_below_min():
+    """A finding appearing in fewer than ``min_count`` runs is filtered out.
+    Symmetric to the survives-at-min test; isolates the strict-inequality
+    boundary.
+    """
+    rare = _consensus_finding(title="rare flake")
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([rare]),  # run 1 — only place it appears
+            _consensus_result([]),       # run 2
+            _consensus_result([]),       # run 3
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 2},
+    )
+
+    assert out["findings"] == []
+
+
+async def test_consensus_min_1_keeps_outlier_unchanged():
+    """The 10×-outlier-survives-unchanged property (per
+    ``project_reviewer_distill_principle``): with ``consensus_min=1``,
+    a unique finding from a single run lands in the consolidated
+    result with its body / severity / location preserved verbatim.
+    Consensus is noise reduction; it must not smooth features.
+    """
+    outlier = _consensus_finding(
+        severity="concern",
+        title="critical race condition",
+        path="src/load_bearing.py",
+        line=137,
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([outlier]),  # run 1 only
+            _consensus_result([_consensus_finding(title="nit", severity="nit")]),
+            _consensus_result([_consensus_finding(title="nit", severity="nit")]),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    titles = [f["title"] for f in out["findings"]]
+    assert "critical race condition" in titles
+    survivor = next(f for f in out["findings"] if f["title"] == "critical race condition")
+    assert survivor["severity"] == "concern"
+    assert survivor["path"] == "src/load_bearing.py"
+    assert survivor["line"] == 137
+    assert survivor["body"] == outlier.body
+
+
+async def test_consensus_min_greater_than_runs_returns_error():
+    """``consensus_min > consensus_runs`` is a caller bug — no finding
+    could ever survive. Fail fast with a clear error rather than
+    silently dropping every finding.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 3},
+    )
+
+    assert "error" in out
+    assert "consensus_min=3" in out["error"]
+    assert "consensus_runs=2" in out["error"]
+    # No provider calls should have been made before validation fired.
+    assert fake.requests == []
+
+
+async def test_consensus_invalid_runs_falls_back_to_default():
+    """Non-int / non-positive / bool ``consensus_runs`` falls through to
+    the default of 1 (no consensus). Treats malformed bus payloads as
+    absent rather than crashing — same defensive convention as
+    ``num_ctx`` and ``format``.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    for bad_value in (0, -1, True, False, "3", 1.5, None, [3]):
+        fake.requests.clear()
+        fake._call_index = 0
+        await harness.call(
+            "review_text",
+            {"kind": "pr_diff", "content": "x", "consensus_runs": bad_value},
+        )
+        assert len(fake.requests) == 1, f"bad_value={bad_value!r} should fall through to single call"
+
+
+async def test_consensus_first_error_propagates_without_consolidation():
+    """If any run errors, surface the first error verbatim and skip
+    finding-consolidation — partial-consensus over a degraded set is
+    a future refinement.
+
+    Per Copilot R1 PR#37: usage is MERGED across all runs even on the
+    error path, so cost-accounting captures the real spend (runs that
+    completed before the error already burned tokens).
+    """
+    errored = ReviewResult(
+        request_id="run-2",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="provider blew up",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=1.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=50,  # the failing call still spent tokens before erroring
+            output_tokens=0,
+        ),
+    )
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f], input_tokens=100, output_tokens=50),  # run 1: ok
+            errored,                                                      # run 2: error
+            _consensus_result([f], input_tokens=120, output_tokens=70),  # run 3: ok
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    assert out["error"] == "provider blew up"
+    assert out["disposition"] == "errored"
+    assert out["findings"] == []
+    # Usage merged across all runs (100+50+120=270 input, 50+0+70=120 output)
+    # so the consuming UsageStore captures real spend even on error.
+    assert out["usage"]["input_tokens"] == 270
+    assert out["usage"]["output_tokens"] == 120
+
+
+async def test_consensus_error_path_overrides_usage_disposition_and_error():
+    """Per Copilot R2 PR#37: on the error path the merged usage row's
+    ``disposition`` / ``error`` / ``error_category`` fields must reflect
+    the FAILING run, not the first (successful) run that
+    ``_merge_usage_events`` happens to anchor identity on. Otherwise
+    failure-rate analytics undercount because the persisted usage row
+    looks "posted" with empty error fields even though the result was
+    errored.
+    """
+    errored = ReviewResult(
+        request_id="run-2",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="provider blew up",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=2.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=50,
+            output_tokens=0,
+            disposition="errored",
+            error="provider blew up",
+            error_category="backend_error",
+        ),
+    )
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f]),  # run 1 ok (disposition='posted', no error)
+            errored,
+            _consensus_result([f]),  # run 3 ok
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    # Without the override, _merge_usage_events would carry over run 1's
+    # disposition='posted' and empty error fields — broken analytics.
+    assert out["usage"]["disposition"] == "errored"
+    assert out["usage"]["error"] == "provider blew up"
+    assert out["usage"]["error_category"] == "backend_error"
+
+
+async def test_consensus_error_path_falls_back_when_errored_run_lacks_usage():
+    """Override path also handles the rare provider behavior of
+    returning an errored ReviewResult with ``usage=None`` (hard
+    transport failure that fired before any tokens were spent). The
+    merged usage row still reflects failure by falling back to the
+    result-level ``disposition`` / ``error`` / ``error_category``.
+    """
+    errored = ReviewResult(
+        request_id="run-2",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="connection refused",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=None,
+    )
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f]),  # run 1 ok — has usage
+            errored,                  # run 2 hard fail — no usage
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 1},
+    )
+
+    assert out["usage"]["disposition"] == "errored"
+    assert out["usage"]["error"] == "connection refused"
+    assert out["usage"]["error_category"] == "backend_error"
+
+
+async def test_consensus_min_greater_than_runs_runs_1_returns_error():
+    """``consensus_runs=1, consensus_min=2`` must fail validation just
+    like ``runs=2, min=3`` — the cross-check is unconditional and
+    fires before the single-call fast path. Per Copilot R1 PR#37:
+    previously this payload silently took the single-call branch and
+    skipped validation.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 1, "consensus_min": 2},
+    )
+
+    assert "error" in out
+    assert "consensus_min=2" in out["error"]
+    assert "consensus_runs=1" in out["error"]
+    # Validation fires before any provider call.
+    assert fake.requests == []
+
+
+async def test_consensus_runs_above_max_returns_error():
+    """``consensus_runs`` above the hard cap (16) refuses to spawn the
+    flood — typo / abuse guard. Per Copilot R1 PR#37.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 1000, "consensus_min": 1},
+    )
+
+    assert "error" in out
+    assert "consensus_runs=1000" in out["error"]
+    assert "max" in out["error"].lower()
+    # Validation fires before any provider call (zero burst at the backend).
+    assert fake.requests == []
+
+
+def test_scripted_provider_rejects_empty_responses():
+    """Test-helper hardening per Copilot R1 PR#37: constructing
+    ``_ScriptedProvider`` with no scripted responses must fail at
+    construction time with a clear error rather than at first
+    ``review()`` call with a confusing IndexError.
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="at least one scripted response"):
+        _ScriptedProvider("ollama", [])
+
+
+async def test_consensus_aggregates_usage_tokens_sum_duration_max():
+    """Token / cost fields sum across runs (true compute spend);
+    ``duration_ms`` takes the max (concurrent wall-clock, not serial).
+    Identity fields (backend / model) take run 1's value.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f], input_tokens=100, output_tokens=50, duration_ms=1500),
+            _consensus_result([f], input_tokens=200, output_tokens=80, duration_ms=900),
+            _consensus_result([f], input_tokens=120, output_tokens=70, duration_ms=1100),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    usage = out["usage"]
+    assert usage["input_tokens"] == 420  # sum: 100+200+120
+    assert usage["output_tokens"] == 200  # sum: 50+80+70
+    assert usage["duration_ms"] == 1500   # max, not sum
+    assert usage["backend"] == "ollama"
+    assert usage["model"] == "qwen2.5-coder:14b"
+
+
+async def test_consensus_result_request_id_strips_per_run_suffix():
+    """The consolidated result reports the base ``request_id`` the
+    caller supplied — the ``-rN`` per-run suffixes are internal
+    plumbing for usage-record disambiguation only.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])] * 2)
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "request_id": "caller-supplied-id",
+            "consensus_runs": 2,
+            "consensus_min": 1,
+        },
+    )
+
+    assert out["request_id"] == "caller-supplied-id"
+    # ...even though the per-run requests carried -r1 / -r2 suffixes.
+    assert {r.request_id for r in fake.requests} == {
+        "caller-supplied-id-r1",
+        "caller-supplied-id-r2",
+    }
+
+
+async def test_consensus_finding_anchor_uses_path_and_line_when_set():
+    """Inline findings (path + line both set) anchor on
+    ``(severity, path, line, normalized_title)``. Two findings with the
+    same severity and title but different lines must NOT group — they
+    refer to different code sites.
+    """
+    same_title_diff_line_a = _consensus_finding(line=10)
+    same_title_diff_line_b = _consensus_finding(line=20)
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([same_title_diff_line_a]),
+            _consensus_result([same_title_diff_line_b]),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 2},
+    )
+
+    # Different lines → different keys → neither hits min=2 → both dropped.
+    assert out["findings"] == []
+
+
+async def test_consensus_path_only_finding_anchors_as_summary_level():
+    """Per Copilot R4 PR#37: a finding with ``path`` set but
+    ``line=None`` (or vice versa) MUST anchor as summary-level (empty
+    path, 0 line) rather than producing a partial-anchor key that
+    contradicts the docstring and groups with nothing.
+
+    Concretely: two findings with the same severity + same title +
+    same path-but-no-line across two runs MUST consolidate (because
+    their key collapses to the summary-level shape), not stay
+    separate as "near-inline" findings.
+    """
+    path_only_a = ReviewFinding(
+        severity="comment",  # type: ignore[arg-type]
+        title="missing rate-limit handling",
+        body="body a",
+        path="src/api.py",
+        line=None,
+    )
+    path_only_b = ReviewFinding(
+        severity="comment",  # type: ignore[arg-type]
+        title="missing rate-limit handling",
+        body="body b",
+        path="src/api.py",
+        line=None,
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([path_only_a]), _consensus_result([path_only_b])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 2},
+    )
+
+    # Both findings collapse to (comment, "", 0, "missing rate-limit
+    # handling") under the summary-anchor rule, so the group has size
+    # 2 and survives min=2.
+    titles = [f["title"] for f in out["findings"]]
+    assert titles == ["missing rate-limit handling"]
+
+
+async def test_consensus_title_normalization_groups_minor_drift():
+    """Title normalization (lowercase + whitespace collapse) groups
+    findings with trivial wording differences, which is the common
+    LLM-output drift pattern. Without normalization, "Race condition"
+    and "race  condition" would be treated as distinct findings and
+    consensus would fail to lock onto repeated observations.
+    """
+    drift_a = _consensus_finding(title="Race condition", line=42)
+    drift_b = _consensus_finding(title="race  condition", line=42)
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([drift_a]), _consensus_result([drift_b])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 2},
+    )
+
+    titles = [f["title"] for f in out["findings"]]
+    # Grouped under the same key → one finding survives (canonical = first).
+    assert titles == ["Race condition"]
