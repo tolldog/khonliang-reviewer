@@ -125,9 +125,17 @@ def test_expected_skills_registered():
 def test_skills_parameters_match_public_contract():
     harness = _make_harness()
     skill = next(s for s in harness.skills if s.name == "review_text")
-    # contract: kind + content are required, everything else optional
+    # contract: kind is required at the schema level. The payload
+    # arrives as ``content`` (canonical) OR ``diff`` (alias accepted
+    # for callers coming from the review_diff shape) — neither is
+    # marked required at the schema level, but the handler raises
+    # if both are missing/empty (see
+    # test_review_text_missing_both_payload_args_returns_error).
     assert skill.parameters["kind"]["required"] is True
-    assert skill.parameters["content"]["required"] is True
+    assert "content" in skill.parameters
+    assert "diff" in skill.parameters
+    assert skill.parameters["content"].get("required", False) is False
+    assert skill.parameters["diff"].get("required", False) is False
     for optional in ("instructions", "context", "backend", "model", "request_id", "metadata"):
         assert optional in skill.parameters
         assert skill.parameters[optional].get("required", False) is False
@@ -554,6 +562,118 @@ async def test_review_diff_diff_not_string_returns_error():
     harness = _make_harness({"ollama": fake})
     result = await harness.call("review_diff", {"diff": 123})
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# review_diff / review_text arg consistency (fr_reviewer_8fb104e9)
+# ---------------------------------------------------------------------------
+
+
+async def test_review_text_accepts_diff_alias():
+    """review_text accepts ``diff`` as an alias for ``content`` so
+    subagents coming from review_diff don't have to remember to
+    rename the field. The two skills differ in framing, not field
+    name.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "diff": "diff --git a/x b/x\n@@\n-old\n+new"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.content.startswith("diff --git")
+
+
+async def test_review_diff_accepts_content_alias():
+    """review_diff accepts ``content`` as an alias for ``diff`` —
+    same symmetry. A subagent reusing a review_text snippet against
+    review_diff works without renaming.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"content": "diff --git a/x b/x"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.kind == "pr_diff"  # review_diff sets the kind
+    assert fake.last_request.content == "diff --git a/x b/x"
+
+
+async def test_review_text_canonical_content_wins_over_diff_alias():
+    """When both ``content`` and ``diff`` are non-empty on review_text,
+    the canonical ``content`` wins — keeps the canonical-name
+    authoritative in the rare ambiguous-call case.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "canonical body", "diff": "alias body"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.content == "canonical body"
+
+
+async def test_review_diff_canonical_diff_wins_over_content_alias():
+    """Symmetric: review_diff prefers ``diff`` on the same ambiguous
+    call. The canonical name for each skill stays authoritative.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"diff": "canonical diff", "content": "alias body"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.content == "canonical diff"
+
+
+async def test_review_text_missing_both_payload_args_returns_error():
+    """Missing both ``content`` and ``diff`` still surfaces an error;
+    the alias doesn't relax the required-payload contract.
+    """
+    harness = _make_harness()
+    result = await harness.call("review_text", {"kind": "pr_diff"})
+    assert "error" in result
+    # Error message names both options so subagents see the alias.
+    assert "content" in result["error"]
+    assert "diff" in result["error"]
+
+
+async def test_review_diff_missing_both_payload_args_returns_error():
+    harness = _make_harness()
+    result = await harness.call("review_diff", {})
+    assert "error" in result
+    assert "diff" in result["error"]
+    assert "content" in result["error"]
+
+
+async def test_review_text_empty_content_falls_through_to_diff():
+    """Edge case: ``content=""`` (explicitly empty) falls through to
+    the ``diff`` alias rather than failing immediately. Subagents
+    that pass both fields and clear the canonical one still get a
+    successful review.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "", "diff": "diff --git a/x b/x"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.content.startswith("diff --git")
 
 
 # ---------------------------------------------------------------------------
