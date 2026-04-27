@@ -559,6 +559,34 @@ def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
     return line_count, file_count
 
 
+def _resolve_payload_arg(args: dict[str, Any], *, prefer: str = "content") -> str:
+    """Resolve the review payload from either ``content`` or ``diff``.
+
+    Both ``review_text`` and ``review_diff`` skills accept either arg
+    name so subagents can call whichever feels natural — the two
+    skills differ in framing (freeform text vs unified-diff bytes),
+    not in field name. Resolution rules:
+
+    - The ``prefer``-named arg wins when it's a non-empty string.
+    - The other arg is consulted when the preferred one is missing,
+      empty, or non-string.
+    - Returns ``""`` when neither carries a non-empty string (the
+      caller surfaces "required" as an error).
+
+    The ``prefer`` parameter lets each skill's handler keep its
+    canonical name authoritative on ties: review_text prefers
+    ``content``, review_diff prefers ``diff``.
+    """
+    primary = args.get(prefer)
+    if isinstance(primary, str) and primary:
+        return primary
+    other_name = "diff" if prefer == "content" else "content"
+    secondary = args.get(other_name)
+    if isinstance(secondary, str) and secondary:
+        return secondary
+    return ""
+
+
 def _coerce_default_models(val: Any) -> dict[str, str]:
     """Coerce ``config['default_models']`` to a ``dict[str, str]``.
 
@@ -678,10 +706,20 @@ class ReviewerAgent(BaseAgent):
         return [
             Skill(
                 "review_text",
-                "Run a review over arbitrary content. Returns structured findings + usage record.",
+                "Run a review over arbitrary content. Returns structured "
+                "findings + usage record. The payload may be passed as "
+                "`content` (canonical) OR `diff` (alias accepted for "
+                "callers coming from the `review_diff` shape) — whichever "
+                "is non-empty wins, with `content` taking precedence "
+                "when both are supplied.",
                 {
                     "kind": {"type": "string", "required": True},
-                    "content": {"type": "string", "required": True},
+                    # Canonical payload field. ``diff`` is also accepted
+                    # as an alias so callers don't have to remember
+                    # which shape this skill uses; the handler resolves
+                    # whichever is non-empty (content wins on tie).
+                    "content": {"type": "string", "default": ""},
+                    "diff": {"type": "string", "default": ""},
                     "instructions": {"type": "string", "default": ""},
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
@@ -698,9 +736,16 @@ class ReviewerAgent(BaseAgent):
             ),
             Skill(
                 "review_diff",
-                "Shortcut for review_text with kind='pr_diff'.",
+                "Shortcut for review_text with kind='pr_diff'. The "
+                "payload may be passed as `diff` (canonical) OR "
+                "`content` (alias accepted for callers coming from the "
+                "`review_text` shape). The two skills differ in framing "
+                "(diff bytes vs freeform text), not field name.",
                 {
-                    "diff": {"type": "string", "required": True},
+                    # Canonical payload field. ``content`` is also
+                    # accepted as an alias.
+                    "diff": {"type": "string", "default": ""},
+                    "content": {"type": "string", "default": ""},
                     "instructions": {"type": "string", "default": ""},
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
@@ -766,9 +811,15 @@ class ReviewerAgent(BaseAgent):
         if not kind:
             return {"error": "kind is required"}
 
-        content = args.get("content")
-        if not isinstance(content, str) or not content:
-            return {"error": "content is required and must be a non-empty string"}
+        # Accept ``content`` (canonical) OR ``diff`` (alias) — review_text
+        # and review_diff differ in framing (freeform text vs unified diff
+        # bytes), not field name. Subagents drift between the two; the
+        # alias collapses the surface so either name works on either skill.
+        # ``content`` wins when both are non-empty so the canonical name
+        # remains authoritative.
+        content = _resolve_payload_arg(args)
+        if not content:
+            return {"error": "content (or diff) is required and must be a non-empty string"}
 
         caller_backend = args.get("backend") or None
         # Preserve an explicit empty-string model: ``model=""`` means
@@ -1008,9 +1059,13 @@ class ReviewerAgent(BaseAgent):
 
     @handler("review_diff")
     async def handle_review_diff(self, args: dict[str, Any]) -> dict[str, Any]:
-        diff = args.get("diff")
-        if not isinstance(diff, str) or not diff:
-            return {"error": "diff is required and must be a non-empty string"}
+        # Accept ``diff`` (canonical) OR ``content`` (alias). For
+        # review_diff the resolution prefers ``diff`` since that's the
+        # canonical-for-this-skill name; ``content`` is the legacy /
+        # cross-skill alias.
+        diff = _resolve_payload_arg(args, prefer="diff")
+        if not diff:
+            return {"error": "diff (or content) is required and must be a non-empty string"}
         forwarded = {
             k: v for k, v in args.items() if k not in {"diff", "kind", "content"}
         }
