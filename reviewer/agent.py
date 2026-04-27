@@ -1645,6 +1645,31 @@ class ReviewerAgent(BaseAgent):
         ollama_default = str(
             ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
         )
+        # Thread per-provider knobs through to the dataclass so the
+        # config-layer rung of the resolution order ("caller →
+        # config → None" / "caller → config → auto-bump") is
+        # actually reachable from ``config.yaml``. Without this,
+        # the advertised 3-/4-layer resolution skips the operator
+        # default and goes straight from caller to None / auto-bump.
+        # Treat-malformed-as-absent: a YAML payload with a non-string
+        # ``format`` or non-positive ``num_ctx`` collapses to None
+        # rather than crashing the provider boot path; the value
+        # types are validated again inside the resolution helpers,
+        # so this is belt-and-suspenders.
+        ollama_format_raw = ollama_cfg.get("format")
+        ollama_format = (
+            ollama_format_raw
+            if isinstance(ollama_format_raw, str) and ollama_format_raw
+            else None
+        )
+        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
+        ollama_num_ctx = (
+            ollama_num_ctx_raw
+            if isinstance(ollama_num_ctx_raw, int)
+            and not isinstance(ollama_num_ctx_raw, bool)
+            and ollama_num_ctx_raw > 0
+            else None
+        )
         registry.register(
             OllamaProvider(
                 OllamaProviderConfig(
@@ -1653,6 +1678,8 @@ class ReviewerAgent(BaseAgent):
                         or "http://localhost:11434/v1"
                     ),
                     default_model=ollama_default,
+                    num_ctx=ollama_num_ctx,
+                    format=ollama_format,
                 )
             ),
             default_model=ollama_default,
