@@ -135,7 +135,12 @@ def test_approved_trailer_format():
     )
 
 
-def test_approved_with_findings_trailer_includes_count():
+def test_approved_with_findings_trailer_matches_spec_filtered_suffix():
+    """Spec acceptance example shape: ``<histogram> filtered`` —
+    e.g. ``1 comment + 2 nits filtered``. The numeric counts are
+    surviving findings; ``filtered`` is a participial adjective
+    on the histogram meaning "flagged but non-blocking".
+    """
     r = _result(findings=[_f("nit"), _f("nit"), _f("comment")])
     out = build_trailer(r)
     assert out["verdict"] == "approved-with-findings"
@@ -146,6 +151,12 @@ def test_approved_with_findings_trailer_includes_count():
     assert "2 nits" in out["trailer_line"]
     # And specifically: comments bucket appears before nits bucket.
     assert out["trailer_line"].index("comment") < out["trailer_line"].index("nit")
+    # Spec-locked suffix.
+    assert out["trailer_line"].endswith("filtered")
+    # Spec-example shape for the simpler "2 nits" case.
+    r2 = _result(findings=[_f("nit"), _f("nit")])
+    out2 = build_trailer(r2)
+    assert out2["trailer_line"].endswith("approved-with-findings: 2 nits filtered")
 
 
 def test_concerns_raised_trailer_uses_first_concern_anchor():
@@ -244,11 +255,17 @@ def test_concerns_anchor_skips_leading_nits_and_comments():
     assert "leading-comment" not in out["trailer_line"]
 
 
-def test_filtered_count_appended_to_approved_with_findings_reason():
-    """Per the MS-D spec/acceptance, the trailer should reflect
-    severity_filter activity. When ``findings_filtered_count`` > 0
-    on the result's UsageEvent, the auto-reason appends a "+ N
-    filtered" segment so subagents see the floor was applied.
+def test_filtered_count_is_telemetry_not_trailer_copy():
+    """``UsageEvent.findings_filtered_count`` counts how many
+    findings severity_filter dropped — that's telemetry. The
+    trailer talks about the SURVIVING histogram (which is what
+    the reviewer is signing off on), so the trailer should NOT
+    surface the dropped count as an extra segment. Spec example
+    "2 nits filtered" is the surviving 2 nits, not 2 nits-
+    that-were-dropped.
+
+    Pinning this so a future revision doesn't mix telemetry
+    into the trailer copy and break the spec-locked shape.
     """
     r = _result(
         findings=[ReviewFinding(severity="nit", title="t", body="b")],  # type: ignore[arg-type]
@@ -256,34 +273,44 @@ def test_filtered_count_appended_to_approved_with_findings_reason():
     )
     out = build_trailer(r)
     assert out["verdict"] == "approved-with-findings"
-    assert "1 nit" in out["trailer_line"]
-    assert "3 filtered" in out["trailer_line"]
+    # Surviving histogram + " filtered" suffix; no separate "+ N filtered".
+    assert out["trailer_line"].endswith("approved-with-findings: 1 nit filtered")
+    assert "+ 3" not in out["trailer_line"]
 
 
-def test_filtered_count_surfaces_on_approved_too():
-    """When all findings were filtered out (zero surviving) the
-    verdict is approved, but the trailer still records the
-    filtered count so subagents see that severity_filter shaped
-    the payload — otherwise the trailer would claim 'approved'
-    against findings that had been silently dropped.
+def test_approved_with_zero_surviving_omits_reason():
+    """When zero findings survive (verdict=approved), the trailer
+    has no reason segment regardless of how many findings the
+    floor dropped — the spec says reason is omitted for approved.
+    A clean approval reads cleanly.
     """
     r = _result(findings=[], findings_filtered_count=4)
     out = build_trailer(r)
     assert out["verdict"] == "approved"
-    assert "4 filtered" in out["trailer_line"]
+    # No reason segment.
+    assert ": " not in out["trailer_line"].split("approved", 1)[1]
 
 
-def test_filtered_count_zero_omits_segment():
-    """When no filtering happened, the auto-reason doesn't append
-    a "0 filtered" noise segment. The reason matches the surviving
-    histogram exactly.
+def test_space_in_role_sanitized():
+    """Operator-supplied ``role`` (e.g. typo'd "my role") with
+    embedded spaces would otherwise break the trailer's
+    ``<role>/<backend>/<model> <verdict>`` tokenization — the
+    triple is supposed to be a single space-delimited token.
+    The path-segment sanitizer rewrites internal spaces to "-"
+    so the locked shape holds even on careless override input.
     """
-    r = _result(
-        findings=[ReviewFinding(severity="comment", title="t", body="b")],  # type: ignore[arg-type]
-        findings_filtered_count=0,
-    )
-    out = build_trailer(r)
-    assert "filtered" not in out["trailer_line"]
+    r = _result()
+    out = build_trailer(r, role="my role with spaces")
+    line = out["trailer_line"]
+    # The role/backend/model triple is the first space-delimited
+    # token after "Agent-Reviewed-by:". A space inside any
+    # segment would split the triple into multiple tokens.
+    after_key = line.split(": ", 1)[1]
+    triple = after_key.split(" ", 1)[0]
+    # Sanitized role uses dashes; the triple stays single-token.
+    assert triple.startswith("my-role-with-spaces/")
+    # Original spaces don't leak through.
+    assert "my role" not in line
 
 
 def test_errored_disposition_raises():

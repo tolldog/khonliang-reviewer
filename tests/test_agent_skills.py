@@ -683,10 +683,12 @@ async def test_sign_off_trailer_result_only_path():
     out = await harness.call("sign_off_trailer", {"result": result_dict})
 
     assert out["verdict"] == "approved-with-findings"
+    # Spec-locked shape: "<histogram> filtered" suffix, where the
+    # histogram counts the surviving findings.
     assert (
         out["trailer_line"]
         == "Agent-Reviewed-by: khonliang-reviewer/ollama/qwen2.5-coder:14b "
-        "approved-with-findings: 1 nit"
+        "approved-with-findings: 1 nit filtered"
     )
     # Result-only path doesn't call the provider.
     assert fake.last_request is None

@@ -20,13 +20,21 @@ Where:
 - ``verdict`` is computed from finding severity counts and the
   result's error_category — see :func:`compute_verdict`.
 - ``reason`` is required for ``approved-with-findings`` and
-  ``concerns-raised``. For ``approved`` and ``escalated-approved``
-  the reason is normally omitted, but the trailer DOES surface a
-  filtered-count reason (``approved: 4 filtered``) when
-  ``ReviewResult.usage.findings_filtered_count`` is > 0, so a
-  pre-floor payload doesn't ship an unmarked ``approved``
-  trailer. Reason capped at ~80 chars so ``git log --oneline``
-  stays readable.
+  ``concerns-raised``; omitted for ``approved`` and
+  ``escalated-approved`` (those verdicts produce a clean two-
+  segment trailer). Caller-supplied reasons are honored on every
+  verdict — the auto-reason logic only fires when the caller
+  doesn't supply one. Reason is capped at ~80 chars so ``git log
+  --oneline`` stays readable.
+
+- ``approved-with-findings`` reasons follow the spec's locked
+  ``<histogram> filtered`` shape — e.g. ``2 nits filtered``,
+  ``1 comment + 2 nits filtered``. The ``filtered`` suffix is a
+  participial adjective on the histogram meaning "flagged but
+  non-blocking"; the numeric counts are the surviving findings.
+  ``UsageEvent.findings_filtered_count`` (the count
+  severity_filter dropped) is telemetry, not trailer copy — the
+  trailer talks about what survived, not what was dropped.
 
 Errored review results (``disposition == "errored"``) raise
 :class:`ValueError` from :func:`compute_verdict` /
@@ -199,39 +207,36 @@ def _auto_reason(result: ReviewResult, verdict: Verdict) -> str:
     leading nit/comment rows are skipped so the anchor doesn't
     accidentally point at a low-severity finding.
 
-    For ``approved-with-findings`` the reason summarizes the
-    surviving severity mix. For ``approved`` /
-    ``escalated-approved`` the surviving-mix reason is empty.
+    For ``approved-with-findings`` the reason follows the spec's
+    locked "<histogram> filtered" shape — e.g. ``2 nits filtered``,
+    ``1 comment + 2 nits filtered``. The ``filtered`` suffix is a
+    participial adjective on the histogram meaning "flagged but
+    non-blocking". The numeric counts are the surviving findings
+    in ``result.findings``; the spec deliberately doesn't reference
+    ``UsageEvent.findings_filtered_count`` here (that field is
+    telemetry, not trailer copy).
 
-    For *any* verdict, ``result.usage.findings_filtered_count`` is
-    folded in when > 0 — the trailer should reflect that the
-    severity_filter pipeline transform dropped findings even when
-    no surviving findings remain (otherwise the trailer claims
-    ``approved`` for a payload that was actually shaped by a
-    floor).
+    For ``approved`` / ``escalated-approved`` the reason is empty —
+    the trailer omits the segment so a clean approval reads
+    cleanly.
     """
     counts = _severity_counts(result)
-    filtered_count = (
-        result.usage.findings_filtered_count if result.usage is not None else 0
-    )
 
     if verdict == "concerns-raised":
         concern_count = counts["concern"] + counts["unknown"]
         anchor_finding = _first_concern_or_unknown(result)
         if anchor_finding is None:
-            base = (
+            return (
                 f"{concern_count} concern"
                 + ("s" if concern_count != 1 else "")
             )
-        else:
-            anchor = (
-                anchor_finding.category
-                or anchor_finding.title
-                or "(no title)"
-            )
-            plural = "s" if concern_count != 1 else ""
-            base = f"{concern_count} concern{plural}: {anchor}"
-        return _append_filtered(base, filtered_count)
+        anchor = (
+            anchor_finding.category
+            or anchor_finding.title
+            or "(no title)"
+        )
+        plural = "s" if concern_count != 1 else ""
+        return f"{concern_count} concern{plural}: {anchor}"
 
     if verdict == "approved-with-findings":
         parts = []
@@ -244,13 +249,12 @@ def _auto_reason(result: ReviewResult, verdict: Verdict) -> str:
             parts.append(
                 f"{counts['nit']} nit" + ("s" if counts["nit"] != 1 else "")
             )
-        base = " + ".join(parts)
-        return _append_filtered(base, filtered_count)
+        if not parts:
+            return ""
+        return " + ".join(parts) + " filtered"
 
-    # approved / escalated-approved: surviving-mix reason is empty.
-    # Filtered-count, if any, still surfaces so the trailer reflects
-    # that severity_filter shaped the payload.
-    return _append_filtered("", filtered_count)
+    # approved / escalated-approved.
+    return ""
 
 
 def _first_concern_or_unknown(result: ReviewResult):
@@ -272,25 +276,6 @@ def _first_concern_or_unknown(result: ReviewResult):
         except ValueError:
             return f
     return None
-
-
-def _append_filtered(base: str, filtered_count: int) -> str:
-    """Append ``+ N filtered`` to ``base`` when ``filtered_count > 0``.
-
-    When ``base`` is empty, returns just ``"N filtered"`` so the
-    trailer still surfaces the filtered count for verdicts that
-    don't otherwise carry a reason. Returns ``base`` unchanged
-    when ``filtered_count`` is 0.
-    """
-    if filtered_count <= 0:
-        return base
-    # ``filtered`` is an adjective on the elided noun "findings" —
-    # doesn't pluralize, so a single template covers count == 1
-    # and count > 1 alike.
-    suffix = f"{filtered_count} filtered"
-    if not base:
-        return suffix
-    return f"{base} + {suffix}"
 
 
 def _sanitize_segment(value: str) -> str:
@@ -320,22 +305,26 @@ def _sanitize_path_segment(value: str) -> str:
     ``role/backend/model`` path of the trailer line.
 
     Stricter than :func:`_sanitize_segment`: in addition to the
-    newline / whitespace normalization, replaces ``/`` and ``\\``
-    with ``-`` so a model id like ``kimi-k2/5/cloud`` doesn't add
-    phantom path segments to the trailer's three-part shape.
-    Operator-supplied roles, provider-reported backend names, and
-    model ids all run through this — provider names are usually
-    plain (``ollama``, ``claude_cli``, ``gh_copilot``) but model
-    ids carry the most variability.
+    newline / whitespace normalization, replaces ``/``, ``\\``,
+    and the remaining single-space characters with ``-`` so the
+    triple stays a single space-delimited token in the locked
+    ``Agent-Reviewed-by: <role>/<backend>/<model> <verdict>...``
+    format. Operator-supplied roles, provider-reported backend
+    names, and model ids all run through this — model ids carry
+    the most variability (e.g. ``kimi-k2/5/cloud``).
     """
     cleaned = _sanitize_segment(value)
     if not cleaned:
         return cleaned
-    # Translate the path-separator chars to ``-``; preserves the
-    # rest of the segment's characters (digits, dots, colons,
-    # underscores) so canonical-but-slash-bearing model ids stay
-    # readable in the trailer.
-    return cleaned.replace("/", "-").replace("\\", "-")
+    # Translate path-separator chars AND any remaining spaces to
+    # ``-``. Preserves digits, dots, colons, underscores so
+    # canonical model ids stay readable in the trailer.
+    return (
+        cleaned
+        .replace("/", "-")
+        .replace("\\", "-")
+        .replace(" ", "-")
+    )
 
 
 def _truncate_reason(reason: str) -> str:
