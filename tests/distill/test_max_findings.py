@@ -18,6 +18,7 @@ Pins the contract:
 
 from __future__ import annotations
 
+import pytest
 from khonliang_reviewer import ReviewFinding, ReviewResult
 
 from reviewer.distill.transforms.max_findings import apply_max_findings
@@ -149,3 +150,16 @@ def test_cap_exactly_zero_keeps_no_findings():
     result = _result(_f("concern", "c"))
     out = apply_max_findings(result, DistillConfig(max_findings=0))
     assert out.findings == []
+
+
+def test_negative_cap_raises():
+    """Negative caps would silently slice from the END rather than
+    truncate (Python slicing semantics: ``findings[:-2]`` drops the
+    last two rather than capping to zero). Raise loudly so a
+    misconfigured rule never silently reshapes results — matches
+    the ValueError contract used by dedup's 'semantic' strategy
+    and body_mode's unknown-mode case.
+    """
+    result = _result(_f("nit", "a"), _f("nit", "b"), _f("nit", "c"))
+    with pytest.raises(ValueError, match="max_findings"):
+        apply_max_findings(result, DistillConfig(max_findings=-1))

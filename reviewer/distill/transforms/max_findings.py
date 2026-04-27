@@ -54,6 +54,18 @@ def apply_max_findings(result: ReviewResult, config: DistillConfig) -> ReviewRes
     cap = config.max_findings
     if cap is None:
         return result
+    if cap < 0:
+        # A negative cap would silently flip Python's slicing
+        # semantics (``findings[:-2]`` drops from the END rather
+        # than capping to zero), which would surprise every caller
+        # that ever supplies a misconfigured rule. Fail loudly so
+        # the misconfiguration shows up immediately — matches the
+        # ValueError contract used by dedup's 'semantic' strategy
+        # and body_mode's unknown-mode case.
+        raise ValueError(
+            f"DistillConfig.max_findings={cap!r} must be >= 0 or None; "
+            "negative caps would slice from the end rather than truncate."
+        )
 
     # Negate the rank so higher-severity sorts first; stable sort
     # preserves first-occurrence order among equal-rank findings.
