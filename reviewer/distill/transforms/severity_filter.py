@@ -18,10 +18,12 @@ post-provider path). Same noise-reduction contract:
   contract).
 
 Once the rule-table → DistillConfig evolution lands, the agent's
-post-call path (``reviewer/agent.py:326-343``) collapses into this
-single pipeline step. Until then both paths coexist; this transform
-runs against the ``DistillConfig.severity_floor`` field while the
-agent's path runs against the legacy ``severity_floor`` skill arg.
+post-call severity-floor application path — which uses
+``reviewer.agent._filter_findings_by_floor`` before writing the
+final result — collapses into this single pipeline step. Until
+then both paths coexist; this transform runs against the
+``DistillConfig.severity_floor`` field while the agent's path
+runs against the legacy ``severity_floor`` skill arg.
 """
 
 from __future__ import annotations
