@@ -345,18 +345,31 @@ def _merge_usage_events(
     events: list[UsageEvent],
     base_request_id: str,
 ) -> UsageEvent:
-    """Sum cost-bearing fields, ``max`` wall-clock, preserve identity.
+    """Merge the available usage events for a consensus request.
 
-    Caller guarantees ``events`` is non-empty (we error out before
-    consolidation if any run errored, so the surviving runs each
-    carry a usage event under the current provider implementations).
-    Token / cost fields sum across runs (true compute spend);
-    ``duration_ms`` is the max of the per-run durations (concurrent
-    wall-clock, not serial). Identity fields (``backend``, ``model``,
-    ``repo``, ``pr_number``, ``timestamp``, ``disposition``) take the
-    first run's value — they're invariant across runs in the typical
-    case, and the first-run pick keeps the trace anchored at the
-    earliest start time.
+    Caller guarantees ``events`` is non-empty, but the originating
+    review runs need not all have succeeded or emitted usage. Two
+    call sites exercise this helper:
+
+    1. Success path (:func:`_consolidate_consensus_results`) — every
+       run completed successfully and contributes a usage event.
+    2. Error path (:meth:`ReviewerAgent._run_consensus`) — the
+       first errored run is surfaced, but usage from runs that
+       completed before the error is still merged so cost-accounting
+       captures real spend. The error-path caller subsequently
+       overrides ``disposition`` / ``error`` / ``error_category``
+       from the failing run on the returned ``UsageEvent`` because
+       this helper inherits those fields from the first event
+       (typically a successful run).
+
+    Token / cost fields sum across the provided usage events (true
+    compute spend for the usage we observed); ``duration_ms`` is the
+    max of the per-run durations (concurrent wall-clock, not serial).
+    Identity fields (``backend``, ``model``, ``repo``, ``pr_number``,
+    ``timestamp``, ``disposition``) take the first event's value —
+    they're invariant across runs in the typical case, and the
+    first-event pick keeps the trace anchored at the earliest start
+    time.
 
     ``request_id`` is rewritten to ``base_request_id`` (sans the
     ``-rN`` per-run suffix) so the usage record is searchable under
@@ -998,8 +1011,8 @@ class ReviewerAgent(BaseAgent):
                     # consolidation. Must be in [1, consensus_runs].
                     # 1 (default) = keep all findings (no real
                     # filtering), useful for warming up the consensus
-                    # path; majority is consensus_min = ceil(runs/2)+1
-                    # — operators decide.
+                    # path; a strict majority is
+                    # consensus_min = floor(runs/2)+1 — operators decide.
                     "consensus_min": {"type": "integer", "default": 1},
                 },
                 since="0.1.0",
@@ -1332,12 +1345,33 @@ class ReviewerAgent(BaseAgent):
             # already burned tokens. (Copilot R1 PR#37: previously
             # we returned the errored result alone and dropped the
             # other runs' usage events.)
+            #
+            # Then override the merged usage's disposition / error
+            # fields from the errored run so the persisted usage row
+            # reflects the FAILURE outcome — without this override
+            # the merged usage would silently inherit the first
+            # successful run's disposition ("posted", empty error)
+            # even though the returned ReviewResult is errored, and
+            # failure-rate analytics would undercount.
+            # (Copilot R2 PR#37.)
             usage_events = [r.usage for r in results if r.usage is not None]
             merged_usage = (
                 _merge_usage_events(usage_events, request.request_id)
                 if usage_events
                 else None
             )
+            if merged_usage is not None and first_errored.usage is not None:
+                merged_usage.disposition = first_errored.usage.disposition
+                merged_usage.error = first_errored.usage.error
+                merged_usage.error_category = first_errored.usage.error_category
+            elif merged_usage is not None:
+                # Errored run had no usage event (some providers
+                # return None on hard transport failure). Fall back
+                # to the result-level error fields so the usage row
+                # still reflects failure.
+                merged_usage.disposition = first_errored.disposition
+                merged_usage.error = first_errored.error
+                merged_usage.error_category = first_errored.error_category
             return ReviewResult(
                 request_id=request.request_id,
                 summary=first_errored.summary,

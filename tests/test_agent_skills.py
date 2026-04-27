@@ -3116,6 +3116,96 @@ async def test_consensus_first_error_propagates_without_consolidation():
     assert out["usage"]["output_tokens"] == 120
 
 
+async def test_consensus_error_path_overrides_usage_disposition_and_error():
+    """Per Copilot R2 PR#37: on the error path the merged usage row's
+    ``disposition`` / ``error`` / ``error_category`` fields must reflect
+    the FAILING run, not the first (successful) run that
+    ``_merge_usage_events`` happens to anchor identity on. Otherwise
+    failure-rate analytics undercount because the persisted usage row
+    looks "posted" with empty error fields even though the result was
+    errored.
+    """
+    errored = ReviewResult(
+        request_id="run-2",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="provider blew up",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=2.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=50,
+            output_tokens=0,
+            disposition="errored",
+            error="provider blew up",
+            error_category="backend_error",
+        ),
+    )
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f]),  # run 1 ok (disposition='posted', no error)
+            errored,
+            _consensus_result([f]),  # run 3 ok
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 3, "consensus_min": 1},
+    )
+
+    # Without the override, _merge_usage_events would carry over run 1's
+    # disposition='posted' and empty error fields — broken analytics.
+    assert out["usage"]["disposition"] == "errored"
+    assert out["usage"]["error"] == "provider blew up"
+    assert out["usage"]["error_category"] == "backend_error"
+
+
+async def test_consensus_error_path_falls_back_when_errored_run_lacks_usage():
+    """Override path also handles the rare provider behavior of
+    returning an errored ReviewResult with ``usage=None`` (hard
+    transport failure that fired before any tokens were spent). The
+    merged usage row still reflects failure by falling back to the
+    result-level ``disposition`` / ``error`` / ``error_category``.
+    """
+    errored = ReviewResult(
+        request_id="run-2",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="connection refused",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=None,
+    )
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f]),  # run 1 ok — has usage
+            errored,                  # run 2 hard fail — no usage
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "consensus_runs": 2, "consensus_min": 1},
+    )
+
+    assert out["usage"]["disposition"] == "errored"
+    assert out["usage"]["error"] == "connection refused"
+    assert out["usage"]["error_category"] == "backend_error"
+
+
 async def test_consensus_min_greater_than_runs_runs_1_returns_error():
     """``consensus_runs=1, consensus_min=2`` must fail validation just
     like ``runs=2, min=3`` — the cross-check is unconditional and
