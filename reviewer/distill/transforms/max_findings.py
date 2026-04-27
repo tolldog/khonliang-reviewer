@@ -85,11 +85,19 @@ def apply_max_findings(result: ReviewResult, config: DistillConfig) -> ReviewRes
 
 def _sort_key(f: ReviewFinding) -> int:
     """Return ``-rank`` so higher severity sorts first under
-    ``sorted``. Unknown severity strings use the max-rank fallback
-    so a malformed label doesn't silently drop the finding.
+    ``sorted``. Unknown severity strings AND non-string severities
+    use the max-rank fallback so malformed provider output doesn't
+    silently drop the finding or crash the pipeline. Matches
+    ``apply_severity_filter``'s trust-boundary handling: severity
+    is a Literal type-checker contract, but the bus boundary can
+    deliver wider payloads (``None``, list, int, etc.) that the
+    type system doesn't enforce.
     """
+    severity = f.severity
+    if not isinstance(severity, str):
+        return -_UNKNOWN_SEVERITY_RANK
     try:
-        return -severity_rank(f.severity)
+        return -severity_rank(severity)
     except ValueError:
         return -_UNKNOWN_SEVERITY_RANK
 

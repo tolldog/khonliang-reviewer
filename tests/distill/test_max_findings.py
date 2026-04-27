@@ -163,3 +163,27 @@ def test_negative_cap_raises():
     result = _result(_f("nit", "a"), _f("nit", "b"), _f("nit", "c"))
     with pytest.raises(ValueError, match="max_findings"):
         apply_max_findings(result, DistillConfig(max_findings=-1))
+
+
+def test_non_string_severity_treated_as_max_rank():
+    """Severity is a Literal type-checker contract, but the bus
+    boundary can deliver wider payloads — None, list, int. The
+    sort key must not crash on those (severity_rank's dict lookup
+    would raise TypeError on an unhashable list, for example).
+    Treat any non-string severity as max-rank so the finding
+    survives the cap rather than disappearing into a crash.
+    Matches apply_severity_filter's keep-on-non-string pattern.
+    """
+    # ReviewFinding's type contract is severity: Severity (Literal),
+    # but Python doesn't enforce that at runtime. Constructing one
+    # with non-string severity simulates a corrupt provider envelope.
+    weird = ReviewFinding(severity=None, title="oddly-typed", body="b")  # type: ignore[arg-type]
+    result = _result(_f("nit", "n1"), weird, _f("concern", "c1"))
+    out = apply_max_findings(result, DistillConfig(max_findings=2))
+    titles = [f.title for f in out.findings]
+    # The non-string-severity finding sorts at max-rank alongside the
+    # concern; cap=2 keeps both, drops the nit. Stable sort preserves
+    # original order between the two max-rank survivors.
+    assert "oddly-typed" in titles
+    assert "c1" in titles
+    assert "n1" not in titles
