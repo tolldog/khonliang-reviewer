@@ -775,6 +775,42 @@ class ReviewerAgent(BaseAgent):
                 since="0.1.0",
             ),
             Skill(
+                "sign_off_trailer",
+                "Format an Agent-Reviewed-by trailer line from a "
+                "ReviewResult. Two call shapes: (a) result-only — "
+                "pass `result` (a ReviewResult dict) to format the "
+                "trailer from a review the caller already has; "
+                "(b) pass-through — pass review_text/review_diff "
+                "args (kind/content/diff/...) to run a review "
+                "internally and format the trailer in one call. "
+                "Returns {verdict, trailer_line}; the caller "
+                "stitches trailer_line into a commit message.",
+                {
+                    # Result-only path: the caller passes a
+                    # serialized ReviewResult dict here. When set,
+                    # the pass-through path is bypassed.
+                    "result": {"type": "object", "default": {}},
+                    # Pass-through path: same shape as review_text /
+                    # review_diff. The handler runs review_text
+                    # internally then formats the trailer from the
+                    # resulting ReviewResult.
+                    "kind": {"type": "string", "default": ""},
+                    "content": {"type": "string", "default": ""},
+                    "diff": {"type": "string", "default": ""},
+                    "instructions": {"type": "string", "default": ""},
+                    "context": {"type": "object", "default": {}},
+                    "backend": {"type": "string", "default": ""},
+                    "model": {"type": "string", "default": ""},
+                    "request_id": {"type": "string", "default": ""},
+                    "metadata": {"type": "object", "default": {}},
+                    "severity_floor": {"type": "string", "default": ""},
+                    # Optional formatting kwargs:
+                    "role": {"type": "string", "default": "khonliang-reviewer"},
+                    "reason": {"type": "string", "default": ""},
+                },
+                since="0.1.0",
+            ),
+            Skill(
                 "usage_summary",
                 "Aggregated token usage + estimated API cost grouped by "
                 "(backend, model). All filters optional; omit to summarize "
@@ -1203,6 +1239,74 @@ class ReviewerAgent(BaseAgent):
                 "event": event,
             },
         }
+
+    @handler("sign_off_trailer")
+    async def handle_sign_off_trailer(
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Format an ``Agent-Reviewed-by`` trailer line.
+
+        Two shapes:
+
+        - **Result-only**: ``args["result"]`` is a ReviewResult dict
+          (typically the output of a previous ``review_text`` /
+          ``review_diff`` / ``review_pr`` call). The handler skips
+          the review and formats the trailer directly. This is the
+          common case — pre-push subagents that already ran the
+          review and just need the canonical trailer string.
+
+        - **Pass-through**: when ``result`` is absent or empty,
+          forward the remaining args to ``review_text`` (with the
+          same ``content`` / ``diff`` alias the consistency FR
+          accepts) and format the trailer from the resulting
+          ReviewResult. Saves the caller a round-trip.
+
+        Returns ``{"verdict": str, "trailer_line": str}``. Errors
+        from either path surface as the standard ``{"error": ...}``
+        envelope.
+        """
+        from reviewer.skills.sign_off_trailer import build_trailer
+
+        role = str(args.get("role") or "khonliang-reviewer")
+        reason = str(args.get("reason") or "")
+
+        # Result-only path: caller already ran the review.
+        result_dict = args.get("result")
+        if isinstance(result_dict, dict) and result_dict:
+            try:
+                result = ReviewResult.from_dict(result_dict)
+            except (TypeError, ValueError, KeyError) as exc:
+                return {"error": f"sign_off_trailer: malformed result: {exc}"}
+            return build_trailer(result, role=role, reason=reason)
+
+        # Pass-through path: run review_text first, then format.
+        # Strip the trailer-only fields so they don't leak into the
+        # review-call arg envelope (they'd be ignored, but the
+        # bus-boundary validator could complain about unknown keys).
+        review_args = {
+            k: v for k, v in args.items() if k not in {"result", "role", "reason"}
+        }
+        # review_text / review_diff need a ``kind`` and a payload.
+        # Default kind to ``pr_diff`` when the caller passed only a
+        # diff-shaped payload — same defaulting review_diff already
+        # does for its own callers.
+        if not review_args.get("kind"):
+            review_args["kind"] = "pr_diff"
+        review_outcome = await self.handle_review_text(review_args)
+        # ReviewResult.to_dict() always includes an ``error`` field
+        # (default empty); a truthy check distinguishes the actual
+        # error envelope (``{"error": "..."}``) from a normal review
+        # result that happens to carry the field empty. If the
+        # review surfaces a real error, the outcome lacks the rest
+        # of the ReviewResult shape — forward verbatim so the caller
+        # sees the same envelope review_text would have returned.
+        if review_outcome.get("error") and "request_id" not in review_outcome:
+            return review_outcome
+        try:
+            result = ReviewResult.from_dict(review_outcome)
+        except (TypeError, ValueError, KeyError) as exc:
+            return {"error": f"sign_off_trailer: malformed review result: {exc}"}
+        return build_trailer(result, role=role, reason=reason)
 
     @handler("usage_summary")
     async def handle_usage_summary(self, args: dict[str, Any]) -> dict[str, Any]:
