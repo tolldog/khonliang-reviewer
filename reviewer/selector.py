@@ -33,16 +33,22 @@ class SelectorConfig:
 
     - ``default_models`` (preferred): per-backend dict of model ids,
       so each backend ships its own sensible default. Resolution
-      treats empty-string entries as **unset at the selector layer**
-      (fall through to the registry's per-provider default), not as
-      "select the empty string as the model id". The plumbing-change
-      contract in :meth:`ProviderSelector.select` step 5 explains why.
+      treats empty-string entries as **unset at the selector layer**,
+      not as "select the empty string as the model id". That unset
+      state can still fall through to the legacy ``default_model``
+      when the chosen backend matches ``default_backend``; otherwise
+      selection continues on to the empty-string sentinel that
+      tells providers to apply their own
+      ``ProviderConfig.default_model``. See
+      :meth:`ProviderSelector._resolve_default_model` for the
+      ordered branches.
     - ``default_model`` (legacy): single string treated as paired
       with ``default_backend``. Kept for backward-compat — operators
       with an existing ``config.yaml`` that only sets ``default_model``
       keep working without changes. The legacy field's value is
       consulted only when ``default_models`` does not carry a
-      non-empty entry for the chosen backend.
+      non-empty entry for the chosen backend AND that chosen backend
+      matches ``default_backend``.
 
     See ``specs/MS-D/spec.md`` for the design context.
     """
