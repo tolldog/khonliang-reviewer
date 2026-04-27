@@ -3,15 +3,15 @@
 Receives a :class:`khonliang_reviewer.ReviewResult` plus a
 :class:`reviewer.rules.distill.DistillConfig` and returns a possibly-
 shaped result. Transforms compose in a fixed order (dedup →
-severity_filter → body_mode → max_findings). The ``dedup``,
-``severity_filter``, and ``body_mode`` transforms ship in this
-module today (see :mod:`reviewer.distill.transforms.dedup`,
-:mod:`reviewer.distill.transforms.severity_filter`, and
-:mod:`reviewer.distill.transforms.body_mode`); ``max_findings``
-lands in a follow-up FR. The pipeline shell carries the
-``audit_corpus`` audience short-circuit, the call shape every
-transform plugs into, and an identity-preserving guarantee on the
-inert-config path.
+severity_filter → body_mode → max_findings). All four transforms
+ship in this module today (see
+:mod:`reviewer.distill.transforms.dedup`,
+:mod:`reviewer.distill.transforms.severity_filter`,
+:mod:`reviewer.distill.transforms.body_mode`, and
+:mod:`reviewer.distill.transforms.max_findings`). The pipeline
+shell carries the ``audit_corpus`` audience short-circuit, the
+call shape every transform plugs into, and an identity-preserving
+guarantee on the inert-config path.
 
 Consensus (``DistillConfig.consensus``) is *not* a transform — it
 runs at the selector layer ahead of the provider call. The
@@ -34,6 +34,7 @@ from khonliang_reviewer import ReviewResult
 
 from reviewer.distill.transforms.body_mode import apply_body_mode
 from reviewer.distill.transforms.dedup import apply_dedup
+from reviewer.distill.transforms.max_findings import apply_max_findings
 from reviewer.distill.transforms.severity_filter import apply_severity_filter
 from reviewer.rules.distill import DistillConfig
 
@@ -58,17 +59,16 @@ def run_pipeline(result: ReviewResult, config: DistillConfig) -> ReviewResult:
 
     Each transform is identity-preserving when its config slot is
     inert (``dedup="none"``, ``severity_floor="nit"``,
-    ``body_mode="full"``), so the default-config path through the
-    pipeline returns the same ``ReviewResult`` object the provider
-    produced.
+    ``body_mode="full"``, ``max_findings=None``), so the default-
+    config path through the pipeline returns the same
+    ``ReviewResult`` object the provider produced.
     """
     if config.audience == "audit_corpus":
         return result
     result = apply_dedup(result, config)
     result = apply_severity_filter(result, config)
     result = apply_body_mode(result, config)
-    # Remaining transform (max_findings) slots in here in a
-    # subsequent FR.
+    result = apply_max_findings(result, config)
     return result
 
 
