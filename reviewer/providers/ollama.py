@@ -69,6 +69,15 @@ class OllamaProviderConfig:
     api_key: str = "ollama"
     default_model: str = "qwen2.5-coder:14b"
     timeout_seconds: float = 300.0
+    #: Operator-pinned ``num_ctx`` for every Ollama review unless the
+    #: caller overrides via ``request.metadata["num_ctx"]``. ``None``
+    #: (default) falls through to the auto-bump heuristic
+    #: (:func:`_suggest_num_ctx`) so existing configs keep working
+    #: unchanged. Useful for measurement runs that want a fixed
+    #: context window so duration / token-count comparisons hold the
+    #: ``num_ctx`` axis constant; the auto-bump heuristic varies with
+    #: prompt size.
+    num_ctx: int | None = None
 
 
 class OllamaProvider(ReviewProvider):
@@ -141,14 +150,22 @@ class OllamaProvider(ReviewProvider):
         started_wall = time.time()
         started_mono = time.monotonic()
 
-        # Size ``num_ctx`` to the actual prompt length when it would
-        # overflow Ollama's 4096-token default. Without this, large
-        # diffs silently truncate at the model boundary and the model
-        # returns a near-empty response — observed as
-        # ``output_tokens=8`` with ``disposition=posted`` and zero
-        # findings on a ~500-line diff (bug_reviewer_663d0d62), which
-        # is indistinguishable from a clean approval.
-        num_ctx_override = _suggest_num_ctx(prompt)
+        # ``num_ctx`` resolution order (highest precedence wins):
+        # 1. ``request.metadata["num_ctx"]`` — caller-supplied per-call
+        #    override. Skips the auto-bump heuristic entirely; useful
+        #    for measurement runs that want to hold ``num_ctx`` constant
+        #    across calls regardless of prompt size.
+        # 2. ``self.config.num_ctx`` — operator-pinned default for
+        #    every review served by this provider instance. Mirrors
+        #    the runtime kwarg so config-file pinning is supported.
+        # 3. :func:`_suggest_num_ctx` — auto-bump based on prompt
+        #    length. Without this, large diffs silently truncate at
+        #    Ollama's 4096-token default and the model returns a
+        #    near-empty response (bug_reviewer_663d0d62), which is
+        #    indistinguishable from a clean approval.
+        # 4. ``None`` — let Ollama apply the model's documented
+        #    default. Only fires when (1)-(3) all return None.
+        num_ctx_override = _resolve_num_ctx(request, self.config, prompt)
         create_kwargs: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
@@ -321,6 +338,65 @@ _BYTES_PER_TOKEN = 3
 # 1024 tokens covers a typical structured response with several
 # medium-bodied findings.
 _RESPONSE_TOKEN_HEADROOM = 1024
+
+
+def _resolve_num_ctx(
+    request: ReviewRequest,
+    config: OllamaProviderConfig,
+    prompt: str,
+) -> int | None:
+    """Apply the documented num_ctx resolution order.
+
+    Returns ``None`` only when all three layers agree the model's
+    documented default is appropriate. The auto-bump heuristic is
+    the floor — if neither the request nor config supplies a value,
+    the prompt-length estimate kicks in and bumps to the smallest
+    ladder step that fits.
+
+    Resolution:
+
+    1. ``request.metadata["num_ctx"]`` — caller per-call override.
+    2. ``config.num_ctx`` — operator-pinned default.
+    3. :func:`_suggest_num_ctx` — auto-bump from prompt length.
+    4. ``None`` — let Ollama apply the model default.
+
+    Non-int / non-positive values at layers 1 or 2 are treated as
+    "unset" and fall through. The bus boundary can deliver any JSON
+    shape under metadata, so this is a defensive check rather than
+    an error path: a misconfigured rule never silently skips the
+    auto-bump fallback.
+    """
+    # Layer 1: caller per-call override.
+    caller_value = request.metadata.get("num_ctx")
+    caller_int = _coerce_positive_int(caller_value)
+    if caller_int is not None:
+        return caller_int
+
+    # Layer 2: operator-pinned config default.
+    config_int = _coerce_positive_int(config.num_ctx)
+    if config_int is not None:
+        return config_int
+
+    # Layer 3: auto-bump fallback (current pre-FR behavior).
+    return _suggest_num_ctx(prompt)
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    """Return ``value`` as a positive int, or ``None`` for non-int /
+    non-positive / unparseable inputs.
+
+    The bus boundary delivers ``num_ctx`` as JSON; YAML configs
+    deliver it as an int already. Both paths run through here so a
+    misconfigured payload (None, "16384", float, list) falls through
+    to the auto-bump heuristic rather than crashing the provider.
+    """
+    if isinstance(value, bool):
+        # ``bool`` is an ``int`` subclass in Python; reject explicitly
+        # so ``num_ctx=True`` doesn't silently land as 1.
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
 
 
 def _suggest_num_ctx(prompt: str) -> int | None:

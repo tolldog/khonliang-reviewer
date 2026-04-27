@@ -858,6 +858,43 @@ async def test_sign_off_trailer_caller_role_and_reason_override():
     assert "1 concern: race" not in out["trailer_line"]
 
 
+async def test_review_text_threads_num_ctx_into_request_metadata():
+    """Caller-supplied ``num_ctx`` arg lands on ``ReviewRequest.metadata``.
+
+    The provider reads ``metadata['num_ctx']`` (caller layer of the 4-layer
+    resolution order) before consulting config defaults or the auto-bump
+    estimator. This test guards the agent-side wiring; provider-side
+    resolution is covered in :mod:`tests.providers.test_ollama`.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "num_ctx": 16384},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("num_ctx") == 16384
+
+
+async def test_review_text_zero_num_ctx_omitted_from_metadata():
+    """``num_ctx=0`` is the schema default (absence sentinel); the handler
+    must NOT forward it. Otherwise a default-valued arg would override
+    config defaults / auto-bump in the provider.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "num_ctx": 0},
+    )
+
+    assert fake.last_request is not None
+    assert "num_ctx" not in fake.last_request.metadata
+
+
 async def test_review_text_empty_content_falls_through_to_diff():
     """Edge case: ``content=""`` (explicitly empty) falls through to
     the ``diff`` alias rather than failing immediately. Subagents

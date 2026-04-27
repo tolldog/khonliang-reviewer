@@ -476,6 +476,162 @@ def test_suggest_num_ctx_caps_at_largest_ladder_step():
     assert _suggest_num_ctx("x" * 1_000_000) == 131072
 
 
+# ---------------------------------------------------------------------------
+# num_ctx resolution order (fr_reviewer_2c751c3b)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_num_ctx_caller_metadata_wins_over_auto_bump():
+    """A caller-supplied ``request.metadata['num_ctx']`` skips the
+    auto-bump heuristic entirely. Useful for measurement runs that
+    want to hold ``num_ctx`` constant across calls regardless of
+    prompt size.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x" * 200_000,  # would auto-bump high
+        metadata={"num_ctx": 16384},  # caller pin
+        request_id="req-test",
+    )
+    cfg = OllamaProviderConfig()  # config-level default unset
+
+    assert _resolve_num_ctx(request, cfg, "x" * 200_000) == 16384
+
+
+def test_resolve_num_ctx_caller_wins_over_config():
+    """When both caller metadata AND config carry a value, the caller
+    wins — per-call override is the highest-precedence layer.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x" * 1000,
+        metadata={"num_ctx": 16384},
+        request_id="req-test",
+    )
+    cfg = OllamaProviderConfig(num_ctx=8192)
+
+    assert _resolve_num_ctx(request, cfg, "x" * 1000) == 16384
+
+
+def test_resolve_num_ctx_config_default_used_when_no_caller_override():
+    """Operator-pinned ``OllamaProviderConfig.num_ctx`` is the
+    second-precedence layer — used when caller metadata is absent.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x" * 1000,
+        metadata={},
+        request_id="req-test",
+    )
+    cfg = OllamaProviderConfig(num_ctx=32768)
+
+    assert _resolve_num_ctx(request, cfg, "x" * 1000) == 32768
+
+
+def test_resolve_num_ctx_falls_through_to_auto_bump():
+    """When neither caller nor config supplies a value, the auto-
+    bump heuristic kicks in — preserves the existing PR#20 behavior
+    so a default config matches the pre-FR contract.
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    big_prompt = "x" * 30_000
+    request = ReviewRequest(
+        kind="pr_diff", content=big_prompt, metadata={}, request_id="req-test"
+    )
+    cfg = OllamaProviderConfig()  # default num_ctx=None
+
+    # 30000/3 + 1024 = 11024 → first ladder step is 16384.
+    assert _resolve_num_ctx(request, cfg, big_prompt) == 16384
+
+
+def test_resolve_num_ctx_falls_through_for_small_prompt():
+    """Inert config + small prompt → ``None`` (Ollama applies the
+    model default).
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    request = ReviewRequest(kind="pr_diff", content="hi", metadata={}, request_id="req-test")
+    cfg = OllamaProviderConfig()
+
+    assert _resolve_num_ctx(request, cfg, "hi") is None
+
+
+def test_resolve_num_ctx_ignores_invalid_caller_value():
+    """Bus boundary may deliver ``num_ctx`` as None / string / float /
+    bool / negative / zero. Each falls through to the next layer
+    rather than crashing the provider — same defensive convention
+    used elsewhere (severity_filter, sign_off_trailer's
+    _coerce_segment).
+    """
+    from khonliang_reviewer import ReviewRequest
+
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_num_ctx
+
+    cfg = OllamaProviderConfig(num_ctx=8192)
+    big = "x" * 1000  # small enough that auto-bump returns None
+
+    for bad_value in (None, "16384", 16384.5, True, -100, 0):
+        request = ReviewRequest(
+            kind="pr_diff",
+            content=big,
+            metadata={"num_ctx": bad_value},
+            request_id="req-test",
+        )
+        # Falls through to config layer (8192).
+        assert _resolve_num_ctx(request, cfg, big) == 8192
+
+
+async def test_caller_num_ctx_threads_to_extra_body():
+    """End-to-end through the provider: a caller-supplied num_ctx
+    in request.metadata lands on the Ollama HTTP request as
+    ``extra_body.options.num_ctx``. The wire-level contract.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    provider = OllamaProvider(client=client)
+    request = _make_request(metadata={"num_ctx": 16384})
+
+    await provider.review(request)
+
+    captured = client._create.last_call
+    assert captured is not None
+    assert captured.get("extra_body") == {"options": {"num_ctx": 16384}}
+
+
+async def test_config_num_ctx_threads_to_extra_body_when_no_caller_override():
+    """Operator-pinned ``OllamaProviderConfig.num_ctx`` lands on
+    the Ollama HTTP request as ``extra_body.options.num_ctx`` when
+    the caller doesn't supply one.
+    """
+    client = _make_client(response=SUCCESS_RESPONSE)
+    provider = OllamaProvider(OllamaProviderConfig(num_ctx=8192), client=client)
+    # Caller metadata has no num_ctx; small prompt so auto-bump
+    # would otherwise return None.
+    request = _make_request(metadata={"repo": "tolldog/example"})
+
+    await provider.review(request)
+
+    captured = client._create.last_call
+    assert captured is not None
+    assert captured.get("extra_body") == {"options": {"num_ctx": 8192}}
+
+
 def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
     """Ceiling division must push borderline prompts over the override
     threshold rather than rounding down and silently truncating.
