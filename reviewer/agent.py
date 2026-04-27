@@ -559,6 +559,27 @@ def _estimate_diff_size(content: str, kind: str) -> tuple[int, int]:
     return line_count, file_count
 
 
+def _coerce_default_models(val: Any) -> dict[str, str]:
+    """Coerce ``config['default_models']`` to a ``dict[str, str]``.
+
+    The bus boundary may deliver any YAML-shape (None, list, int,
+    nested dict) under that key; the selector contract is a flat
+    ``backend -> model`` mapping. Non-dict inputs collapse to an
+    empty dict so a misconfigured ``config.yaml`` falls through to
+    the legacy ``default_model`` path rather than crashing the
+    selector. Non-string keys / values are skipped silently — same
+    "treat malformed as absent" pattern used elsewhere in this
+    module.
+    """
+    if not isinstance(val, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in val.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+    return out
+
+
 def _positive_float_or_none(val: Any) -> float | None:
     """Coerce ``val`` to a positive float, or None when it's falsy/invalid.
 
@@ -1388,6 +1409,7 @@ class ReviewerAgent(BaseAgent):
             SelectorConfig(
                 default_backend=str(config.get("default_provider") or "ollama"),
                 default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
+                default_models=_coerce_default_models(config.get("default_models")),
             ),
         )
 
