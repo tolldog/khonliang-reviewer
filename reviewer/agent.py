@@ -1318,17 +1318,27 @@ class ReviewerAgent(BaseAgent):
 
         First-cut behavior (the simple correct version):
 
-        - Per-run requests get a ``-r{i+1}`` suffix appended to
-          ``request_id`` so usage records remain disambiguatable in
-          the storage layer; the consolidated result keeps the base id.
-        - If ANY run errors, return that run's result verbatim and
-          skip consolidation. This is intentionally simple — partial-
-          consensus over a degraded set is a future refinement.
-        - Surviving findings preserve the canonical body from the first
-          run that produced them. No body merging — averaging text
-          would smooth features (see ``project_reviewer_distill_principle``).
-        - Usage tokens sum across runs (true compute spend);
-          ``duration_ms`` is the max (concurrent wall-clock).
+        - Per-run requests carry a ``-r{i+1}`` suffix on
+          ``request_id`` for the provider calls; the returned result
+          always uses the base request id (per-run suffixes are
+          internal plumbing only — see the merged-usage call below
+          which rewrites ``request_id`` back to the base).
+        - If ANY run errors, skip consolidation and return a new
+          ``ReviewResult`` carrying the errored run's summary,
+          disposition, error metadata, backend, and model, with
+          ``findings=[]`` and usage merged across all completed runs
+          (with disposition / error fields overridden from the
+          failing run so failure analytics stay accurate). This is
+          intentionally simple — partial-consensus over a degraded
+          set is a future refinement.
+        - Surviving findings preserve the canonical body from the
+          first run that produced them. No body merging — averaging
+          text would smooth features (see
+          ``project_reviewer_distill_principle``).
+        - Usage is recorded as a single merged event on the base
+          ``request_id``; token counts sum across runs (true compute
+          spend) and ``duration_ms`` is the max (concurrent
+          wall-clock).
         """
         per_run_requests = [
             dataclass_replace(request, request_id=f"{request.request_id}-r{i + 1}")
