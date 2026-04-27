@@ -1280,16 +1280,16 @@ class ReviewerAgent(BaseAgent):
             return build_trailer(result, role=role, reason=reason)
 
         # Pass-through path: run review_text first, then format.
-        # Strip the trailer-only fields so they don't leak into the
-        # review-call arg envelope (they'd be ignored, but the
-        # bus-boundary validator could complain about unknown keys).
+        # Strip the trailer-only fields so the review-call arg
+        # envelope only carries what handle_review_text expects.
         review_args = {
             k: v for k, v in args.items() if k not in {"result", "role", "reason"}
         }
-        # review_text / review_diff need a ``kind`` and a payload.
-        # Default kind to ``pr_diff`` when the caller passed only a
-        # diff-shaped payload — same defaulting review_diff already
-        # does for its own callers.
+        # Default ``kind`` to ``pr_diff`` when the caller didn't
+        # supply one. The canonical pre-push sign-off use case is
+        # trailer formatting against a diff, so this default keeps
+        # the common shape minimal — a freeform-text caller who
+        # wants ``kind="spec"`` (etc.) still passes it explicitly.
         if not review_args.get("kind"):
             review_args["kind"] = "pr_diff"
         review_outcome = await self.handle_review_text(review_args)

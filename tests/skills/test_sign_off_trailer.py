@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 
-from khonliang_reviewer import ReviewFinding, ReviewResult
+from khonliang_reviewer import ReviewFinding, ReviewResult, UsageEvent
 
 from reviewer.skills.sign_off_trailer import (
     build_trailer,
@@ -34,7 +34,19 @@ def _result(
     backend: str = "ollama",
     model: str = "qwen2.5-coder:14b",
     error_category: str = "",
+    findings_filtered_count: int = 0,
 ) -> ReviewResult:
+    usage = None
+    if findings_filtered_count:
+        usage = UsageEvent(
+            timestamp=0.0,
+            backend=backend,
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=0,
+            findings_filtered_count=findings_filtered_count,
+        )
     return ReviewResult(
         request_id="req-test",
         summary="ok",
@@ -42,6 +54,7 @@ def _result(
         backend=backend,
         model=model,
         error_category=error_category,  # type: ignore[arg-type]
+        usage=usage,
     )
 
 
@@ -203,6 +216,71 @@ def test_missing_backend_or_model_uses_placeholders():
     out = build_trailer(r)
     assert "unknown-backend" in out["trailer_line"]
     assert "unknown-model" in out["trailer_line"]
+
+
+def test_concerns_anchor_skips_leading_nits_and_comments():
+    """Anchor selection must point at the first finding that
+    actually triggered the concerns verdict — a concern-severity
+    or unknown-severity row — skipping leading nits/comments. A
+    naive ``findings[0]`` fallback would mis-anchor the trailer
+    at a low-severity row when the concern is later in the list.
+    """
+    weird = ReviewFinding(severity="bogus", title="malformed-row", body="b")  # type: ignore[arg-type]
+    r = _result(
+        findings=[
+            ReviewFinding(severity="nit", title="leading-nit", body="b"),  # type: ignore[arg-type]
+            ReviewFinding(severity="comment", title="leading-comment", body="b"),  # type: ignore[arg-type]
+            weird,
+        ]
+    )
+    out = build_trailer(r)
+    assert out["verdict"] == "concerns-raised"
+    # Anchor names the malformed row, not "leading-nit" / "leading-comment".
+    assert "malformed-row" in out["trailer_line"]
+    assert "leading-nit" not in out["trailer_line"]
+    assert "leading-comment" not in out["trailer_line"]
+
+
+def test_filtered_count_appended_to_approved_with_findings_reason():
+    """Per the MS-D spec/acceptance, the trailer should reflect
+    severity_filter activity. When ``findings_filtered_count`` > 0
+    on the result's UsageEvent, the auto-reason appends a "+ N
+    filtered" segment so subagents see the floor was applied.
+    """
+    r = _result(
+        findings=[ReviewFinding(severity="nit", title="t", body="b")],  # type: ignore[arg-type]
+        findings_filtered_count=3,
+    )
+    out = build_trailer(r)
+    assert out["verdict"] == "approved-with-findings"
+    assert "1 nit" in out["trailer_line"]
+    assert "3 filtered" in out["trailer_line"]
+
+
+def test_filtered_count_surfaces_on_approved_too():
+    """When all findings were filtered out (zero surviving) the
+    verdict is approved, but the trailer still records the
+    filtered count so subagents see that severity_filter shaped
+    the payload — otherwise the trailer would claim 'approved'
+    against findings that had been silently dropped.
+    """
+    r = _result(findings=[], findings_filtered_count=4)
+    out = build_trailer(r)
+    assert out["verdict"] == "approved"
+    assert "4 filtered" in out["trailer_line"]
+
+
+def test_filtered_count_zero_omits_segment():
+    """When no filtering happened, the auto-reason doesn't append
+    a "0 filtered" noise segment. The reason matches the surviving
+    histogram exactly.
+    """
+    r = _result(
+        findings=[ReviewFinding(severity="comment", title="t", body="b")],  # type: ignore[arg-type]
+        findings_filtered_count=0,
+    )
+    out = build_trailer(r)
+    assert "filtered" not in out["trailer_line"]
 
 
 def test_trailer_parses_via_git_trailer_regex():
