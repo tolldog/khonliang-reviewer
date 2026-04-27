@@ -779,6 +779,16 @@ class ReviewerAgent(BaseAgent):
                     # measurement runs that hold the axis constant).
                     # Other backends ignore this field.
                     "num_ctx": {"type": "integer", "default": 0},
+                    # format: per-call Ollama structured-output toggle.
+                    # "" / unset = no skill-arg override; provider
+                    # falls through to its config default. "json" =
+                    # enforce JSON-formatted output via Ollama's
+                    # native ``format`` parameter (grammar-constrained
+                    # decoding). Used by callers that route findings
+                    # through small models which otherwise produce
+                    # mixed output (per the 2026-04-22 evaluator-gate
+                    # experiment). Other backends ignore this field.
+                    "format": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -802,6 +812,7 @@ class ReviewerAgent(BaseAgent):
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
                     "num_ctx": {"type": "integer", "default": 0},
+                    "format": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -989,6 +1000,14 @@ class ReviewerAgent(BaseAgent):
         num_ctx_arg = args.get("num_ctx")
         if isinstance(num_ctx_arg, int) and not isinstance(num_ctx_arg, bool) and num_ctx_arg > 0:
             metadata["num_ctx"] = num_ctx_arg
+        # ``format`` is plumbed the same way for Ollama's native
+        # grammar-constrained decoding. Empty string = no skill-arg
+        # override; any non-empty string is forwarded verbatim and
+        # the provider's resolution order treats absence identically
+        # to "key not present". Ollama validates the value server-side.
+        format_arg = args.get("format")
+        if isinstance(format_arg, str) and format_arg:
+            metadata["format"] = format_arg
 
         # Repo-side prompt merge (FR fr_reviewer_92453047). Loaded here
         # rather than inside the provider so both Ollama and Claude-CLI
@@ -1626,6 +1645,31 @@ class ReviewerAgent(BaseAgent):
         ollama_default = str(
             ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
         )
+        # Thread per-provider knobs through to the dataclass so the
+        # config-layer rung of the resolution order ("caller →
+        # config → None" / "caller → config → auto-bump") is
+        # actually reachable from ``config.yaml``. Without this,
+        # the advertised 3-/4-layer resolution skips the operator
+        # default and goes straight from caller to None / auto-bump.
+        # Treat-malformed-as-absent: a YAML payload with a non-string
+        # ``format`` or non-positive ``num_ctx`` collapses to None
+        # rather than crashing the provider boot path; the value
+        # types are validated again inside the resolution helpers,
+        # so this is belt-and-suspenders.
+        ollama_format_raw = ollama_cfg.get("format")
+        ollama_format = (
+            ollama_format_raw
+            if isinstance(ollama_format_raw, str) and ollama_format_raw
+            else None
+        )
+        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
+        ollama_num_ctx = (
+            ollama_num_ctx_raw
+            if isinstance(ollama_num_ctx_raw, int)
+            and not isinstance(ollama_num_ctx_raw, bool)
+            and ollama_num_ctx_raw > 0
+            else None
+        )
         registry.register(
             OllamaProvider(
                 OllamaProviderConfig(
@@ -1634,6 +1678,8 @@ class ReviewerAgent(BaseAgent):
                         or "http://localhost:11434/v1"
                     ),
                     default_model=ollama_default,
+                    num_ctx=ollama_num_ctx,
+                    format=ollama_format,
                 )
             ),
             default_model=ollama_default,

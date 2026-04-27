@@ -895,6 +895,43 @@ async def test_review_text_zero_num_ctx_omitted_from_metadata():
     assert "num_ctx" not in fake.last_request.metadata
 
 
+async def test_review_text_threads_format_into_request_metadata():
+    """Caller-supplied ``format`` arg lands on ``ReviewRequest.metadata``.
+
+    The provider reads ``metadata['format']`` (caller layer of the
+    resolution order) before consulting config defaults. This test
+    guards the agent-side wiring; provider-side resolution is covered
+    in :mod:`tests.providers.test_ollama`.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "format": "json"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("format") == "json"
+
+
+async def test_review_text_empty_format_omitted_from_metadata():
+    """``format=""`` is the schema default (absence sentinel); the
+    handler must NOT forward it. Otherwise a default-valued arg would
+    override config defaults in the provider.
+    """
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "format": ""},
+    )
+
+    assert fake.last_request is not None
+    assert "format" not in fake.last_request.metadata
+
+
 async def test_review_text_empty_content_falls_through_to_diff():
     """Edge case: ``content=""`` (explicitly empty) falls through to
     the ``diff`` alias rather than failing immediately. Subagents
@@ -1389,6 +1426,100 @@ def test_ollama_default_model_honors_per_provider_config(tmp_path):
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
     assert ollama_provider.config.default_model == "glm-4.7-flash"
+
+
+def test_ollama_format_threads_from_config_yaml_to_provider(tmp_path):
+    """Operator sets ``providers.ollama.format: json`` in config.yaml →
+    it must land on ``OllamaProviderConfig.format`` so the resolution
+    order's config rung is actually reachable end-to-end. Without this
+    threading the advertised "caller → config → None" fall-through
+    skips the operator default, which Copilot R1 on PR #36 flagged.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    format: json\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.format == "json"
+
+
+def test_ollama_num_ctx_threads_from_config_yaml_to_provider(tmp_path):
+    """Same end-to-end guard for ``num_ctx`` — the previous PR added
+    the dataclass field but the agent loader didn't actually pass it
+    through, so the config-layer rung of the num_ctx resolution order
+    was unreachable from ``config.yaml`` until this fix.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    num_ctx: 16384\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.num_ctx == 16384
+
+
+def test_ollama_format_absent_in_config_falls_back_to_none(tmp_path):
+    """When config.yaml omits ``providers.ollama.format`` entirely the
+    dataclass field stays ``None`` — the unconstrained default. Pre-FR
+    behavior preserved for deployments that don't opt in.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    base_url: http://example:11434/v1\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.format is None
+    assert ollama_provider.config.num_ctx is None
+
+
+def test_ollama_malformed_config_values_collapse_to_none(tmp_path):
+    """Belt-and-suspenders: a YAML payload with non-string ``format``
+    (e.g. an int dropped in by mistake) or non-positive ``num_ctx``
+    must not crash the registry boot path. The loader collapses
+    malformed values to ``None`` so the provider's own resolution
+    helper applies the fall-through behavior. Provider-side tests
+    already cover the layered resolution; this test pins the
+    boot-time tolerance.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    format: 42\n"
+        "    num_ctx: -1\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.format is None
+    assert ollama_provider.config.num_ctx is None
 
 
 def test_selector_does_not_apply_default_model_to_non_default_backend():

@@ -78,6 +78,19 @@ class OllamaProviderConfig:
     #: ``num_ctx`` axis constant; the auto-bump heuristic varies with
     #: prompt size.
     num_ctx: int | None = None
+    #: Native Ollama ``format`` parameter (e.g. ``"json"``). When set,
+    #: forwarded via ``extra_body`` to ``/v1/chat/completions`` and
+    #: mapped to grammar-constrained decoding on the server. Use to
+    #: force structured output from small models that otherwise produce
+    #: free-form text — see the 2026-04-22 evaluator-gate experiment
+    #: where ``llama3.2:3b`` failed to produce parseable JSON in
+    #: every prompt configuration tested. Caller can override per-call
+    #: via ``request.metadata["format"]``. ``None`` (default) =
+    #: unconstrained; the OpenAI-compat ``response_format`` kwarg
+    #: already on every call is silently ignored by Ollama for
+    #: non-cloud deployments, so this is the only knob that actually
+    #: bites.
+    format: str | None = None
 
 
 class OllamaProvider(ReviewProvider):
@@ -166,20 +179,26 @@ class OllamaProvider(ReviewProvider):
         # 4. ``None`` — let Ollama apply the model's documented
         #    default. Only fires when (1)-(3) all return None.
         num_ctx_override = _resolve_num_ctx(request, self.config, prompt)
+        format_override = _resolve_format(request, self.config)
         create_kwargs: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
             "timeout": self.config.timeout_seconds,
         }
+        # Ollama's OpenAI-compatible endpoint accepts native Ollama
+        # parameters via ``extra_body`` — ``options.num_ctx`` for the
+        # context window and top-level ``format`` for grammar-
+        # constrained decoding. The ``openai`` SDK forwards
+        # ``extra_body`` verbatim so this works without depending on
+        # a future schema-flag in the OpenAI types.
+        extra_body: dict[str, Any] = {}
         if num_ctx_override is not None:
-            # Ollama's OpenAI-compatible endpoint accepts native Ollama
-            # options under ``options.num_ctx``. The ``openai`` SDK
-            # forwards ``extra_body`` verbatim so this works without
-            # depending on a future schema-flag for context window.
-            create_kwargs["extra_body"] = {
-                "options": {"num_ctx": num_ctx_override}
-            }
+            extra_body["options"] = {"num_ctx": num_ctx_override}
+        if format_override is not None:
+            extra_body["format"] = format_override
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
 
         try:
             response = await self._client.chat.completions.create(**create_kwargs)
@@ -395,6 +414,52 @@ def _coerce_positive_int(value: Any) -> int | None:
         # so ``num_ctx=True`` doesn't silently land as 1.
         return None
     if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def _resolve_format(
+    request: ReviewRequest,
+    config: OllamaProviderConfig,
+) -> str | None:
+    """Apply the documented ``format`` resolution order.
+
+    Resolution:
+
+    1. ``request.metadata["format"]`` — caller per-call override.
+    2. ``config.format`` — operator-pinned default.
+    3. ``None`` — unconstrained; the model is free to return any text.
+
+    Non-string / empty values at layers 1 or 2 are treated as "unset"
+    and fall through. Mirrors :func:`_resolve_num_ctx` so a malformed
+    bus payload (``format=42``, ``format=""``, ``format=True``) lands
+    silently as the default rather than crashing the provider.
+
+    No enum restriction here — Ollama accepts ``"json"`` today and
+    may add schema-constrained variants tomorrow. Whatever the caller
+    sends is forwarded verbatim; Ollama returns an error if the value
+    is unsupported and that error reaches the caller via the existing
+    :class:`openai.APIError` handler.
+    """
+    caller_value = request.metadata.get("format")
+    caller_str = _coerce_format_value(caller_value)
+    if caller_str is not None:
+        return caller_str
+    config_str = _coerce_format_value(config.format)
+    if config_str is not None:
+        return config_str
+    return None
+
+
+def _coerce_format_value(value: Any) -> str | None:
+    """Return ``value`` as a non-empty string, or ``None`` otherwise.
+
+    The bus boundary delivers ``format`` as JSON; YAML configs deliver
+    it as a string already. Both paths run through here so a
+    misconfigured payload (None, int, bool, list, empty string) falls
+    through to the next resolution layer rather than crashing.
+    """
+    if isinstance(value, str) and value:
         return value
     return None
 
