@@ -402,10 +402,9 @@ def test_slash_in_model_id_sanitized():
     """
     r = _result(model="kimi-k2/5/cloud")
     out = build_trailer(r)
-    # Trailer still has exactly three "/" — between role+backend
-    # and backend+model. (No spurious extras from the model id.)
-    # The trailer line is "Agent-Reviewed-by: <role>/<backend>/<model>..."
-    # so we expect 2 "/" in the role/backend/model triple.
+    # Trailer still has exactly two "/" in the role/backend/model
+    # triple — between role+backend and backend+model. (No
+    # spurious extras from the model id.)
     after_key = out["trailer_line"].split(": ", 1)[1]
     triple = after_key.split(" ", 1)[0]
     assert triple.count("/") == 2
@@ -422,6 +421,30 @@ def test_backslash_in_segment_sanitized():
     out = build_trailer(r)
     assert "\\" not in out["trailer_line"]
     assert "weird-model-id" in out["trailer_line"]
+
+
+def test_non_string_backend_or_model_falls_back_to_placeholder():
+    """ReviewResult fields are typed ``str`` but the bus boundary
+    can deliver any JSON shape (None, int, dict, list). Passing a
+    non-string straight into the sanitizer would crash on
+    ``.split()``. The coercion layer falls back to the
+    ``unknown-*`` placeholder so the trailer's three-segment
+    shape stays intact while signaling the malformed input.
+    """
+    # Build a ReviewResult and bash non-string values onto the
+    # str-typed fields (Python doesn't enforce the type at runtime).
+    r = ReviewResult(request_id="req-test", summary="ok")
+    r.backend = None  # type: ignore[assignment]
+    r.model = 42  # type: ignore[assignment]
+
+    out = build_trailer(r)
+    # Trailer line still has the locked three-segment shape.
+    after_key = out["trailer_line"].split(": ", 1)[1]
+    triple = after_key.split(" ", 1)[0]
+    assert triple.count("/") == 2
+    # Both malformed segments fall back to placeholder.
+    assert "unknown-backend" in triple
+    assert "unknown-model" in triple
 
 
 def test_slash_in_reason_preserved():

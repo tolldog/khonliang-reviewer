@@ -1279,11 +1279,16 @@ class ReviewerAgent(BaseAgent):
                 return {"error": f"sign_off_trailer: malformed result: {exc}"}
             try:
                 return build_trailer(result, role=role, reason=reason)
-            except ValueError as exc:
-                # build_trailer raises on errored ReviewResults so the
-                # caller doesn't ship a sign-off for a review that
-                # didn't actually run. Surface the standard error
-                # envelope.
+            except (ValueError, TypeError, AttributeError) as exc:
+                # ValueError: documented contract (e.g. errored
+                # disposition; build_trailer raises so the caller
+                # doesn't ship a sign-off for a review that didn't
+                # run).
+                # TypeError / AttributeError: defense in depth —
+                # build_trailer + the helpers coerce inputs, but a
+                # weird-shape payload at the bus boundary could
+                # still trip something. Surface the standard error
+                # envelope rather than letting the handler crash.
                 return {"error": f"sign_off_trailer: {exc}"}
 
         # Pass-through path: run review_text first, then format.
@@ -1315,12 +1320,14 @@ class ReviewerAgent(BaseAgent):
             return {"error": f"sign_off_trailer: malformed review result: {exc}"}
         try:
             return build_trailer(result, role=role, reason=reason)
-        except ValueError as exc:
-            # The review ran but disposition is "errored" (e.g.
-            # backend unreachable). Don't ship a trailer for a
-            # failed review — surface the error envelope so the
-            # caller sees the failure rather than a misleading
-            # ``approved`` sign-off built from zero findings.
+        except (ValueError, TypeError, AttributeError) as exc:
+            # ValueError: documented contract (errored disposition).
+            # TypeError / AttributeError: defense in depth against
+            # a weird-shape payload at the bus boundary.
+            # Don't ship a trailer for a failed review — surface
+            # the error envelope so the caller sees the failure
+            # rather than a misleading ``approved`` sign-off built
+            # from zero findings.
             return {"error": f"sign_off_trailer: {exc}"}
 
     @handler("usage_summary")

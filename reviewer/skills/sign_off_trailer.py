@@ -145,9 +145,17 @@ def build_trailer(
     # tests/test_benchmark_sweep.py's "kimi-k2/5/cloud" example);
     # _sanitize_path_segment normalizes those to "-" alongside the
     # newline-strip every segment gets.
-    backend = _sanitize_path_segment(result.backend or "unknown-backend")
-    model = _sanitize_path_segment(result.model or "unknown-model")
-    role = _sanitize_path_segment(role)
+    #
+    # Coerce backend/model to str via the placeholder fallback when
+    # they're non-string. ReviewResult's type contract calls them
+    # str, but a deserialized payload from the bus boundary can carry
+    # any JSON-shape — passing a non-string into _sanitize_path_segment
+    # would crash on ``.split()``. The placeholder fallback keeps the
+    # trailer line shape intact for telemetry / auditing while
+    # signaling the malformed input.
+    backend = _sanitize_path_segment(_coerce_segment(result.backend, "unknown-backend"))
+    model = _sanitize_path_segment(_coerce_segment(result.model, "unknown-model"))
+    role = _sanitize_path_segment(_coerce_segment(role, "unknown-role"))
 
     if not reason:
         reason = _auto_reason(result, verdict)
@@ -277,6 +285,22 @@ def _first_concern_or_unknown(result: ReviewResult):
         except ValueError:
             return f
     return None
+
+
+def _coerce_segment(value: Any, placeholder: str) -> str:
+    """Coerce ``value`` to a non-empty string for trailer composition.
+
+    ReviewResult fields are typed as ``str`` but the bus boundary can
+    deliver any JSON shape (None, int, dict, list). Passing a non-
+    string into the sanitizer would crash on ``.split()``; the
+    placeholder fallback keeps the trailer's three-segment shape
+    intact while signaling the malformed input. Empty strings also
+    fall back to the placeholder so the trailer never carries a
+    zero-length segment that would break tokenization.
+    """
+    if isinstance(value, str) and value:
+        return value
+    return placeholder
 
 
 def _sanitize_segment(value: str) -> str:
