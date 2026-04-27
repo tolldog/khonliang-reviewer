@@ -10,9 +10,15 @@ Three modes from ``DistillConfig.body_mode``:
   ``audience="developer_handoff"`` where the consuming agent
   only needs the headline.
 - ``compact``: strip finding bodies entirely (empty string) and
-  collapse the result's ``summary`` to a single line. Useful for
-  ``audience="github_comment"`` where the user-facing comment
-  body is the whole budget.
+  keep only the first sentence of the result's ``summary``.
+  Useful for ``audience="github_comment"`` where the user-facing
+  comment body is the whole budget. Note that "first sentence"
+  here is text-up-to-the-first-terminator — internal whitespace
+  / newlines inside that first sentence are NOT normalized; if
+  callers need a strictly-single-line summary they should
+  post-process. Whitespace-stripping was deliberately kept out
+  of this transform's scope so the original sentence's quoting
+  / formatting (e.g. inline code spans) survives intact.
 
 "First sentence" detection is a deliberately simple regex:
 non-greedy match up through the first ``.`` / ``!`` / ``?``
