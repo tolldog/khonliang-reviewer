@@ -1587,7 +1587,51 @@ class ReviewerAgent(BaseAgent):
             )
             return consensus_result
 
-        # Evaluator succeeded — its findings list is the survivor set.
+        # Evaluator succeeded — but DON'T trust eval_result.findings
+        # blindly. Per Copilot R2 PR#38: the evaluator could hallucinate
+        # a new finding (or rephrase a candidate enough that the
+        # rewritten copy bypasses the consensus gate). Survivors must
+        # be a strict subset of the candidate set, anchored by the
+        # same ``_consensus_finding_key`` consensus uses for grouping.
+        #
+        # We also return the CANDIDATE finding objects verbatim
+        # (rather than the evaluator's possibly-rewritten copies) so
+        # the prompt's "preserve fields verbatim" instruction is
+        # enforced structurally, not just by the model's compliance.
+        candidate_by_key: dict[tuple[str, str, int, str], ReviewFinding] = {
+            _consensus_finding_key(f): f for f in consensus_result.findings
+        }
+        survivors: list[ReviewFinding] = []
+        seen_keys: set[tuple[str, str, int, str]] = set()
+        hallucinated_titles: list[str] = []
+        for ev_finding in eval_result.findings:
+            key = _consensus_finding_key(ev_finding)
+            if key in seen_keys:
+                # Evaluator emitted the same key twice; the canonical
+                # candidate is already in survivors. Drop silently —
+                # idempotent under repeated emit.
+                continue
+            candidate = candidate_by_key.get(key)
+            if candidate is not None:
+                survivors.append(candidate)
+                seen_keys.add(key)
+            else:
+                # Evaluator returned a finding whose anchor doesn't
+                # match any candidate. Either a hallucination or
+                # field-rewrite that drifted past the normalized
+                # title threshold. Drop + log so operators can spot
+                # rogue evaluator behavior.
+                hallucinated_titles.append(ev_finding.title)
+
+        if hallucinated_titles:
+            logger.warning(
+                "reviewer.evaluator_hot: dropped %d evaluator finding(s) "
+                "not in candidate set (likely hallucination or "
+                "field-rewrite): %s",
+                len(hallucinated_titles),
+                hallucinated_titles[:5],
+            )
+
         # Usage merge is identity-aware (Copilot R1 PR#38): only merge
         # when consensus and evaluator share the same (backend, model);
         # otherwise the merged event would misattribute evaluator spend
@@ -1607,6 +1651,19 @@ class ReviewerAgent(BaseAgent):
                 merged_usage = _merge_usage_events(
                     [consensus_usage, evaluator_usage],
                     consensus_result.request_id,
+                )
+                # Override duration_ms specifically for this call site:
+                # _merge_usage_events takes max(durations) because
+                # consensus runs are PARALLEL (concurrent wall-clock),
+                # but consensus + evaluator are SEQUENTIAL stages —
+                # the wall-clock is the sum, not the max. (Copilot R2
+                # PR#38.)
+                merged_usage = dataclass_replace(
+                    merged_usage,
+                    duration_ms=(
+                        consensus_usage.duration_ms
+                        + evaluator_usage.duration_ms
+                    ),
                 )
             else:
                 logger.warning(
@@ -1636,7 +1693,7 @@ class ReviewerAgent(BaseAgent):
             # even when it referenced findings the evaluator just
             # dropped.)
             summary=eval_result.summary or consensus_result.summary,
-            findings=eval_result.findings,
+            findings=survivors,
             disposition=consensus_result.disposition,
             error="",
             error_category="",

@@ -3794,6 +3794,152 @@ async def test_evaluator_hot_prefers_eval_summary_when_set():
     assert out["summary"] == "evaluator kept 1 of 3"
 
 
+async def test_evaluator_hot_drops_hallucinated_findings_not_in_candidate_set(caplog):
+    """Per Copilot R2 PR#38: the evaluator's findings list MUST be a
+    strict subset of the consensus candidate set, anchored by the
+    same key consensus uses for grouping. Hallucinated findings
+    (and findings the evaluator field-rewrote past the normalized-
+    title threshold) get dropped and logged so the consensus gate
+    isn't bypassed.
+    """
+    candidate = _consensus_finding(
+        severity="concern", title="real bug", path="src/api.py", line=42
+    )
+    hallucinated = ReviewFinding(
+        severity="concern",  # type: ignore[arg-type]
+        title="completely made up issue",
+        body="evaluator invented this",
+        path="src/other.py",
+        line=99,
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([candidate]),
+            # Evaluator returns the candidate AND a hallucinated extra.
+            _evaluator_result([candidate, hallucinated]),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    import logging
+    caplog.set_level(logging.WARNING)
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    titles = [f["title"] for f in out["findings"]]
+    # Only the legitimate candidate survives. The hallucinated extra
+    # (no matching anchor in the candidate set) is dropped.
+    assert titles == ["real bug"]
+    assert any(
+        "not in candidate set" in rec.message for rec in caplog.records
+    )
+
+
+async def test_evaluator_hot_returns_canonical_candidate_objects_verbatim():
+    """Per Copilot R2 PR#38: when the evaluator returns a
+    field-rewritten copy of a candidate (e.g. body changed,
+    severity changed), we return the CANDIDATE finding verbatim
+    rather than the evaluator's rewritten copy. The "preserve fields
+    verbatim" instruction in the evaluator prompt is enforced
+    structurally — model misbehavior can't change the recorded
+    finding bytes.
+    """
+    candidate = ReviewFinding(
+        severity="concern",  # type: ignore[arg-type]
+        title="race condition",
+        body="ORIGINAL body from generator",
+        path="src/api.py",
+        line=42,
+    )
+    # Evaluator returns the same anchor (same severity + path + line +
+    # normalized title) but with a rewritten body and severity.
+    rewritten = ReviewFinding(
+        severity="concern",  # type: ignore[arg-type]
+        title="Race Condition",  # case-only difference; same normalized
+        body="REWRITTEN body — model decided to paraphrase",
+        path="src/api.py",
+        line=42,
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([candidate]), _evaluator_result([rewritten])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert len(out["findings"]) == 1
+    survivor = out["findings"][0]
+    # The body / title are the candidate's, NOT the evaluator's
+    # rewritten copy. Structural enforcement of "preserve verbatim".
+    assert survivor["body"] == "ORIGINAL body from generator"
+    assert survivor["title"] == "race condition"
+
+
+async def test_evaluator_hot_sums_duration_for_sequential_stages():
+    """Per Copilot R2 PR#38: consensus + evaluator are SEQUENTIAL
+    stages, so wall-clock duration is the SUM of both, not the max.
+    ``_merge_usage_events`` defaults to max() because it was designed
+    for parallel consensus runs; the evaluator-hot call site
+    overrides ``duration_ms`` after the merge to reflect sequential
+    semantics.
+    """
+    candidate = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result(
+                [candidate], input_tokens=100, output_tokens=50, duration_ms=1500
+            ),
+            _evaluator_result([candidate]),  # default duration_ms=0
+        ],
+    )
+    # Override the evaluator's duration_ms to a known value.
+    fake._responses[1] = ReviewResult(
+        request_id=fake._responses[1].request_id,
+        summary=fake._responses[1].summary,
+        findings=fake._responses[1].findings,
+        disposition=fake._responses[1].disposition,
+        backend=fake._responses[1].backend,
+        model=fake._responses[1].model,
+        usage=UsageEvent(
+            timestamp=2.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=80,
+            output_tokens=20,
+            duration_ms=900,
+        ),
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    # 1500 + 900 = 2400 (sum, sequential), NOT max(1500, 900) = 1500.
+    assert out["usage"]["duration_ms"] == 2400
+
+
 async def test_evaluator_hot_falls_back_to_consensus_summary_when_eval_summary_empty():
     """Symmetric guard for the fallback: when the evaluator returns
     an empty summary, the consensus summary is preserved verbatim
