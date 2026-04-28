@@ -1348,13 +1348,12 @@ class ReviewerAgent(BaseAgent):
         # plus a dict lookup; running it twice (here and inside
         # ``_run_evaluator_hot``) is negligible defense-in-depth.
         evaluator_hot_arg = args.get("evaluator_hot")
-        evaluator_hot_active = (
+        evaluator_hot_active = bool(
             isinstance(evaluator_hot_arg, str) and evaluator_hot_arg
         )
         if evaluator_hot_active:
             try:
-                _, _ = _parse_evaluator_spec(evaluator_hot_arg)
-                eval_backend = evaluator_hot_arg.partition(":")[0]
+                eval_backend, _ = _parse_evaluator_spec(evaluator_hot_arg)
                 if eval_backend not in self._ensure_selector().providers:
                     raise EvaluatorError(
                         f"evaluator_hot backend={eval_backend!r} is not "
