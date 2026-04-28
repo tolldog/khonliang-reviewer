@@ -1340,6 +1340,30 @@ class ReviewerAgent(BaseAgent):
             _validate_consensus(consensus_runs, consensus_min)
         except ConsensusError as exc:
             return {"error": str(exc)}
+
+        # Pre-validate ``evaluator_hot`` BEFORE the consensus / provider
+        # call so an invalid spec or unknown backend doesn't waste
+        # tokens on a review whose result is then thrown away.
+        # (Copilot R1 PR#38.) The validation is a cheap string parse
+        # plus a dict lookup; running it twice (here and inside
+        # ``_run_evaluator_hot``) is negligible defense-in-depth.
+        evaluator_hot_arg = args.get("evaluator_hot")
+        evaluator_hot_active = (
+            isinstance(evaluator_hot_arg, str) and evaluator_hot_arg
+        )
+        if evaluator_hot_active:
+            try:
+                _, _ = _parse_evaluator_spec(evaluator_hot_arg)
+                eval_backend = evaluator_hot_arg.partition(":")[0]
+                if eval_backend not in self._ensure_selector().providers:
+                    raise EvaluatorError(
+                        f"evaluator_hot backend={eval_backend!r} is not "
+                        f"registered; known backends: "
+                        f"{sorted(self._ensure_selector().providers)}"
+                    )
+            except EvaluatorError as exc:
+                return {"error": str(exc)}
+
         if consensus_runs > 1:
             result = await self._run_consensus(
                 provider, request, consensus_runs, consensus_min
@@ -1352,14 +1376,19 @@ class ReviewerAgent(BaseAgent):
         # the evaluator sees pre-floor findings so it can drop nits
         # the floor would have kept, and the floor filters the
         # evaluator-survived set so dual-filtering doesn't surprise
-        # operators. Empty string skips the whole pass.
-        evaluator_hot_arg = args.get("evaluator_hot")
-        if isinstance(evaluator_hot_arg, str) and evaluator_hot_arg:
+        # operators. The spec is already validated upfront so we
+        # don't expect EvaluatorError here, but catch defensively in
+        # case future code adds a runtime-only failure mode.
+        if evaluator_hot_active:
             try:
                 result = await self._run_evaluator_hot(
                     result, request, evaluator_hot_arg
                 )
             except EvaluatorError as exc:
+                # Defense in depth: still record consensus usage
+                # before surfacing the error so the spend isn't lost.
+                self._apply_severity_floor(result, effective_floor)
+                await self._record_usage(result)
                 return {"error": str(exc)}
 
         # Apply the severity_floor post-filter at the edge of the return
@@ -1559,20 +1588,54 @@ class ReviewerAgent(BaseAgent):
             return consensus_result
 
         # Evaluator succeeded — its findings list is the survivor set.
-        # Merge usage so cost-accounting reflects consensus + evaluator
-        # spend together.
-        usage_events = [
-            u for u in (consensus_result.usage, eval_result.usage)
-            if u is not None
-        ]
-        merged_usage = (
-            _merge_usage_events(usage_events, consensus_result.request_id)
-            if usage_events
-            else None
-        )
+        # Usage merge is identity-aware (Copilot R1 PR#38): only merge
+        # when consensus and evaluator share the same (backend, model);
+        # otherwise the merged event would misattribute evaluator spend
+        # to the consensus backend in usage_summary analytics. When
+        # identities differ, the consensus usage is kept as the
+        # canonical record and the evaluator spend is logged as a
+        # warning so operators can see the lost-attribution event;
+        # capturing both stages cleanly needs a usage-list refactor
+        # which is a follow-up FR.
+        consensus_usage = consensus_result.usage
+        evaluator_usage = eval_result.usage
+        if consensus_usage is not None and evaluator_usage is not None:
+            if (
+                consensus_usage.backend == evaluator_usage.backend
+                and consensus_usage.model == evaluator_usage.model
+            ):
+                merged_usage = _merge_usage_events(
+                    [consensus_usage, evaluator_usage],
+                    consensus_result.request_id,
+                )
+            else:
+                logger.warning(
+                    "reviewer.evaluator_hot: not merging evaluator usage into "
+                    "consensus usage because identity differs "
+                    "(consensus=%s/%s, evaluator=%s/%s); evaluator spend "
+                    "of input=%d output=%d not persisted to usage_summary",
+                    consensus_usage.backend,
+                    consensus_usage.model,
+                    evaluator_usage.backend,
+                    evaluator_usage.model,
+                    evaluator_usage.input_tokens,
+                    evaluator_usage.output_tokens,
+                )
+                merged_usage = consensus_usage
+        else:
+            merged_usage = consensus_usage or evaluator_usage
+
         return ReviewResult(
             request_id=consensus_result.request_id,
-            summary=consensus_result.summary,
+            # Prefer the evaluator's summary when non-empty: the
+            # evaluator just filtered the findings list, so its
+            # summary describes the post-filter state. Falling back
+            # to the consensus summary keeps behavior unchanged for
+            # evaluators that don't write a summary. (Copilot R1
+            # PR#38: previously the consensus summary stuck around
+            # even when it referenced findings the evaluator just
+            # dropped.)
+            summary=eval_result.summary or consensus_result.summary,
             findings=eval_result.findings,
             disposition=consensus_result.disposition,
             error="",

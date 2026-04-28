@@ -3623,6 +3623,10 @@ async def test_evaluator_hot_invalid_spec_returns_error():
     halves non-empty. ``"ollama"`` (no colon), ``":model"`` (no
     backend), ``"ollama:"`` (no model) all fail validation and
     return a structured error rather than silently skipping.
+
+    Per Copilot R1 PR#38: validation runs BEFORE the consensus /
+    provider call so an invalid spec doesn't waste tokens on a
+    review whose result is then thrown away.
     """
     f = _consensus_finding()
     fake = _ScriptedProvider("ollama", [_consensus_result([f])])
@@ -3641,6 +3645,11 @@ async def test_evaluator_hot_invalid_spec_returns_error():
         )
         assert "error" in out, f"bad_spec={bad_spec!r} should return error"
         assert "evaluator_hot" in out["error"]
+        # Pre-validation skips the consensus / provider call entirely
+        # for invalid specs — caller bug shouldn't burn local tokens.
+        assert fake.requests == [], (
+            f"bad_spec={bad_spec!r} fired the provider call before validating"
+        )
 
 
 async def test_evaluator_hot_unknown_backend_returns_error():
@@ -3648,6 +3657,10 @@ async def test_evaluator_hot_unknown_backend_returns_error():
     error, no silent fall-through. The evaluator-tier promise is
     "the named provider runs"; if the named provider doesn't exist,
     the caller needs to know.
+
+    Per Copilot R1 PR#38: backend-registration check runs BEFORE
+    the consensus / provider call so a bad backend name doesn't
+    burn tokens on a review whose result is then thrown away.
     """
     f = _consensus_finding()
     fake = _ScriptedProvider("ollama", [_consensus_result([f])])
@@ -3665,6 +3678,164 @@ async def test_evaluator_hot_unknown_backend_returns_error():
     assert "error" in out
     assert "nonexistent_backend" in out["error"]
     assert "not registered" in out["error"]
+    # Pre-validation: unknown backend skips the consensus / provider
+    # call entirely.
+    assert fake.requests == []
+
+
+async def test_evaluator_hot_skips_usage_merge_when_backend_differs(caplog):
+    """Per Copilot R1 PR#38: when consensus and evaluator run on
+    different (backend, model) identities, the evaluator's usage is
+    NOT merged into the consensus usage — that would misattribute
+    the evaluator spend to the consensus backend in the
+    ``usage_summary`` aggregator. The consensus usage stays canonical;
+    the lost evaluator attribution is logged as a warning.
+
+    This case fires for cross-vendor evaluators (e.g. consensus on
+    Ollama, escalation on claude_cli). Capturing both stages cleanly
+    needs a usage-list refactor — follow-up FR.
+    """
+    consensus_result = _consensus_result(
+        [_consensus_finding()], input_tokens=100, output_tokens=50
+    )
+    # Force evaluator's usage to a DIFFERENT identity by overwriting
+    # backend/model on the scripted result + its nested UsageEvent.
+    eval_result = _evaluator_result([_consensus_finding()])
+    eval_result = ReviewResult(
+        request_id=eval_result.request_id,
+        summary=eval_result.summary,
+        findings=eval_result.findings,
+        disposition=eval_result.disposition,
+        backend="claude_cli",
+        model="claude-opus-4-7",
+        usage=UsageEvent(
+            timestamp=2.0,
+            backend="claude_cli",
+            model="claude-opus-4-7",
+            input_tokens=80,
+            output_tokens=20,
+        ),
+    )
+
+    consensus_provider = _ScriptedProvider("ollama", [consensus_result])
+    evaluator_provider = _ScriptedProvider("claude_cli", [eval_result])
+    harness = _make_harness(
+        {"ollama": consensus_provider, "claude_cli": evaluator_provider}
+    )
+
+    import logging
+    caplog.set_level(logging.WARNING)
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "claude_cli:claude-opus-4-7",
+        },
+    )
+
+    # Consensus-only usage attribution — evaluator's 80/20 not merged.
+    assert out["usage"]["input_tokens"] == 100
+    assert out["usage"]["output_tokens"] == 50
+    assert out["usage"]["backend"] == "ollama"
+    # Warning recorded so operators can see the lost-attribution event.
+    assert any(
+        "not merging evaluator usage" in rec.message
+        for rec in caplog.records
+    )
+
+
+async def test_evaluator_hot_prefers_eval_summary_when_set():
+    """Per Copilot R1 PR#38: when the evaluator returns a non-empty
+    summary, prefer it over the consensus summary — the evaluator
+    just filtered the findings list, so its summary reflects the
+    post-filter state. Falling back to the consensus summary keeps
+    behavior unchanged for evaluators that don't write one.
+
+    Without this, the returned summary could reference findings the
+    evaluator dropped, leaving the result internally inconsistent.
+    """
+    f = _consensus_finding(title="real concern")
+    consensus_result = ReviewResult(
+        request_id="consensus-id",
+        summary="3 findings flagged in src/api.py",
+        findings=[f],
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=1.0, backend="ollama", model="qwen2.5-coder:14b",
+            input_tokens=100, output_tokens=50,
+        ),
+    )
+    eval_with_summary = ReviewResult(
+        request_id="eval-id",
+        summary="evaluator kept 1 of 3",  # non-empty → wins
+        findings=[f],
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=2.0, backend="ollama", model="qwen2.5-coder:14b",
+            input_tokens=80, output_tokens=20,
+        ),
+    )
+
+    fake = _ScriptedProvider("ollama", [consensus_result, eval_with_summary])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert out["summary"] == "evaluator kept 1 of 3"
+
+
+async def test_evaluator_hot_falls_back_to_consensus_summary_when_eval_summary_empty():
+    """Symmetric guard for the fallback: when the evaluator returns
+    an empty summary, the consensus summary is preserved verbatim
+    rather than blanking the field.
+    """
+    f = _consensus_finding(title="real concern")
+    consensus_result = ReviewResult(
+        request_id="consensus-id",
+        summary="canonical consensus summary",
+        findings=[f],
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=1.0, backend="ollama", model="qwen2.5-coder:14b",
+            input_tokens=100, output_tokens=50,
+        ),
+    )
+    eval_no_summary = ReviewResult(
+        request_id="eval-id",
+        summary="",  # evaluator left it blank
+        findings=[f],
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=2.0, backend="ollama", model="qwen2.5-coder:14b",
+            input_tokens=80, output_tokens=20,
+        ),
+    )
+
+    fake = _ScriptedProvider("ollama", [consensus_result, eval_no_summary])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert out["summary"] == "canonical consensus summary"
 
 
 async def test_evaluator_hot_merges_usage_across_consensus_and_evaluator():
