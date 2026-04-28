@@ -224,10 +224,13 @@ def _parse_evaluator_spec(spec: str) -> tuple[str, str]:
     so callers can correct it.
     """
     head, _, tail = spec.partition(":")
+    head = head.strip()
+    tail = tail.strip()
     if not head or not tail:
         raise EvaluatorError(
             f"evaluator_hot={spec!r} must be of the form "
-            f"'<backend>:<model>' with both halves non-empty"
+            f"'<backend>:<model>' with both halves non-empty "
+            f"(after whitespace trimming)"
         )
     return head, tail
 
@@ -1536,8 +1539,13 @@ class ReviewerAgent(BaseAgent):
             )
         evaluator_provider = selector.providers[backend]
 
+        # Compact JSON (no indent / minimal separators) — the
+        # evaluator reads this as opaque data, not for humans.
+        # Indent=2 was costing ~30% extra tokens per candidate
+        # finding for zero benefit. (Copilot R4 PR#38.)
         findings_json = json.dumps(
-            [f.to_dict() for f in consensus_result.findings], indent=2
+            [f.to_dict() for f in consensus_result.findings],
+            separators=(",", ":"),
         )
         evaluator_instructions = (
             "You are evaluating findings from a previous reviewer pass on the "
@@ -1584,6 +1592,43 @@ class ReviewerAgent(BaseAgent):
                 eval_result.error,
                 len(consensus_result.findings),
             )
+            # The evaluator call already spent tokens before
+            # erroring (parse failure on a real LLM response, not
+            # a free no-op). Merge usage when identities match so
+            # the persisted usage row reflects total compute spend;
+            # mismatched identities log the lost spend so operators
+            # can see the gap. (Copilot R4 PR#38.)
+            consensus_usage = consensus_result.usage
+            evaluator_usage = eval_result.usage
+            if consensus_usage is not None and evaluator_usage is not None:
+                if (
+                    consensus_usage.backend == evaluator_usage.backend
+                    and consensus_usage.model == evaluator_usage.model
+                ):
+                    merged_usage = _merge_usage_events(
+                        [consensus_usage, evaluator_usage],
+                        consensus_result.request_id,
+                    )
+                    merged_usage = dataclass_replace(
+                        merged_usage,
+                        duration_ms=(
+                            consensus_usage.duration_ms
+                            + evaluator_usage.duration_ms
+                        ),
+                    )
+                    return dataclass_replace(consensus_result, usage=merged_usage)
+                logger.warning(
+                    "reviewer.evaluator_hot: not merging errored evaluator "
+                    "usage into consensus usage because identity differs "
+                    "(consensus=%s/%s, evaluator=%s/%s); evaluator spend "
+                    "of input=%d output=%d not persisted to usage_summary",
+                    consensus_usage.backend,
+                    consensus_usage.model,
+                    evaluator_usage.backend,
+                    evaluator_usage.model,
+                    evaluator_usage.input_tokens,
+                    evaluator_usage.output_tokens,
+                )
             return consensus_result
 
         # Evaluator succeeded — but DON'T trust eval_result.findings

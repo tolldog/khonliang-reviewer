@@ -3535,13 +3535,18 @@ async def test_evaluator_hot_fail_open_on_evaluator_error():
     default — better to over-keep findings than have a flaky
     evaluator silently drop real concerns. Escalation tier (which
     would fire on this path) is the follow-up FR.
+
+    Per Copilot R4 PR#38: usage from the failed evaluator is merged
+    into consensus usage (when identities match) so the cost-
+    accounting reflects the real spend — the failed call already
+    burned tokens before erroring.
     """
     f1 = _consensus_finding(title="finding a")
     f2 = _consensus_finding(title="finding b", line=99)
     fake = _ScriptedProvider(
         "ollama",
         [
-            _consensus_result([f1, f2]),
+            _consensus_result([f1, f2], input_tokens=100, output_tokens=50),
             _evaluator_result(
                 [],
                 error="evaluator parse failure",
@@ -3564,6 +3569,100 @@ async def test_evaluator_hot_fail_open_on_evaluator_error():
     titles = sorted(f["title"] for f in out["findings"])
     assert titles == ["finding a", "finding b"]
     assert out.get("error", "") == ""
+    # Evaluator error path merges usage when identities match.
+    # _evaluator_result default: 80 input / 20 output → 100+80=180
+    # input, 50+20=70 output.
+    assert out["usage"]["input_tokens"] == 180
+    assert out["usage"]["output_tokens"] == 70
+
+
+async def test_evaluator_hot_strips_whitespace_in_spec():
+    """Per Copilot R4 PR#38: ``_parse_evaluator_spec`` trims
+    whitespace around both halves of ``<backend>:<model>`` so
+    operators don't fight invisible characters. ``"  ollama:
+    qwen2.5-coder:14b  "`` parses cleanly to
+    ``("ollama", "qwen2.5-coder:14b")``.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _evaluator_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "  ollama:  qwen2.5-coder:14b  ",
+        },
+    )
+
+    eval_request = fake.requests[1]
+    # Whitespace stripped from both halves; model id is intact
+    # (whitespace within a model name itself isn't supported but no
+    # standard model names contain spaces).
+    assert eval_request.metadata.get("model") == "qwen2.5-coder:14b"
+
+
+async def test_evaluator_hot_whitespace_only_spec_returns_error():
+    """A spec consisting purely of whitespace and a colon still
+    fails validation after stripping (both halves become empty).
+    Per Copilot R4 PR#38.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "   :   ",
+        },
+    )
+
+    assert "error" in out
+    assert "evaluator_hot" in out["error"]
+    # Validation runs before any provider call.
+    assert fake.requests == []
+
+
+async def test_evaluator_hot_uses_compact_json_for_findings_in_prompt():
+    """Per Copilot R4 PR#38: the candidate-findings JSON embedded in
+    evaluator instructions uses compact separators (no indent) to
+    save prompt tokens. The evaluator reads this as opaque data, not
+    for humans.
+    """
+    f = _consensus_finding(
+        severity="concern", title="race condition", path="src/api.py", line=42
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _evaluator_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    eval_request = fake.requests[1]
+    # Compact format — no `, "` or `": ` (i.e. no spaces after JSON
+    # separators). Indent=2 would produce both. The exact key/value
+    # bytes are still present, just without the cosmetic spacing.
+    assert '"severity":"concern"' in eval_request.instructions
+    assert '"path":"src/api.py"' in eval_request.instructions
+    # Sanity: no JSON-indent newlines in the findings section
+    # (instructions overall has \n separators between sections).
+    assert ',\n  "' not in eval_request.instructions
 
 
 async def test_evaluator_hot_skipped_for_zero_findings():
