@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -198,6 +199,40 @@ class ConsensusError(ValueError):
     blocks catch it, but distinct enough that callers wanting to branch
     on "validation error vs. other ValueError" can key on the class.
     """
+
+
+class EvaluatorError(ValueError):
+    """Raised when caller-supplied ``evaluator_hot`` spec fails validation.
+
+    The skill-arg layer accepts ``"<backend>:<model>"`` strings.
+    Empty string is the absence sentinel (no evaluator); non-empty
+    values must parse cleanly and reference a registered backend, or
+    they raise this error and the handler converts it to a structured
+    error response.
+    """
+
+
+def _parse_evaluator_spec(spec: str) -> tuple[str, str]:
+    """Parse ``"<backend>:<model>"`` into the pair.
+
+    Both halves must be non-empty; the colon is the only separator
+    (model strings rarely contain colons in this codebase, and the
+    Ollama wire spec ``model:tag`` uses a different syntax in the
+    tag namespace — model strings here are the *tag-included* form
+    treated as opaque after the first colon). Validation errors raise
+    :class:`EvaluatorError` with a message naming the offending value
+    so callers can correct it.
+    """
+    head, _, tail = spec.partition(":")
+    head = head.strip()
+    tail = tail.strip()
+    if not head or not tail:
+        raise EvaluatorError(
+            f"evaluator_hot={spec!r} must be of the form "
+            f"'<backend>:<model>' with both halves non-empty "
+            f"(after whitespace trimming)"
+        )
+    return head, tail
 
 
 def _coerce_consensus_int(value: Any, *, default: int) -> int:
@@ -1020,6 +1055,16 @@ class ReviewerAgent(BaseAgent):
                     # path; a strict majority is
                     # consensus_min = floor(runs/2)+1 — operators decide.
                     "consensus_min": {"type": "integer", "default": 1},
+                    # evaluator_hot: optional second-pass filter over
+                    # the consensus result's findings. "" (default)
+                    # = no evaluator; the consensus result returns
+                    # unchanged. "<backend>:<model>" = run the named
+                    # provider over the candidate findings; only the
+                    # findings the evaluator marks as real survive.
+                    # Fail-open on evaluator error (keep all findings,
+                    # log a warning). Escalation / cold tiers are a
+                    # follow-up FR per the cb081fa8 split.
+                    "evaluator_hot": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -1046,6 +1091,7 @@ class ReviewerAgent(BaseAgent):
                     "format": {"type": "string", "default": ""},
                     "consensus_runs": {"type": "integer", "default": 1},
                     "consensus_min": {"type": "integer", "default": 1},
+                    "evaluator_hot": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -1297,12 +1343,56 @@ class ReviewerAgent(BaseAgent):
             _validate_consensus(consensus_runs, consensus_min)
         except ConsensusError as exc:
             return {"error": str(exc)}
+
+        # Pre-validate ``evaluator_hot`` BEFORE the consensus / provider
+        # call so an invalid spec or unknown backend doesn't waste
+        # tokens on a review whose result is then thrown away.
+        # (Copilot R1 PR#38.) The validation is a cheap string parse
+        # plus a dict lookup; running it twice (here and inside
+        # ``_run_evaluator_hot``) is negligible defense-in-depth.
+        evaluator_hot_arg = args.get("evaluator_hot")
+        evaluator_hot_active = bool(
+            isinstance(evaluator_hot_arg, str) and evaluator_hot_arg
+        )
+        if evaluator_hot_active:
+            try:
+                eval_backend, _ = _parse_evaluator_spec(evaluator_hot_arg)
+                if eval_backend not in self._ensure_selector().providers:
+                    raise EvaluatorError(
+                        f"evaluator_hot backend={eval_backend!r} is not "
+                        f"registered; known backends: "
+                        f"{sorted(self._ensure_selector().providers)}"
+                    )
+            except EvaluatorError as exc:
+                return {"error": str(exc)}
+
         if consensus_runs > 1:
             result = await self._run_consensus(
                 provider, request, consensus_runs, consensus_min
             )
         else:
             result = await provider.review(request)
+
+        # Evaluator-hot pass (fr_reviewer_cb081fa8 second cut). Runs
+        # AFTER consensus consolidation but BEFORE severity_floor —
+        # the evaluator sees pre-floor findings so it can drop nits
+        # the floor would have kept, and the floor filters the
+        # evaluator-survived set so dual-filtering doesn't surprise
+        # operators. The spec is already validated upfront so we
+        # don't expect EvaluatorError here, but catch defensively in
+        # case future code adds a runtime-only failure mode.
+        if evaluator_hot_active:
+            try:
+                result = await self._run_evaluator_hot(
+                    result, request, evaluator_hot_arg
+                )
+            except EvaluatorError as exc:
+                # Defense in depth: still record consensus usage
+                # before surfacing the error so the spend isn't lost.
+                self._apply_severity_floor(result, effective_floor)
+                await self._record_usage(result)
+                return {"error": str(exc)}
+
         # Apply the severity_floor post-filter at the edge of the return
         # path, AFTER the provider returns but BEFORE usage recording.
         # The usage event gets the filtered count so downstream
@@ -1403,6 +1493,257 @@ class ReviewerAgent(BaseAgent):
             results,
             min_count=min_count,
             base_request_id=request.request_id,
+        )
+
+    async def _run_evaluator_hot(
+        self,
+        consensus_result: ReviewResult,
+        original_request: ReviewRequest,
+        evaluator_spec: str,
+    ) -> ReviewResult:
+        """Filter ``consensus_result.findings`` through a second-pass evaluator.
+
+        First-cut behavior of the ``evaluator_hot`` tier from
+        ``fr_reviewer_cb081fa8``:
+
+        - Parse ``evaluator_spec`` (``"<backend>:<model>"``); look up
+          the backend in the agent's selector. Mismatch raises
+          :class:`EvaluatorError`.
+        - Build a new :class:`ReviewRequest` carrying the original
+          diff as ``content`` and the candidate findings (JSON-dumped)
+          embedded in ``instructions`` so the evaluator can reason
+          about them in the same prompt-template the rest of the
+          reviewer uses. No special evaluator schema — the evaluator
+          returns a regular :class:`ReviewResult` whose ``findings``
+          list is the survivors.
+        - **Fail-open** on evaluator error / parse failure: if the
+          evaluator returns an errored result, log a warning and
+          return ``consensus_result`` unchanged. Conservative default —
+          better to over-keep findings than have a flaky evaluator
+          silently nuke real concerns. Escalation tier (which would
+          fire on this path) is a follow-up FR.
+        - Skip the call entirely when ``consensus_result`` is errored
+          or carries zero findings: there's nothing to filter.
+        - Usage merges across consensus + evaluator so cost-accounting
+          captures total spend.
+        """
+        if consensus_result.error or not consensus_result.findings:
+            return consensus_result
+
+        backend, model = _parse_evaluator_spec(evaluator_spec)
+        selector = self._ensure_selector()
+        if backend not in selector.providers:
+            raise EvaluatorError(
+                f"evaluator_hot backend={backend!r} is not registered; "
+                f"known backends: {sorted(selector.providers)}"
+            )
+        evaluator_provider = selector.providers[backend]
+
+        # Compact JSON (no indent / minimal separators) — the
+        # evaluator reads this as opaque data, not for humans.
+        # Indent=2 was costing ~30% extra tokens per candidate
+        # finding for zero benefit. (Copilot R4 PR#38.)
+        findings_json = json.dumps(
+            [f.to_dict() for f in consensus_result.findings],
+            separators=(",", ":"),
+        )
+        evaluator_instructions = (
+            "You are evaluating findings from a previous reviewer pass on the "
+            "diff below. For each candidate finding, decide whether it "
+            "represents a real, actionable concern, or a false positive "
+            "(over-eager noise, restatement of the diff, mislabeled "
+            "severity).\n\n"
+            "Return ONLY the findings you judge as real, preserving each "
+            "kept finding's fields (severity, title, body, path, line, "
+            "category, suggestion) verbatim. Return an empty findings list "
+            "if none are real.\n\n"
+            "Candidate findings to evaluate:\n"
+            f"{findings_json}"
+        )
+        if original_request.instructions:
+            evaluator_instructions = (
+                f"{original_request.instructions}\n\n{evaluator_instructions}"
+            )
+
+        eval_metadata = {
+            **{
+                k: v
+                for k, v in original_request.metadata.items()
+                if k != "model"
+            },
+            "model": model,
+        }
+        eval_request = ReviewRequest(
+            kind=original_request.kind,
+            content=original_request.content,
+            instructions=evaluator_instructions,
+            context=original_request.context,
+            metadata=eval_metadata,
+            request_id=f"{original_request.request_id}-eval",
+        )
+
+        eval_result = await evaluator_provider.review(eval_request)
+
+        if eval_result.error:
+            logger.warning(
+                "reviewer.evaluator_hot: evaluator %s failed (%s); "
+                "fail-open — keeping all %d consensus findings",
+                evaluator_spec,
+                eval_result.error,
+                len(consensus_result.findings),
+            )
+            # The evaluator call already spent tokens before
+            # erroring (parse failure on a real LLM response, not
+            # a free no-op). Merge usage when identities match so
+            # the persisted usage row reflects total compute spend;
+            # mismatched identities log the lost spend so operators
+            # can see the gap. (Copilot R4 PR#38.)
+            consensus_usage = consensus_result.usage
+            evaluator_usage = eval_result.usage
+            if consensus_usage is not None and evaluator_usage is not None:
+                if (
+                    consensus_usage.backend == evaluator_usage.backend
+                    and consensus_usage.model == evaluator_usage.model
+                ):
+                    merged_usage = _merge_usage_events(
+                        [consensus_usage, evaluator_usage],
+                        consensus_result.request_id,
+                    )
+                    merged_usage = dataclass_replace(
+                        merged_usage,
+                        duration_ms=(
+                            consensus_usage.duration_ms
+                            + evaluator_usage.duration_ms
+                        ),
+                    )
+                    return dataclass_replace(consensus_result, usage=merged_usage)
+                logger.warning(
+                    "reviewer.evaluator_hot: not merging errored evaluator "
+                    "usage into consensus usage because identity differs "
+                    "(consensus=%s/%s, evaluator=%s/%s); evaluator spend "
+                    "of input=%d output=%d not persisted to usage_summary",
+                    consensus_usage.backend,
+                    consensus_usage.model,
+                    evaluator_usage.backend,
+                    evaluator_usage.model,
+                    evaluator_usage.input_tokens,
+                    evaluator_usage.output_tokens,
+                )
+            return consensus_result
+
+        # Evaluator succeeded — but DON'T trust eval_result.findings
+        # blindly. Per Copilot R2 PR#38: the evaluator could hallucinate
+        # a new finding (or rephrase a candidate enough that the
+        # rewritten copy bypasses the consensus gate). Survivors must
+        # be a strict subset of the candidate set, anchored by the
+        # same ``_consensus_finding_key`` consensus uses for grouping.
+        #
+        # We also return the CANDIDATE finding objects verbatim
+        # (rather than the evaluator's possibly-rewritten copies) so
+        # the prompt's "preserve fields verbatim" instruction is
+        # enforced structurally, not just by the model's compliance.
+        candidate_by_key: dict[tuple[str, str, int, str], ReviewFinding] = {
+            _consensus_finding_key(f): f for f in consensus_result.findings
+        }
+        survivors: list[ReviewFinding] = []
+        seen_keys: set[tuple[str, str, int, str]] = set()
+        hallucinated_titles: list[str] = []
+        for ev_finding in eval_result.findings:
+            key = _consensus_finding_key(ev_finding)
+            if key in seen_keys:
+                # Evaluator emitted the same key twice; the canonical
+                # candidate is already in survivors. Drop silently —
+                # idempotent under repeated emit.
+                continue
+            candidate = candidate_by_key.get(key)
+            if candidate is not None:
+                survivors.append(candidate)
+                seen_keys.add(key)
+            else:
+                # Evaluator returned a finding whose anchor doesn't
+                # match any candidate. Either a hallucination or
+                # field-rewrite that drifted past the normalized
+                # title threshold. Drop + log so operators can spot
+                # rogue evaluator behavior.
+                hallucinated_titles.append(ev_finding.title)
+
+        if hallucinated_titles:
+            logger.warning(
+                "reviewer.evaluator_hot: dropped %d evaluator finding(s) "
+                "not in candidate set (likely hallucination or "
+                "field-rewrite): %s",
+                len(hallucinated_titles),
+                hallucinated_titles[:5],
+            )
+
+        # Usage merge is identity-aware (Copilot R1 PR#38): only merge
+        # when consensus and evaluator share the same (backend, model);
+        # otherwise the merged event would misattribute evaluator spend
+        # to the consensus backend in usage_summary analytics. When
+        # identities differ, the consensus usage is kept as the
+        # canonical record and the evaluator spend is logged as a
+        # warning so operators can see the lost-attribution event;
+        # capturing both stages cleanly needs a usage-list refactor
+        # which is a follow-up FR.
+        consensus_usage = consensus_result.usage
+        evaluator_usage = eval_result.usage
+        if consensus_usage is not None and evaluator_usage is not None:
+            if (
+                consensus_usage.backend == evaluator_usage.backend
+                and consensus_usage.model == evaluator_usage.model
+            ):
+                merged_usage = _merge_usage_events(
+                    [consensus_usage, evaluator_usage],
+                    consensus_result.request_id,
+                )
+                # Override duration_ms specifically for this call site:
+                # _merge_usage_events takes max(durations) because
+                # consensus runs are PARALLEL (concurrent wall-clock),
+                # but consensus + evaluator are SEQUENTIAL stages —
+                # the wall-clock is the sum, not the max. (Copilot R2
+                # PR#38.)
+                merged_usage = dataclass_replace(
+                    merged_usage,
+                    duration_ms=(
+                        consensus_usage.duration_ms
+                        + evaluator_usage.duration_ms
+                    ),
+                )
+            else:
+                logger.warning(
+                    "reviewer.evaluator_hot: not merging evaluator usage into "
+                    "consensus usage because identity differs "
+                    "(consensus=%s/%s, evaluator=%s/%s); evaluator spend "
+                    "of input=%d output=%d not persisted to usage_summary",
+                    consensus_usage.backend,
+                    consensus_usage.model,
+                    evaluator_usage.backend,
+                    evaluator_usage.model,
+                    evaluator_usage.input_tokens,
+                    evaluator_usage.output_tokens,
+                )
+                merged_usage = consensus_usage
+        else:
+            merged_usage = consensus_usage or evaluator_usage
+
+        return ReviewResult(
+            request_id=consensus_result.request_id,
+            # Prefer the evaluator's summary when non-empty: the
+            # evaluator just filtered the findings list, so its
+            # summary describes the post-filter state. Falling back
+            # to the consensus summary keeps behavior unchanged for
+            # evaluators that don't write a summary. (Copilot R1
+            # PR#38: previously the consensus summary stuck around
+            # even when it referenced findings the evaluator just
+            # dropped.)
+            summary=eval_result.summary or consensus_result.summary,
+            findings=survivors,
+            disposition=consensus_result.disposition,
+            error="",
+            error_category="",
+            usage=merged_usage,
+            backend=consensus_result.backend,
+            model=consensus_result.model,
         )
 
     def _resolve_severity_floor(
