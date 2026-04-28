@@ -4138,3 +4138,118 @@ async def test_evaluator_hot_targets_caller_supplied_model():
 
     eval_request = fake.requests[1]
     assert eval_request.metadata.get("model") == "llama3.1:8b"
+
+
+# ---------------------------------------------------------------------------
+# Audience + distill pipeline wiring (fr_reviewer_de1694a8)
+# ---------------------------------------------------------------------------
+
+
+async def test_audience_default_unset_routes_to_agent_consumption():
+    """``audience=""`` (default sentinel) lands as ``agent_consumption``
+    in the DistillConfig — the safe default that runs the pipeline
+    in non-aggressive mode. Filtered findings still get dropped per
+    severity_floor; the audience is just the shape selector.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "x"}
+    )
+
+    assert out.get("error", "") == ""
+    assert len(out["findings"]) == 1
+
+
+async def test_audience_audit_corpus_short_circuits_distill_pipeline():
+    """``audience=audit_corpus`` returns the raw provider output —
+    severity_floor still applied? No: per the pipeline shell's
+    audit_corpus short-circuit, the WHOLE pipeline is skipped.
+    Audit / benchmark callers always see what the model emitted.
+    """
+    nit = ReviewFinding(
+        severity="nit",  # type: ignore[arg-type]
+        title="cosmetic comment",
+        body="b",
+    )
+    concern = ReviewFinding(
+        severity="concern",  # type: ignore[arg-type]
+        title="real bug",
+        body="b",
+    )
+    fake = _ScriptedProvider("ollama", [_consensus_result([nit, concern])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "audience": "audit_corpus",
+            # Even with severity_floor=concern, audit_corpus short-
+            # circuits the pipeline so the nit survives.
+            "severity_floor": "concern",
+        },
+    )
+
+    titles = sorted(f["title"] for f in out["findings"])
+    assert titles == ["cosmetic comment", "real bug"]
+
+
+async def test_audience_unknown_value_returns_error():
+    """Caller-supplied ``audience`` must be one of the Literal
+    members. An unknown value fails fast rather than silently
+    falling back to the default.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "audience": "completely_made_up",
+        },
+    )
+
+    assert "error" in out
+    assert "audience=" in out["error"]
+    assert "completely_made_up" in out["error"]
+
+
+async def test_audience_non_audit_runs_severity_floor_through_pipeline():
+    """For audiences OTHER than audit_corpus, severity_floor still
+    filters findings — the pipeline runs normally. Regression guard
+    that the pipeline replacement preserves the severity_floor
+    contract that pre-FR ``_apply_severity_floor`` enforced.
+    """
+    nit = ReviewFinding(
+        severity="nit",  # type: ignore[arg-type]
+        title="cosmetic comment",
+        body="b",
+    )
+    concern = ReviewFinding(
+        severity="concern",  # type: ignore[arg-type]
+        title="real bug",
+        body="b",
+    )
+    fake = _ScriptedProvider("ollama", [_consensus_result([nit, concern])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "audience": "agent_consumption",
+            "severity_floor": "concern",
+        },
+    )
+
+    titles = [f["title"] for f in out["findings"]]
+    # nit dropped; only concern survives.
+    assert titles == ["real bug"]
