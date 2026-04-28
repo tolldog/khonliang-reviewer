@@ -3408,3 +3408,317 @@ async def test_consensus_title_normalization_groups_minor_drift():
     titles = [f["title"] for f in out["findings"]]
     # Grouped under the same key → one finding survives (canonical = first).
     assert titles == ["Race condition"]
+
+
+# ---------------------------------------------------------------------------
+# Evaluator-hot tier (fr_reviewer_cb081fa8 second cut)
+# ---------------------------------------------------------------------------
+
+
+def _evaluator_result(
+    findings: list[ReviewFinding],
+    *,
+    error: str = "",
+    error_category: str = "",
+    disposition: str = "posted",
+) -> ReviewResult:
+    """A scripted evaluator-pass response. Mirrors ``_consensus_result``
+    but lets tests carry an error so the fail-open path can be
+    exercised.
+    """
+    return ReviewResult(
+        request_id="eval-resp",
+        summary="evaluator pass",
+        findings=findings,
+        disposition=disposition,  # type: ignore[arg-type]
+        error=error,
+        error_category=error_category,
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+        usage=UsageEvent(
+            timestamp=2.0,
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            input_tokens=80,
+            output_tokens=20,
+            disposition=disposition,  # type: ignore[arg-type]
+            error=error,
+            error_category=error_category,
+        ),
+    )
+
+
+async def test_evaluator_hot_default_unset_skips_pass():
+    """``evaluator_hot=""`` (default) skips the evaluator entirely —
+    the consensus / single-call result returns unchanged. Hot-path
+    regression guard.
+    """
+    f1 = _consensus_finding(title="real concern")
+    f2 = _consensus_finding(title="false positive", line=99)
+    fake = _ScriptedProvider("ollama", [_consensus_result([f1, f2])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "x"}
+    )
+
+    titles = sorted(f["title"] for f in out["findings"])
+    assert titles == ["false positive", "real concern"]
+    assert len(fake.requests) == 1
+
+
+async def test_evaluator_hot_drops_findings_evaluator_marks_false_positive():
+    """When ``evaluator_hot`` is set, the second-pass evaluator's
+    ``findings`` list IS the survivor set. Findings the evaluator
+    omits get dropped from the consolidated result.
+    """
+    keep = _consensus_finding(title="real concern", line=10)
+    drop = _consensus_finding(title="false positive", line=99)
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([keep, drop]),
+            _evaluator_result([keep]),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    titles = [f["title"] for f in out["findings"]]
+    assert titles == ["real concern"]
+    assert len(fake.requests) == 2
+
+
+async def test_evaluator_hot_threads_findings_into_evaluator_instructions():
+    """The evaluator request carries the candidate findings inside
+    ``instructions`` (JSON-dumped) so the evaluator can reason about
+    them in the same prompt template the rest of the reviewer uses.
+    No special evaluator schema — keep the contract simple.
+    """
+    f = _consensus_finding(
+        severity="concern", title="race condition", path="src/api.py", line=42
+    )
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _evaluator_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    eval_request = fake.requests[1]
+    assert "evaluating findings" in eval_request.instructions
+    assert "race condition" in eval_request.instructions
+    assert "src/api.py" in eval_request.instructions
+    assert eval_request.content == "x"
+    assert eval_request.request_id.endswith("-eval")
+
+
+async def test_evaluator_hot_fail_open_on_evaluator_error():
+    """If the evaluator returns an errored result, fail open: log a
+    warning and return the consensus result unchanged. Conservative
+    default — better to over-keep findings than have a flaky
+    evaluator silently drop real concerns. Escalation tier (which
+    would fire on this path) is the follow-up FR.
+    """
+    f1 = _consensus_finding(title="finding a")
+    f2 = _consensus_finding(title="finding b", line=99)
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f1, f2]),
+            _evaluator_result(
+                [],
+                error="evaluator parse failure",
+                error_category="parse_error",
+                disposition="errored",
+            ),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    titles = sorted(f["title"] for f in out["findings"])
+    assert titles == ["finding a", "finding b"]
+    assert out.get("error", "") == ""
+
+
+async def test_evaluator_hot_skipped_for_zero_findings():
+    """Don't waste a provider call when consensus has zero findings —
+    nothing to evaluate. Pure efficiency guard; the result is the
+    same with or without the skip.
+    """
+    fake = _ScriptedProvider("ollama", [_consensus_result([])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert out["findings"] == []
+    assert len(fake.requests) == 1
+
+
+async def test_evaluator_hot_skipped_for_errored_consensus_result():
+    """Don't run the evaluator over an errored consensus result —
+    findings will be empty anyway and the evaluator can't usefully
+    judge a failed run.
+    """
+    errored = ReviewResult(
+        request_id="errored",
+        summary="",
+        findings=[],
+        disposition="errored",
+        error="provider blew up",
+        error_category="backend_error",
+        backend="ollama",
+        model="qwen2.5-coder:14b",
+    )
+    fake = _ScriptedProvider("ollama", [errored])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert out["error"] == "provider blew up"
+    assert len(fake.requests) == 1
+
+
+async def test_evaluator_hot_invalid_spec_returns_error():
+    """``evaluator_hot`` must be ``"<backend>:<model>"`` with both
+    halves non-empty. ``"ollama"`` (no colon), ``":model"`` (no
+    backend), ``"ollama:"`` (no model) all fail validation and
+    return a structured error rather than silently skipping.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    for bad_spec in ("ollama", ":model", "ollama:", ":"):
+        fake.requests.clear()
+        fake._call_index = 0
+        out = await harness.call(
+            "review_text",
+            {
+                "kind": "pr_diff",
+                "content": "x",
+                "evaluator_hot": bad_spec,
+            },
+        )
+        assert "error" in out, f"bad_spec={bad_spec!r} should return error"
+        assert "evaluator_hot" in out["error"]
+
+
+async def test_evaluator_hot_unknown_backend_returns_error():
+    """Spec parses but names an unregistered backend → structured
+    error, no silent fall-through. The evaluator-tier promise is
+    "the named provider runs"; if the named provider doesn't exist,
+    the caller needs to know.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "nonexistent_backend:some-model",
+        },
+    )
+
+    assert "error" in out
+    assert "nonexistent_backend" in out["error"]
+    assert "not registered" in out["error"]
+
+
+async def test_evaluator_hot_merges_usage_across_consensus_and_evaluator():
+    """Usage from the evaluator pass merges with the consensus
+    usage so the persisted usage row reflects total spend across
+    both stages, not just the consensus stage.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [
+            _consensus_result([f], input_tokens=100, output_tokens=50),
+            _evaluator_result([f]),
+        ],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    usage = out["usage"]
+    # 100 + 80 = 180 input; 50 + 20 = 70 output.
+    assert usage["input_tokens"] == 180
+    assert usage["output_tokens"] == 70
+
+
+async def test_evaluator_hot_targets_caller_supplied_model():
+    """The model id from the spec lands on
+    ``ReviewRequest.metadata['model']`` for the evaluator request,
+    so the evaluator provider routes the call to that specific
+    model rather than the provider's default. Tag-included model
+    strings (``llama3.1:8b``) split on the FIRST colon only.
+    """
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _evaluator_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "evaluator_hot": "ollama:llama3.1:8b",
+        },
+    )
+
+    eval_request = fake.requests[1]
+    assert eval_request.metadata.get("model") == "llama3.1:8b"

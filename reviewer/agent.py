@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -198,6 +199,37 @@ class ConsensusError(ValueError):
     blocks catch it, but distinct enough that callers wanting to branch
     on "validation error vs. other ValueError" can key on the class.
     """
+
+
+class EvaluatorError(ValueError):
+    """Raised when caller-supplied ``evaluator_hot`` spec fails validation.
+
+    The skill-arg layer accepts ``"<backend>:<model>"`` strings.
+    Empty string is the absence sentinel (no evaluator); non-empty
+    values must parse cleanly and reference a registered backend, or
+    they raise this error and the handler converts it to a structured
+    error response.
+    """
+
+
+def _parse_evaluator_spec(spec: str) -> tuple[str, str]:
+    """Parse ``"<backend>:<model>"`` into the pair.
+
+    Both halves must be non-empty; the colon is the only separator
+    (model strings rarely contain colons in this codebase, and the
+    Ollama wire spec ``model:tag`` uses a different syntax in the
+    tag namespace — model strings here are the *tag-included* form
+    treated as opaque after the first colon). Validation errors raise
+    :class:`EvaluatorError` with a message naming the offending value
+    so callers can correct it.
+    """
+    head, _, tail = spec.partition(":")
+    if not head or not tail:
+        raise EvaluatorError(
+            f"evaluator_hot={spec!r} must be of the form "
+            f"'<backend>:<model>' with both halves non-empty"
+        )
+    return head, tail
 
 
 def _coerce_consensus_int(value: Any, *, default: int) -> int:
@@ -1020,6 +1052,16 @@ class ReviewerAgent(BaseAgent):
                     # path; a strict majority is
                     # consensus_min = floor(runs/2)+1 — operators decide.
                     "consensus_min": {"type": "integer", "default": 1},
+                    # evaluator_hot: optional second-pass filter over
+                    # the consensus result's findings. "" (default)
+                    # = no evaluator; the consensus result returns
+                    # unchanged. "<backend>:<model>" = run the named
+                    # provider over the candidate findings; only the
+                    # findings the evaluator marks as real survive.
+                    # Fail-open on evaluator error (keep all findings,
+                    # log a warning). Escalation / cold tiers are a
+                    # follow-up FR per the cb081fa8 split.
+                    "evaluator_hot": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -1046,6 +1088,7 @@ class ReviewerAgent(BaseAgent):
                     "format": {"type": "string", "default": ""},
                     "consensus_runs": {"type": "integer", "default": 1},
                     "consensus_min": {"type": "integer", "default": 1},
+                    "evaluator_hot": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
             ),
@@ -1303,6 +1346,22 @@ class ReviewerAgent(BaseAgent):
             )
         else:
             result = await provider.review(request)
+
+        # Evaluator-hot pass (fr_reviewer_cb081fa8 second cut). Runs
+        # AFTER consensus consolidation but BEFORE severity_floor —
+        # the evaluator sees pre-floor findings so it can drop nits
+        # the floor would have kept, and the floor filters the
+        # evaluator-survived set so dual-filtering doesn't surprise
+        # operators. Empty string skips the whole pass.
+        evaluator_hot_arg = args.get("evaluator_hot")
+        if isinstance(evaluator_hot_arg, str) and evaluator_hot_arg:
+            try:
+                result = await self._run_evaluator_hot(
+                    result, request, evaluator_hot_arg
+                )
+            except EvaluatorError as exc:
+                return {"error": str(exc)}
+
         # Apply the severity_floor post-filter at the edge of the return
         # path, AFTER the provider returns but BEFORE usage recording.
         # The usage event gets the filtered count so downstream
@@ -1403,6 +1462,124 @@ class ReviewerAgent(BaseAgent):
             results,
             min_count=min_count,
             base_request_id=request.request_id,
+        )
+
+    async def _run_evaluator_hot(
+        self,
+        consensus_result: ReviewResult,
+        original_request: ReviewRequest,
+        evaluator_spec: str,
+    ) -> ReviewResult:
+        """Filter ``consensus_result.findings`` through a second-pass evaluator.
+
+        First-cut behavior of the ``evaluator_hot`` tier from
+        ``fr_reviewer_cb081fa8``:
+
+        - Parse ``evaluator_spec`` (``"<backend>:<model>"``); look up
+          the backend in the agent's selector. Mismatch raises
+          :class:`EvaluatorError`.
+        - Build a new :class:`ReviewRequest` carrying the original
+          diff as ``content`` and the candidate findings (JSON-dumped)
+          embedded in ``instructions`` so the evaluator can reason
+          about them in the same prompt-template the rest of the
+          reviewer uses. No special evaluator schema — the evaluator
+          returns a regular :class:`ReviewResult` whose ``findings``
+          list is the survivors.
+        - **Fail-open** on evaluator error / parse failure: if the
+          evaluator returns an errored result, log a warning and
+          return ``consensus_result`` unchanged. Conservative default —
+          better to over-keep findings than have a flaky evaluator
+          silently nuke real concerns. Escalation tier (which would
+          fire on this path) is a follow-up FR.
+        - Skip the call entirely when ``consensus_result`` is errored
+          or carries zero findings: there's nothing to filter.
+        - Usage merges across consensus + evaluator so cost-accounting
+          captures total spend.
+        """
+        if consensus_result.error or not consensus_result.findings:
+            return consensus_result
+
+        backend, model = _parse_evaluator_spec(evaluator_spec)
+        selector = self._ensure_selector()
+        if backend not in selector.providers:
+            raise EvaluatorError(
+                f"evaluator_hot backend={backend!r} is not registered; "
+                f"known backends: {sorted(selector.providers)}"
+            )
+        evaluator_provider = selector.providers[backend]
+
+        findings_json = json.dumps(
+            [f.to_dict() for f in consensus_result.findings], indent=2
+        )
+        evaluator_instructions = (
+            "You are evaluating findings from a previous reviewer pass on the "
+            "diff below. For each candidate finding, decide whether it "
+            "represents a real, actionable concern, or a false positive "
+            "(over-eager noise, restatement of the diff, mislabeled "
+            "severity).\n\n"
+            "Return ONLY the findings you judge as real, preserving each "
+            "kept finding's fields (severity, title, body, path, line, "
+            "category, suggestion) verbatim. Return an empty findings list "
+            "if none are real.\n\n"
+            "Candidate findings to evaluate:\n"
+            f"{findings_json}"
+        )
+        if original_request.instructions:
+            evaluator_instructions = (
+                f"{original_request.instructions}\n\n{evaluator_instructions}"
+            )
+
+        eval_metadata = {
+            **{
+                k: v
+                for k, v in original_request.metadata.items()
+                if k != "model"
+            },
+            "model": model,
+        }
+        eval_request = ReviewRequest(
+            kind=original_request.kind,
+            content=original_request.content,
+            instructions=evaluator_instructions,
+            context=original_request.context,
+            metadata=eval_metadata,
+            request_id=f"{original_request.request_id}-eval",
+        )
+
+        eval_result = await evaluator_provider.review(eval_request)
+
+        if eval_result.error:
+            logger.warning(
+                "reviewer.evaluator_hot: evaluator %s failed (%s); "
+                "fail-open — keeping all %d consensus findings",
+                evaluator_spec,
+                eval_result.error,
+                len(consensus_result.findings),
+            )
+            return consensus_result
+
+        # Evaluator succeeded — its findings list is the survivor set.
+        # Merge usage so cost-accounting reflects consensus + evaluator
+        # spend together.
+        usage_events = [
+            u for u in (consensus_result.usage, eval_result.usage)
+            if u is not None
+        ]
+        merged_usage = (
+            _merge_usage_events(usage_events, consensus_result.request_id)
+            if usage_events
+            else None
+        )
+        return ReviewResult(
+            request_id=consensus_result.request_id,
+            summary=consensus_result.summary,
+            findings=eval_result.findings,
+            disposition=consensus_result.disposition,
+            error="",
+            error_category="",
+            usage=merged_usage,
+            backend=consensus_result.backend,
+            model=consensus_result.model,
         )
 
     def _resolve_severity_floor(
