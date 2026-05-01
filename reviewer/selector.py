@@ -54,7 +54,11 @@ class SelectorConfig:
     """
 
     default_backend: str = "ollama"
-    default_model: str = "qwen2.5-coder:14b"
+    # 2026-04-30 speed sweep (project_benchmark_four_stage_roadmap.md) measured
+    # deepseek-coder-v2:16b at 334 tok/s warm vs qwen2.5-coder:14b at 94 tok/s
+    # on identical hardware (RTX 5080, sm_120) — 3.5× faster via MoE active path
+    # while sitting in the same VRAM tier (8.9 GB). Promoting to default.
+    default_model: str = "deepseek-coder-v2:16b"
     default_models: dict[str, str] = field(default_factory=dict)
 
 
