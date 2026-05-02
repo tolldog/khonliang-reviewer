@@ -72,7 +72,12 @@ from reviewer.providers import (
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyDecision, PolicyInput, decide
-from reviewer.selector import ProviderSelector, SelectorConfig, UnknownBackendError
+from reviewer.selector import (
+    DEFAULT_REVIEWER_MODEL,
+    ProviderSelector,
+    SelectorConfig,
+    UnknownBackendError,
+)
 from reviewer.storage import UsageStore, open_usage_store
 
 
@@ -2195,7 +2200,7 @@ class ReviewerAgent(BaseAgent):
         # ``ProviderSelector.select``); each provider then applies its
         # own config-level default.
         ollama_default = str(
-            ollama_cfg.get("default_model") or "qwen2.5-coder:14b"
+            ollama_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
         )
         # Thread per-provider knobs through to the dataclass so the
         # config-layer rung of the resolution order ("caller →
@@ -2245,7 +2250,7 @@ class ReviewerAgent(BaseAgent):
             self._ensure_registry().providers,
             SelectorConfig(
                 default_backend=str(config.get("default_provider") or "ollama"),
-                default_model=str(config.get("default_model") or "qwen2.5-coder:14b"),
+                default_model=str(config.get("default_model") or DEFAULT_REVIEWER_MODEL),
                 default_models=_coerce_default_models(config.get("default_models")),
             ),
         )

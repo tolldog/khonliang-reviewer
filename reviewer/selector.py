@@ -21,6 +21,16 @@ from typing import Mapping
 from khonliang_reviewer import ReviewProvider
 
 
+#: Module-level constant — the agent boot path's hard-coded fallback when
+#: ``config.yaml`` omits ``default_model`` AND when ``providers.ollama.default_model``
+#: is also absent. Single source of truth so the dataclass default below and
+#: the agent's two fallback sites can't drift. PR #40 review feedback caught
+#: that hard-coding the literal at the agent boot site overrode the
+#: ``SelectorConfig.default_model`` dataclass default; this constant fixes
+#: that by giving every fallback path one place to look.
+DEFAULT_REVIEWER_MODEL = "deepseek-coder-v2:16b"
+
+
 class UnknownBackendError(ValueError):
     """Raised when the caller or config references an unregistered backend."""
 
@@ -54,11 +64,11 @@ class SelectorConfig:
     """
 
     default_backend: str = "ollama"
-    # 2026-04-30 speed sweep (project_benchmark_four_stage_roadmap.md) measured
-    # deepseek-coder-v2:16b at 334 tok/s warm vs qwen2.5-coder:14b at 94 tok/s
-    # on identical hardware (RTX 5080, sm_120) — 3.5× faster via MoE active path
-    # while sitting in the same VRAM tier (8.9 GB). Promoting to default.
-    default_model: str = "deepseek-coder-v2:16b"
+    # 2026-04-30 speed sweep measured deepseek-coder-v2:16b at 334 tok/s
+    # warm vs qwen2.5-coder:14b at 94 tok/s on identical hardware
+    # (RTX 5080, sm_120) — 3.5× faster via MoE active path while sitting
+    # in the same VRAM tier (8.9 GB). Promoted to default.
+    default_model: str = DEFAULT_REVIEWER_MODEL
     default_models: dict[str, str] = field(default_factory=dict)
 
 

@@ -23,6 +23,7 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 from reviewer.agent import ReviewerAgent
+from reviewer.selector import DEFAULT_REVIEWER_MODEL
 from reviewer.registry import ProviderRegistry
 from reviewer.selector import ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
@@ -1295,7 +1296,12 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         "ollama",
     }
     assert selector.config.default_backend == "ollama"
-    assert selector.config.default_model == "qwen2.5-coder:14b"
+    # Reference the constant rather than the literal so future model
+    # promotions don't have to touch this assertion. The value the
+    # constant resolves to is the agent's hard-coded fallback when
+    # config.yaml omits ``default_model`` — i.e. the actual default
+    # an empty-config operator gets.
+    assert selector.config.default_model == DEFAULT_REVIEWER_MODEL
 
 
 def test_default_selector_honors_config_yaml(tmp_path):
@@ -1403,8 +1409,9 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
     # Built-in baseline applies; the global default_model 'claude-opus-4-7'
-    # must NOT have leaked into Ollama's provider config.
-    assert ollama_provider.config.default_model == "qwen2.5-coder:14b"
+    # must NOT have leaked into Ollama's provider config. Reference the
+    # constant so future model promotions don't have to touch this assertion.
+    assert ollama_provider.config.default_model == DEFAULT_REVIEWER_MODEL
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):
