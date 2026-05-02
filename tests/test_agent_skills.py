@@ -23,9 +23,8 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 from reviewer.agent import ReviewerAgent
-from reviewer.selector import DEFAULT_REVIEWER_MODEL
 from reviewer.registry import ProviderRegistry
-from reviewer.selector import ProviderSelector, SelectorConfig
+from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
 
 
@@ -151,7 +150,8 @@ async def test_review_text_routes_to_rule_table_default_backend():
     """Small content + pr_diff → rule table picks ollama + the promoted
     ``DEFAULT_REVIEWER_MODEL`` (fallback). Asserting the constant rather
     than the literal so future model promotions only need to touch
-    ``reviewer/selector.py``."""
+    ``reviewer/defaults.py`` (the single source of truth;
+    ``reviewer.selector`` re-exports for backward compat)."""
     fake = _RecordingProvider(
         "ollama", _make_result(backend="ollama", model=DEFAULT_REVIEWER_MODEL)
     )
