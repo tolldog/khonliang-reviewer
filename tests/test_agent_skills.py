@@ -1398,9 +1398,10 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     ``OllamaProviderConfig.default_model`` from the global
     ``config.default_model`` — which would inject a Claude model id
     into Ollama. The current shape sources Ollama's default from
-    ``providers.ollama.default_model`` with a built-in qwen baseline,
-    so a caller that picks ``backend: ollama`` without a model gets a
-    valid Ollama model id even when the global default isn't Ollama-shaped.
+    ``providers.ollama.default_model`` with a built-in
+    ``DEFAULT_REVIEWER_MODEL`` baseline, so a caller that picks
+    ``backend: ollama`` without a model gets a valid Ollama model id
+    even when the global default isn't Ollama-shaped.
     """
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -1424,7 +1425,7 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):
-    """When operators set ``providers.ollama.default_model`` it overrides the qwen baseline."""
+    """When operators set ``providers.ollama.default_model`` it overrides the ``DEFAULT_REVIEWER_MODEL`` baseline."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "default_provider: claude_cli\n"

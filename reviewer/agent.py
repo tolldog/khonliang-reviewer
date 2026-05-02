@@ -2191,9 +2191,16 @@ class ReviewerAgent(BaseAgent):
         # Source Ollama's provider-default model from
         # ``providers.ollama.default_model`` (per-provider config),
         # falling back to ``DEFAULT_REVIEWER_MODEL`` (defined in
-        # reviewer/defaults.py, re-exported from reviewer/selector.py,
-        # and also referenced by rules.policy.DEFAULT_FALLBACK so both
-        # fallback paths align). Decoupled from
+        # reviewer/defaults.py, re-exported from reviewer/selector.py).
+        # This baseline backs the SelectorConfig + agent-boot fallback
+        # paths and is also referenced by
+        # ``rules.policy.DEFAULT_FALLBACK`` (the rule-table fallback),
+        # so a swap of the constant flips both fallback paths in
+        # lockstep. The ``docs_kind_to_qwen_small`` rule in
+        # ``rules.policy`` deliberately pins ``qwen2.5-coder:14b`` for
+        # short-text reviews (spec/doc/fr/pr_description) — that's an
+        # intentional small-model carve-out, not a fallback, and is
+        # not affected by promotions of this constant. Decoupled from
         # the global ``config.default_model`` so an operator who sets
         # ``default_provider: claude_cli`` and ``default_model:
         # claude-opus-4-7`` doesn't accidentally inject a Claude model
