@@ -197,10 +197,14 @@ def test_default_models_field_default_is_empty_dict():
     """``SelectorConfig()`` constructs with an empty per-backend dict
     so existing tests / configs that only set ``default_model`` keep
     working without changes (backwards compat).
+
+    Default model is ``deepseek-coder-v2:16b`` (promoted from
+    ``qwen2.5-coder:14b`` on the 2026-04-30 speed sweep — 3.5× faster
+    on the same hardware). Same VRAM tier (~8.9 GB), MoE active path.
     """
     cfg = SelectorConfig()
     assert cfg.default_models == {}
-    assert cfg.default_model == "qwen2.5-coder:14b"
+    assert cfg.default_model == "deepseek-coder-v2:16b"
     assert cfg.default_backend == "ollama"
 
 

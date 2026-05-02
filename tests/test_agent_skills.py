@@ -24,7 +24,7 @@ from khonliang_reviewer import (
 )
 from reviewer.agent import ReviewerAgent
 from reviewer.registry import ProviderRegistry
-from reviewer.selector import ProviderSelector, SelectorConfig
+from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
 
 
@@ -147,8 +147,14 @@ def test_skills_parameters_match_public_contract():
 
 
 async def test_review_text_routes_to_rule_table_default_backend():
-    """Small content + pr_diff → rule table picks ollama/qwen2.5-coder:14b (fallback)."""
-    fake = _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))
+    """Small content + pr_diff → rule table picks ollama + the promoted
+    ``DEFAULT_REVIEWER_MODEL`` (fallback). Asserting the constant rather
+    than the literal so future model promotions only need to touch
+    ``reviewer/defaults.py`` (the single source of truth;
+    ``reviewer.selector`` re-exports for backward compat)."""
+    fake = _RecordingProvider(
+        "ollama", _make_result(backend="ollama", model=DEFAULT_REVIEWER_MODEL)
+    )
     harness = _make_harness({"ollama": fake})
 
     result = await harness.call(
@@ -161,7 +167,7 @@ async def test_review_text_routes_to_rule_table_default_backend():
     assert fake.last_request is not None
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
-    assert fake.last_request.metadata["model"] == "qwen2.5-coder:14b"
+    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
 
 
 async def test_review_text_caller_backend_override_picks_specific_provider():
@@ -308,7 +314,7 @@ async def test_review_text_merges_caller_metadata_with_model():
     assert fake.last_request.metadata["repo"] == "tolldog/x"
     assert fake.last_request.metadata["pr_number"] == 7
     # rule-table-chosen model injected alongside
-    assert fake.last_request.metadata["model"] == "qwen2.5-coder:14b"
+    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
 
 
 async def test_review_text_strips_reserved_khonliang_metadata_keys():
@@ -344,7 +350,7 @@ async def test_review_text_strips_reserved_khonliang_metadata_keys():
     # legitimate caller key preserved
     assert md["repo"] == "tolldog/x"
     # rule-table-chosen model still injected
-    assert md["model"] == "qwen2.5-coder:14b"
+    assert md["model"] == DEFAULT_REVIEWER_MODEL
     # reserved-prefix keys scrubbed — none of them should survive
     assert "_khonliang_repo_prompts" not in md
     assert "_khonliang_example_format" not in md
@@ -1295,7 +1301,16 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         "ollama",
     }
     assert selector.config.default_backend == "ollama"
-    assert selector.config.default_model == "qwen2.5-coder:14b"
+    # Reference the constant rather than the literal so future model
+    # promotions don't have to touch this assertion. The value the
+    # constant resolves to is the ``SelectorConfig.default_model``
+    # used when the rule table doesn't return an explicit model — the
+    # caller-override path goes through ``decide()`` first, so this
+    # field is the floor an empty-config operator gets, not the
+    # rule-table default that ``handle_review_diff`` typically uses.
+    # ``rules.policy.DEFAULT_FALLBACK`` tracks the same constant so
+    # both fallback paths align by default.
+    assert selector.config.default_model == DEFAULT_REVIEWER_MODEL
 
 
 def test_default_selector_honors_config_yaml(tmp_path):
@@ -1383,9 +1398,10 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     ``OllamaProviderConfig.default_model`` from the global
     ``config.default_model`` — which would inject a Claude model id
     into Ollama. The current shape sources Ollama's default from
-    ``providers.ollama.default_model`` with a built-in qwen baseline,
-    so a caller that picks ``backend: ollama`` without a model gets a
-    valid Ollama model id even when the global default isn't Ollama-shaped.
+    ``providers.ollama.default_model`` with a built-in
+    ``DEFAULT_REVIEWER_MODEL`` baseline, so a caller that picks
+    ``backend: ollama`` without a model gets a valid Ollama model id
+    even when the global default isn't Ollama-shaped.
     """
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -1403,12 +1419,13 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
     # Built-in baseline applies; the global default_model 'claude-opus-4-7'
-    # must NOT have leaked into Ollama's provider config.
-    assert ollama_provider.config.default_model == "qwen2.5-coder:14b"
+    # must NOT have leaked into Ollama's provider config. Reference the
+    # constant so future model promotions don't have to touch this assertion.
+    assert ollama_provider.config.default_model == DEFAULT_REVIEWER_MODEL
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):
-    """When operators set ``providers.ollama.default_model`` it overrides the qwen baseline."""
+    """When operators set ``providers.ollama.default_model`` it overrides the ``DEFAULT_REVIEWER_MODEL`` baseline."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "default_provider: claude_cli\n"

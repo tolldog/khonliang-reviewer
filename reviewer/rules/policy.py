@@ -33,6 +33,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+# Imported from the dependency-free ``reviewer.defaults`` module rather
+# than ``reviewer.selector`` to avoid a future circular import: the
+# selector docstring notes it will eventually wire in the rule table
+# (i.e. import from ``reviewer.rules.policy``), which would close a
+# cycle if this file imported back from selector. Both modules now
+# depend "downward" on ``reviewer.defaults``. PR #40 review pass-4
+# finding 1.
+from reviewer.defaults import DEFAULT_REVIEWER_MODEL
+
 
 #: Floor context window sizes, in input tokens. Matches the documented
 #: capability bands across ollama + claude at the time of writing.
@@ -138,13 +147,20 @@ DEFAULT_RULES: list[Rule] = [
 ]
 
 
-#: Ultimate fallback when nothing in the rules matches — cheapest viable
-#: option. Matches the Ollama Copilot-CLI doc's recommended default.
+#: Ultimate fallback when nothing in the rules matches. Sourced from the
+#: ecosystem-wide ``DEFAULT_REVIEWER_MODEL`` constant in
+#: ``reviewer/defaults.py`` (re-exported from ``reviewer/selector.py``
+#: for backward compat) so a single edit there shifts both the
+#: SelectorConfig fallback AND this rule-table fallback. The
+#: ``docs_kind_to_qwen_small`` rule above intentionally pins
+#: ``qwen2.5-coder:14b`` for short-text reviews — that's a deliberate
+#: small-model carve-out and is not a "default" in the sense this
+#: constant captures.
 DEFAULT_FALLBACK = PolicyDecision(
     backend="ollama",
-    model="qwen2.5-coder:14b",
+    model=DEFAULT_REVIEWER_MODEL,
     context_window_floor=CTX_SMALL,
-    reason="default fallback — small code-diff review on qwen2.5-coder:14b",
+    reason=f"default fallback — small code-diff review on {DEFAULT_REVIEWER_MODEL}",
 )
 
 

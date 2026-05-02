@@ -7,11 +7,23 @@ db_path: data/reviewer.db
 # Bus URL this agent registers with.
 bus_url: http://localhost:8787
 
-# Default provider used when the rule table has no better match.
-# Rule-table-driven selection lands in a later work unit; until then this
-# value is what the placeholder skill falls back to.
+# Selector-layer default provider/model. Resolution order for
+# `handle_review_text` / `handle_review_diff`: caller-supplied
+# `(backend, model)` always wins; otherwise the rule table
+# (`reviewer.rules.policy.decide()`) consults review kind + diff
+# size + repo profile and returns an explicit `(backend, model)`
+# pair, which is what the typical no-override review path uses; the
+# fields below are the SelectorConfig fallback when neither caller
+# nor rule-table produces an explicit model. Both the rule-table
+# `DEFAULT_FALLBACK` and `SelectorConfig.default_model` track the
+# `DEFAULT_REVIEWER_MODEL` constant in `reviewer/defaults.py`, so a
+# single edit there flips both fallback paths in lockstep.
+#
+# `deepseek-coder-v2:16b` was promoted from `qwen2.5-coder:14b` on the
+# 2026-04-30 speed sweep — 334 tok/s vs 94 tok/s on the same hardware
+# (RTX 5080, MoE active path). Same VRAM tier (~8.9 GB).
 default_provider: ollama
-default_model: qwen2.5-coder:14b
+default_model: deepseek-coder-v2:16b
 
 # Per-backend default models. Preferred over the legacy single-string
 # `default_model` above: each backend ships its own sensible default so
@@ -27,7 +39,7 @@ default_models:
   claude_cli: sonnet
   codex_cli: ""        # codex_cli picks its own default
   gh_copilot: ""       # gh_copilot picks its own default
-  ollama: qwen2.5-coder:14b
+  ollama: deepseek-coder-v2:16b
 
 # Provider-specific configuration. Each provider is implemented in a later
 # work unit; the keys below are placeholders documenting the eventual shape.

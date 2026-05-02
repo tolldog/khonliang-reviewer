@@ -20,6 +20,14 @@ from typing import Mapping
 
 from khonliang_reviewer import ReviewProvider
 
+# Re-export ``DEFAULT_REVIEWER_MODEL`` so existing callers that import
+# it from ``reviewer.selector`` keep working. The constant itself
+# lives in ``reviewer.defaults`` (a dependency-free leaf module) so
+# ``reviewer.rules.policy`` can also import it without creating a
+# selector ↔ rules cycle when the selector eventually wires the rule
+# table in. PR #40 review pass-4 finding 1.
+from reviewer.defaults import DEFAULT_REVIEWER_MODEL
+
 
 class UnknownBackendError(ValueError):
     """Raised when the caller or config references an unregistered backend."""
@@ -54,7 +62,11 @@ class SelectorConfig:
     """
 
     default_backend: str = "ollama"
-    default_model: str = "qwen2.5-coder:14b"
+    # 2026-04-30 speed sweep measured deepseek-coder-v2:16b at 334 tok/s
+    # warm vs qwen2.5-coder:14b at 94 tok/s on identical hardware
+    # (RTX 5080, sm_120) — 3.5× faster via MoE active path while sitting
+    # in the same VRAM tier (8.9 GB). Promoted to default.
+    default_model: str = DEFAULT_REVIEWER_MODEL
     default_models: dict[str, str] = field(default_factory=dict)
 
 
@@ -158,6 +170,7 @@ class ProviderSelector:
 
 
 __all__ = [
+    "DEFAULT_REVIEWER_MODEL",
     "ProviderSelector",
     "SelectorConfig",
     "UnknownBackendError",

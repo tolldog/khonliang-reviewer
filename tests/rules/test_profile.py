@@ -144,9 +144,13 @@ async def test_profile_flows_into_policy_input():
     )
     profile = await cache.get_profile("reviewer")
 
+    from reviewer.selector import DEFAULT_REVIEWER_MODEL
+
     decision = decide(
         PolicyInput(kind="pr_diff", diff_line_count=20, profile=profile)
     )
-    # small diff + profile present → fallback still applies
+    # small diff + profile present → fallback still applies. Track the
+    # promoted constant so a swap of DEFAULT_REVIEWER_MODEL doesn't
+    # require touching this assertion.
     assert decision.backend == "ollama"
-    assert decision.model == "qwen2.5-coder:14b"
+    assert decision.model == DEFAULT_REVIEWER_MODEL
