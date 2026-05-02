@@ -33,6 +33,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from reviewer.selector import DEFAULT_REVIEWER_MODEL
+
 
 #: Floor context window sizes, in input tokens. Matches the documented
 #: capability bands across ollama + claude at the time of writing.
@@ -138,13 +140,19 @@ DEFAULT_RULES: list[Rule] = [
 ]
 
 
-#: Ultimate fallback when nothing in the rules matches — cheapest viable
-#: option. Matches the Ollama Copilot-CLI doc's recommended default.
+#: Ultimate fallback when nothing in the rules matches. Sourced from the
+#: ecosystem-wide ``DEFAULT_REVIEWER_MODEL`` constant in
+#: ``reviewer/selector.py`` so a single edit there shifts both the
+#: SelectorConfig fallback AND the rule-table fallback. The
+#: ``docs_kind_to_qwen_small`` rule above intentionally pins
+#: ``qwen2.5-coder:14b`` for short-text reviews — that's a deliberate
+#: small-model carve-out and is not a "default" in the sense this
+#: constant captures.
 DEFAULT_FALLBACK = PolicyDecision(
     backend="ollama",
-    model="qwen2.5-coder:14b",
+    model=DEFAULT_REVIEWER_MODEL,
     context_window_floor=CTX_SMALL,
-    reason="default fallback — small code-diff review on qwen2.5-coder:14b",
+    reason=f"default fallback — small code-diff review on {DEFAULT_REVIEWER_MODEL}",
 )
 
 

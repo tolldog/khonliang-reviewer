@@ -13,6 +13,7 @@ from reviewer.rules import (
     Rule,
     decide,
 )
+from reviewer.selector import DEFAULT_REVIEWER_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +25,11 @@ def test_empty_input_hits_fallback():
     decision = decide(PolicyInput())
     assert decision == DEFAULT_FALLBACK
     assert decision.backend == "ollama"
-    assert decision.model == "qwen2.5-coder:14b"
+    # Fallback tracks ``DEFAULT_REVIEWER_MODEL`` so a swap there shifts
+    # both the SelectorConfig fallback and the rule-table fallback in
+    # one edit. Asserting the constant (not a literal) keeps this test
+    # honest after future promotions.
+    assert decision.model == DEFAULT_REVIEWER_MODEL
 
 
 def test_small_code_diff_hits_fallback():

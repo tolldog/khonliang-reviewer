@@ -2190,8 +2190,9 @@ class ReviewerAgent(BaseAgent):
         )
         # Source Ollama's provider-default model from
         # ``providers.ollama.default_model`` (per-provider config),
-        # falling back to ``DEFAULT_REVIEWER_MODEL`` (the
-        # ecosystem-wide default; see reviewer/selector.py).
+        # falling back to ``DEFAULT_REVIEWER_MODEL`` (defined in
+        # reviewer/selector.py and also referenced by
+        # rules.policy.DEFAULT_FALLBACK so both fallback paths align).
         # Decoupled from
         # the global ``config.default_model`` so an operator who sets
         # ``default_provider: claude_cli`` and ``default_model:
