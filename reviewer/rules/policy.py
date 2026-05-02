@@ -33,7 +33,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from reviewer.selector import DEFAULT_REVIEWER_MODEL
+# Imported from the dependency-free ``reviewer.defaults`` module rather
+# than ``reviewer.selector`` to avoid a future circular import: the
+# selector docstring notes it will eventually wire in the rule table
+# (i.e. import from ``reviewer.rules.policy``), which would close a
+# cycle if this file imported back from selector. Both modules now
+# depend "downward" on ``reviewer.defaults``. PR #40 review pass-4
+# finding 1.
+from reviewer.defaults import DEFAULT_REVIEWER_MODEL
 
 
 #: Floor context window sizes, in input tokens. Matches the documented

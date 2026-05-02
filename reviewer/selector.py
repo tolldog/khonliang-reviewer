@@ -20,15 +20,13 @@ from typing import Mapping
 
 from khonliang_reviewer import ReviewProvider
 
-
-#: Module-level constant — the agent boot path's hard-coded fallback when
-#: ``config.yaml`` omits ``default_model`` AND when ``providers.ollama.default_model``
-#: is also absent. Single source of truth so the dataclass default below and
-#: the agent's two fallback sites can't drift. PR #40 review feedback caught
-#: that hard-coding the literal at the agent boot site overrode the
-#: ``SelectorConfig.default_model`` dataclass default; this constant fixes
-#: that by giving every fallback path one place to look.
-DEFAULT_REVIEWER_MODEL = "deepseek-coder-v2:16b"
+# Re-export ``DEFAULT_REVIEWER_MODEL`` so existing callers that import
+# it from ``reviewer.selector`` keep working. The constant itself
+# lives in ``reviewer.defaults`` (a dependency-free leaf module) so
+# ``reviewer.rules.policy`` can also import it without creating a
+# selector ↔ rules cycle when the selector eventually wires the rule
+# table in. PR #40 review pass-4 finding 1.
+from reviewer.defaults import DEFAULT_REVIEWER_MODEL
 
 
 class UnknownBackendError(ValueError):
