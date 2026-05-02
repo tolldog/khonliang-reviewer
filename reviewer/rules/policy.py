@@ -149,8 +149,9 @@ DEFAULT_RULES: list[Rule] = [
 
 #: Ultimate fallback when nothing in the rules matches. Sourced from the
 #: ecosystem-wide ``DEFAULT_REVIEWER_MODEL`` constant in
-#: ``reviewer/selector.py`` so a single edit there shifts both the
-#: SelectorConfig fallback AND the rule-table fallback. The
+#: ``reviewer/defaults.py`` (re-exported from ``reviewer/selector.py``
+#: for backward compat) so a single edit there shifts both the
+#: SelectorConfig fallback AND this rule-table fallback. The
 #: ``docs_kind_to_qwen_small`` rule above intentionally pins
 #: ``qwen2.5-coder:14b`` for short-text reviews — that's a deliberate
 #: small-model carve-out and is not a "default" in the sense this
