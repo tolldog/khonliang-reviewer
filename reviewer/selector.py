@@ -172,6 +172,7 @@ class ProviderSelector:
 
 
 __all__ = [
+    "DEFAULT_REVIEWER_MODEL",
     "ProviderSelector",
     "SelectorConfig",
     "UnknownBackendError",
