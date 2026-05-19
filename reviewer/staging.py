@@ -1,0 +1,161 @@
+"""Resolve ``staging_handle`` tokens produced by ``kh-stage`` to bundle bytes.
+
+Pattern (closes ``fr_reviewer_800e851d``; pairs with
+``fr_khonliang-bus-lib_520ce3bf`` on the writer side): the caller hands the
+reviewer an opaque ``<backend>:<id>`` token instead of the raw diff. The
+reviewer reads the bundle on its side, so the caller never pays diff-size
+token cost on its MCP context.
+
+Today's only wired backend is ``fs`` (group-readable bundles under
+``/var/lib/khonliang/staging/<uuid>/``). ``store:`` is reserved for the
+future store-agent staging surface — handles parse, but resolution raises
+:class:`StagingNotImplemented` so the surface is forward-stable.
+
+The staging root is configurable via the ``KHONLIANG_STAGING_ROOT`` env
+var (default ``/var/lib/khonliang/staging``). Tests and dev environments
+that can't write to ``/var/lib`` override via the env var; production
+overrides via the systemd unit's ``Environment=`` line if a non-default
+location is needed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import NamedTuple
+
+DEFAULT_STAGING_ROOT = Path("/var/lib/khonliang/staging")
+ENV_STAGING_ROOT = "KHONLIANG_STAGING_ROOT"
+
+
+class StagingHandleError(ValueError):
+    """Raised when a staging_handle is malformed or the bundle can't be read."""
+
+
+class StagingNotImplemented(NotImplementedError):
+    """Raised when the handle's backend or bundle kind isn't wired yet.
+
+    Distinct from :class:`StagingHandleError` so callers can render
+    "we know what you meant; come back when X lands" differently from
+    "the handle itself is bad."
+    """
+
+
+class ResolvedBundle(NamedTuple):
+    """The output of ``resolve()`` — what the review pipeline needs.
+
+    ``kind`` carries the manifest's bundle kind verbatim (``"diff"`` today;
+    ``"changed-files"`` / ``"module"`` / ``"repo"`` / ``"with-context"``
+    once kh-stage implements them) so the caller can route based on
+    bundle shape without re-reading the manifest.
+    """
+
+    kind: str
+    diff_bytes: bytes
+
+
+def staging_root() -> Path:
+    """Return the active staging root.
+
+    Read from the env var on every call (no caching) so test fixtures
+    that ``monkeypatch.setenv(...)`` per-test are honored.
+    """
+    return Path(os.environ.get(ENV_STAGING_ROOT, str(DEFAULT_STAGING_ROOT)))
+
+
+def parse_handle(handle: str) -> tuple[str, str]:
+    """Split ``<backend>:<id>`` into ``(backend, id)``.
+
+    Validates only the *shape*; whether the backend is supported or the
+    id resolvable is resolve_*'s job.
+    """
+    if not isinstance(handle, str) or not handle:
+        raise StagingHandleError("staging_handle must be a non-empty string")
+    if ":" not in handle:
+        raise StagingHandleError(
+            f"staging_handle missing '<backend>:' prefix: {handle!r}"
+        )
+    backend, _, ident = handle.partition(":")
+    if not backend or not ident:
+        raise StagingHandleError(
+            f"staging_handle has empty backend or id: {handle!r}"
+        )
+    return backend, ident
+
+
+def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
+    """Read an ``fs:`` bundle from the staging root.
+
+    Bundle layout (set by ``kh-stage``):
+        <root>/<bundle_id>/manifest.json    {"kind": "diff", ...}
+        <root>/<bundle_id>/diff.patch       raw unified-diff bytes
+
+    Today only ``kind="diff"`` is wired. Other kinds parse correctly but
+    raise :class:`StagingNotImplemented` so reviewer adoption can lag
+    kh-stage by one ship cycle for each new depth mode.
+    """
+    if root is None:
+        root = staging_root()
+    bundle_dir = root / bundle_id
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise StagingHandleError(
+            f"fs bundle manifest not found at {manifest_path}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StagingHandleError(
+            f"fs bundle manifest unreadable at {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise StagingHandleError(
+            f"fs bundle manifest at {manifest_path} must be a JSON object"
+        )
+    kind = manifest.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise StagingHandleError(
+            f"fs bundle manifest at {manifest_path} missing required 'kind' string"
+        )
+    if kind != "diff":
+        raise StagingNotImplemented(
+            f"fs bundle kind={kind!r} not yet wired in reviewer; "
+            "only 'diff' is implemented today (richer modes land per "
+            "fr_khonliang-bus-lib_520ce3bf follow-ups)"
+        )
+    diff_path = bundle_dir / "diff.patch"
+    if not diff_path.is_file():
+        raise StagingHandleError(
+            f"fs bundle missing diff.patch at {diff_path}"
+        )
+    try:
+        diff_bytes = diff_path.read_bytes()
+    except OSError as exc:
+        raise StagingHandleError(
+            f"fs bundle diff.patch unreadable at {diff_path}: {exc}"
+        ) from exc
+    return ResolvedBundle(kind=kind, diff_bytes=diff_bytes)
+
+
+def resolve(handle: str, *, root: Path | None = None) -> ResolvedBundle:
+    """Resolve any backend's handle to a :class:`ResolvedBundle`.
+
+    Dispatch table:
+        ``fs:<uuid>``    -> :func:`resolve_fs`
+        ``store:<id>``   -> :class:`StagingNotImplemented` (reserved; lands
+                            with the store-agent staging surface)
+        anything else    -> :class:`StagingHandleError`
+    """
+    backend, ident = parse_handle(handle)
+    if backend == "fs":
+        return resolve_fs(ident, root=root)
+    if backend == "store":
+        raise StagingNotImplemented(
+            "staging_handle backend='store' lands when the store agent "
+            "grows a byte-shaped staging surface; see fr_reviewer_800e851d"
+        )
+    raise StagingHandleError(
+        f"unknown staging_handle backend {backend!r} "
+        "(supported: fs; reserved: store)"
+    )

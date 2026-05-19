@@ -78,6 +78,11 @@ from reviewer.selector import (
     SelectorConfig,
     UnknownBackendError,
 )
+from reviewer.staging import (
+    StagingHandleError,
+    StagingNotImplemented,
+    resolve as resolve_staging_handle,
+)
 from reviewer.storage import UsageStore, open_usage_store
 
 
@@ -732,6 +737,67 @@ def _resolve_payload_arg(args: dict[str, Any], *, prefer: str = "content") -> st
     return ""
 
 
+def _resolve_payload_or_staging(
+    args: dict[str, Any], *, prefer: str = "content"
+) -> tuple[str, dict[str, Any] | None]:
+    """Resolve a review payload from ``content``/``diff`` OR ``staging_handle``.
+
+    Returns ``(payload, error)``. Exactly one of the inline payload args
+    and ``staging_handle`` may be set:
+
+    - inline only -> return ``(inline_bytes, None)``.
+    - staging_handle only -> resolve via :func:`reviewer.staging.resolve`,
+      return ``(diff_bytes_decoded, None)`` for ``kind="diff"`` bundles.
+      Today other kinds raise :class:`StagingNotImplemented` from the
+      resolver — surfaced as an error envelope.
+    - both set -> error envelope (ambiguous).
+    - neither set -> error envelope ("required").
+
+    Bundles store raw bytes; the review pipeline downstream operates on
+    ``str``. Decode with ``errors="replace"`` rather than ``strict`` so a
+    diff that picked up an odd byte (rare but possible — non-UTF-8
+    paths, binary-section markers under ``--binary``) reaches the
+    reviewer rather than failing the resolve. The diff content is for
+    prompt assembly, not byte-identity reconstruction.
+    """
+    inline_payload = _resolve_payload_arg(args, prefer=prefer)
+    staging_handle = args.get("staging_handle")
+
+    alias = "diff" if prefer == "content" else "content"
+
+    if inline_payload and staging_handle:
+        return ("", {
+            "error": (
+                f"pass exactly one of {prefer}/{alias} or staging_handle, "
+                "not both"
+            )
+        })
+
+    if staging_handle is not None:
+        if not isinstance(staging_handle, str) or not staging_handle:
+            return ("", {"error": "staging_handle must be a non-empty string"})
+        try:
+            bundle = resolve_staging_handle(staging_handle)
+        except StagingHandleError as exc:
+            return ("", {"error": f"staging_handle: {exc}"})
+        except StagingNotImplemented as exc:
+            return ("", {"error": f"staging_handle: {exc}"})
+        return (
+            bundle.diff_bytes.decode("utf-8", errors="replace"),
+            None,
+        )
+
+    if not inline_payload:
+        return ("", {
+            "error": (
+                f"{prefer} (or {alias}, or staging_handle) is required "
+                "and must be a non-empty string"
+            )
+        })
+
+    return (inline_payload, None)
+
+
 def _coerce_default_models(val: Any) -> dict[str, str]:
     """Coerce ``config['default_models']`` to a ``dict[str, str]``.
 
@@ -1088,15 +1154,17 @@ class ReviewerAgent(BaseAgent):
         if not kind:
             return {"error": "kind is required"}
 
-        # Accept ``content`` (canonical) OR ``diff`` (alias) — review_text
-        # and review_diff differ in framing (freeform text vs unified diff
-        # bytes), not field name. Subagents drift between the two; the
-        # alias collapses the surface so either name works on either skill.
-        # ``content`` wins when both are non-empty so the canonical name
-        # remains authoritative.
-        content = _resolve_payload_arg(args)
-        if not content:
-            return {"error": "content (or diff) is required and must be a non-empty string"}
+        # Accept ``content`` (canonical), ``diff`` (alias), or
+        # ``staging_handle`` (out-of-context byte handoff via the
+        # kh-stage CLI — closes fr_reviewer_800e851d). Exactly one
+        # must be set; the resolver returns an error envelope on
+        # ambiguity, malformed handles, or unimplemented bundle kinds.
+        # ``content`` wins when both inline names are non-empty so the
+        # canonical name remains authoritative; ``staging_handle`` is
+        # mutually exclusive with either inline arg.
+        content, payload_error = _resolve_payload_or_staging(args)
+        if payload_error is not None:
+            return payload_error
 
         caller_backend = args.get("backend") or None
         # Preserve an explicit empty-string model: ``model=""`` means
@@ -1729,15 +1797,18 @@ class ReviewerAgent(BaseAgent):
 
     @handler("review_diff")
     async def handle_review_diff(self, args: dict[str, Any]) -> dict[str, Any]:
-        # Accept ``diff`` (canonical) OR ``content`` (alias). For
-        # review_diff the resolution prefers ``diff`` since that's the
-        # canonical-for-this-skill name; ``content`` is the legacy /
-        # cross-skill alias.
-        diff = _resolve_payload_arg(args, prefer="diff")
-        if not diff:
-            return {"error": "diff (or content) is required and must be a non-empty string"}
+        # Accept ``diff`` (canonical), ``content`` (alias), or
+        # ``staging_handle`` (out-of-context byte handoff per
+        # fr_reviewer_800e851d / fr_khonliang-bus-lib_520ce3bf).
+        # ``staging_handle`` is mutually exclusive with the inline args;
+        # the resolver returns the error envelope when violated.
+        diff, payload_error = _resolve_payload_or_staging(args, prefer="diff")
+        if payload_error is not None:
+            return payload_error
         forwarded = {
-            k: v for k, v in args.items() if k not in {"diff", "kind", "content"}
+            k: v
+            for k, v in args.items()
+            if k not in {"diff", "kind", "content", "staging_handle"}
         }
         forwarded["kind"] = "pr_diff"
         forwarded["content"] = diff
