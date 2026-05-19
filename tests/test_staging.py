@@ -180,3 +180,79 @@ def test_staging_root_default(monkeypatch) -> None:
 def test_staging_root_env_override(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv(staging.ENV_STAGING_ROOT, str(tmp_path))
     assert staging.staging_root() == tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Path-traversal hardening (pass-1 finding on reviewer/staging.py:105).
+#
+# The reviewer is a bus service that can be called by arbitrary clients;
+# an attacker-controlled ``staging_handle`` must not be able to read
+# files outside the staging root via ``../`` segments, absolute paths,
+# or symlink swaps.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../etc",
+        "../../etc/passwd",
+        "subdir/escape",
+        "/absolute/path",
+        ".",
+        "..",
+        ".tmp-half-written",
+        ".hidden",
+        "with\x00nul",
+        "",
+    ],
+)
+def test_resolve_fs_rejects_unsafe_bundle_id(tmp_path: Path, bad_id: str) -> None:
+    """``bundle_id`` must be a single safe path segment. Anything that
+    could traverse out of the staging root (``..``), reach in via an
+    absolute path, point at a writer-side temp dir (``.tmp-...``), or
+    smuggle a NUL byte must be rejected before any filesystem access.
+    """
+    with pytest.raises(staging.StagingHandleError):
+        staging.resolve_fs(bad_id, root=tmp_path)
+
+
+def test_resolve_fs_rejects_symlink_escape(tmp_path: Path) -> None:
+    """Defense in depth: even if a bundle dir name passes the segment
+    check, the resolved path must live under the resolved staging
+    root. Symlink ``<root>/escape`` -> ``<tmp>/outside`` should be
+    rejected, NOT followed.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "manifest.json").write_text(
+        json.dumps({"kind": "diff", "created_at": 1.0})
+    )
+    (outside / "diff.patch").write_bytes(b"leaked")
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    (staging_dir / "escape").symlink_to(outside)
+
+    with pytest.raises(staging.StagingHandleError, match="escapes staging root"):
+        staging.resolve_fs("escape", root=staging_dir)
+
+
+def test_resolve_dispatch_rejects_traversal_handle(tmp_path: Path, monkeypatch) -> None:
+    """Top-level ``resolve("fs:../etc")`` must reject before any fs read."""
+    monkeypatch.setenv(staging.ENV_STAGING_ROOT, str(tmp_path))
+    with pytest.raises(staging.StagingHandleError):
+        staging.resolve("fs:../etc")
+
+
+def test_is_within_helper(tmp_path: Path) -> None:
+    """Sanity-check the internal containment predicate."""
+    root = tmp_path / "root"
+    root.mkdir()
+    inside = root / "child"
+    inside.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    assert staging._is_within(inside.resolve(), root.resolve()) is True
+    assert staging._is_within(root.resolve(), root.resolve()) is True
+    assert staging._is_within(outside.resolve(), root.resolve()) is False

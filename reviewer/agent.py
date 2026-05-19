@@ -959,10 +959,13 @@ class ReviewerAgent(BaseAgent):
                 "review_text",
                 "Run a review over arbitrary content. Returns structured "
                 "findings + usage record. The payload may be passed as "
-                "`content` (canonical) OR `diff` (alias accepted for "
-                "callers coming from the `review_diff` shape) — whichever "
-                "is non-empty wins, with `content` taking precedence "
-                "when both are supplied.",
+                "`content` (canonical), `diff` (alias accepted for "
+                "callers coming from the `review_diff` shape), OR "
+                "`staging_handle` (out-of-context byte handoff from "
+                "kh-stage, e.g. `fs:<uuid>` — closes "
+                "fr_reviewer_800e851d). Exactly one of the three must "
+                "be set; `content`/`diff` are mutually exclusive with "
+                "`staging_handle`.",
                 {
                     "kind": {"type": "string", "required": True},
                     # Canonical payload field. ``diff`` is also accepted
@@ -971,6 +974,12 @@ class ReviewerAgent(BaseAgent):
                     # whichever is non-empty (content wins on tie).
                     "content": {"type": "string", "default": ""},
                     "diff": {"type": "string", "default": ""},
+                    # Out-of-context byte handoff (fr_reviewer_800e851d).
+                    # Shape: ``<backend>:<id>`` where backend is ``fs``
+                    # today (bundle under /var/lib/khonliang/staging/)
+                    # or ``store`` (reserved). Mutually exclusive with
+                    # content/diff.
+                    "staging_handle": {"type": "string", "default": ""},
                     "instructions": {"type": "string", "default": ""},
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
@@ -1038,15 +1047,21 @@ class ReviewerAgent(BaseAgent):
             Skill(
                 "review_diff",
                 "Shortcut for review_text with kind='pr_diff'. The "
-                "payload may be passed as `diff` (canonical) OR "
-                "`content` (alias accepted for callers coming from the "
-                "`review_text` shape). The two skills differ in framing "
-                "(diff bytes vs freeform text), not field name.",
+                "payload may be passed as `diff` (canonical), `content` "
+                "(alias), OR `staging_handle` (out-of-context byte "
+                "handoff from kh-stage, e.g. `fs:<uuid>` — closes "
+                "fr_reviewer_800e851d). Exactly one must be set; "
+                "`diff`/`content` are mutually exclusive with "
+                "`staging_handle`.",
                 {
                     # Canonical payload field. ``content`` is also
                     # accepted as an alias.
                     "diff": {"type": "string", "default": ""},
                     "content": {"type": "string", "default": ""},
+                    # Out-of-context byte handoff (fr_reviewer_800e851d);
+                    # mutually exclusive with diff/content. See
+                    # ``review_text`` schema for shape.
+                    "staging_handle": {"type": "string", "default": ""},
                     "instructions": {"type": "string", "default": ""},
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
@@ -1104,6 +1119,9 @@ class ReviewerAgent(BaseAgent):
                     "kind": {"type": "string", "default": ""},
                     "content": {"type": "string", "default": ""},
                     "diff": {"type": "string", "default": ""},
+                    # Out-of-context byte handoff (fr_reviewer_800e851d).
+                    # Pass-through mode resolves it via review_text.
+                    "staging_handle": {"type": "string", "default": ""},
                     "instructions": {"type": "string", "default": ""},
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},

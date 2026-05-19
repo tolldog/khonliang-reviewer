@@ -139,6 +139,17 @@ def test_skills_parameters_match_public_contract():
     for optional in ("instructions", "context", "backend", "model", "request_id", "metadata"):
         assert optional in skill.parameters
         assert skill.parameters[optional].get("required", False) is False
+    # ``staging_handle`` is declared on review_text, review_diff, and
+    # sign_off_trailer so bus-side schema discovery surfaces the new
+    # surface (fr_reviewer_800e851d). Optional; mutually exclusive
+    # with content/diff at the handler level.
+    for skill_name in ("review_text", "review_diff", "sign_off_trailer"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "staging_handle" in s.parameters, (
+            f"{skill_name} schema missing staging_handle"
+        )
+        assert s.parameters["staging_handle"]["type"] == "string"
+        assert s.parameters["staging_handle"].get("required", False) is False
 
 
 # ---------------------------------------------------------------------------
@@ -802,6 +813,23 @@ async def test_review_diff_missing_bundle_rejects(tmp_path, monkeypatch):
     )
     assert "error" in result
     assert "manifest not found" in result["error"]
+
+
+async def test_review_diff_rejects_path_traversal_handle(tmp_path, monkeypatch):
+    """Pass-1 finding: untrusted ``staging_handle`` must not traverse
+    outside the staging root. ``fs:../etc`` reaches the handler ->
+    resolver -> ``_validate_bundle_id_segment`` -> rejection envelope.
+    Tested end-to-end through the bus handler so a regression at
+    either layer (resolver hardening or handler surfacing) is caught.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "fs:../etc"},
+    )
+    assert "error" in result
+    assert "staging_handle" in result["error"]
 
 
 async def test_review_diff_strips_staging_handle_from_forwarded_args(

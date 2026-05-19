@@ -64,6 +64,23 @@ def staging_root() -> Path:
     return Path(os.environ.get(ENV_STAGING_ROOT, str(DEFAULT_STAGING_ROOT)))
 
 
+def _is_within(candidate: Path, root: Path) -> bool:
+    """True iff ``candidate`` is ``root`` or a descendant of it.
+
+    Uses ``Path.relative_to`` (3.9-compatible) rather than ``is_relative_to``
+    (3.9+) for portability, then verifies the result doesn't escape via
+    ``..`` segments. Both args must already be ``.resolve()``-d by the
+    caller for symlink resistance.
+    """
+    try:
+        rel = candidate.relative_to(root)
+    except ValueError:
+        return False
+    # ``relative_to`` raises on non-prefix paths; defense in depth
+    # against any future Path bug that lets ``..`` slip through.
+    return ".." not in rel.parts
+
+
 def parse_handle(handle: str) -> tuple[str, str]:
     """Split ``<backend>:<id>`` into ``(backend, id)``.
 
@@ -84,6 +101,54 @@ def parse_handle(handle: str) -> tuple[str, str]:
     return backend, ident
 
 
+def _validate_bundle_id_segment(bundle_id: str) -> None:
+    """Reject bundle_ids that could escape the staging root.
+
+    The reviewer is a service that can be called by arbitrary bus
+    clients; an attacker who can submit ``staging_handle`` values
+    could try ``fs:../../etc`` or ``fs:/abs/path`` to make
+    ``resolve_fs`` read ``/etc/manifest.json`` and ``/etc/diff.patch``.
+    We constrain ``bundle_id`` to a single safe path segment:
+
+    - non-empty
+    - no path separators (``/`` or ``\\``)
+    - not equal to ``.`` or ``..``
+    - not starting with ``.`` (excludes both ``..`` and the
+      ``.tmp-<uuid>`` half-written bundles that kh-stage uses)
+    - not absolute (no leading ``/`` on POSIX; ``Path.is_absolute()``
+      catches Windows shapes too)
+
+    The check is shape-only — bundle_id doesn't have to be a UUID.
+    Defense-in-depth path-containment is applied by
+    :func:`resolve_fs` after constructing the final ``Path``.
+    """
+    if not bundle_id:
+        raise StagingHandleError("staging_handle: bundle_id is empty")
+    if "/" in bundle_id or "\\" in bundle_id:
+        raise StagingHandleError(
+            f"staging_handle: bundle_id must be a single path segment "
+            f"(got {bundle_id!r} containing path separator)"
+        )
+    if bundle_id in (".", ".."):
+        raise StagingHandleError(
+            f"staging_handle: bundle_id may not be {bundle_id!r}"
+        )
+    if bundle_id.startswith("."):
+        # Reject both ".." (caught above), ".tmp-<uuid>" half-written
+        # bundles, and any other dot-prefixed name that suggests a
+        # leak from the writer side.
+        raise StagingHandleError(
+            f"staging_handle: bundle_id may not start with '.' "
+            f"(got {bundle_id!r})"
+        )
+    # NUL byte is invalid in POSIX paths; reject pre-emptively so a
+    # clever payload doesn't end up with a truncated open() call.
+    if "\x00" in bundle_id:
+        raise StagingHandleError(
+            "staging_handle: bundle_id contains NUL byte"
+        )
+
+
 def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
     """Read an ``fs:`` bundle from the staging root.
 
@@ -94,10 +159,35 @@ def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
     Today only ``kind="diff"`` is wired. Other kinds parse correctly but
     raise :class:`StagingNotImplemented` so reviewer adoption can lag
     kh-stage by one ship cycle for each new depth mode.
+
+    Security: ``bundle_id`` is constrained to a single safe path segment
+    (see :func:`_validate_bundle_id_segment`) and the resolved bundle
+    dir is checked to live under the staging root before any read,
+    so an attacker-controlled handle can't escape via ``../`` or a
+    symlink swap.
     """
     if root is None:
         root = staging_root()
+    _validate_bundle_id_segment(bundle_id)
     bundle_dir = root / bundle_id
+    # Defense in depth: even with the segment check above, a clever
+    # symlink under the staging root could redirect the bundle_dir
+    # resolution outside the root. ``Path.resolve()`` collapses any
+    # symlinks; if the result still lives under the resolved root, the
+    # access is safe. ``strict=False`` so a non-existent bundle still
+    # reaches the "manifest not found" branch (clearer error) rather
+    # than raising FileNotFoundError here.
+    try:
+        resolved_bundle = bundle_dir.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except OSError as exc:
+        raise StagingHandleError(
+            f"fs bundle path could not be resolved: {exc}"
+        ) from exc
+    if not _is_within(resolved_bundle, resolved_root):
+        raise StagingHandleError(
+            f"fs bundle path escapes staging root: bundle_id={bundle_id!r}"
+        )
     manifest_path = bundle_dir / "manifest.json"
     if not manifest_path.is_file():
         raise StagingHandleError(
