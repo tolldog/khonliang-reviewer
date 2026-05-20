@@ -765,6 +765,16 @@ def _resolve_payload_or_staging(
 
     alias = "diff" if prefer == "content" else "content"
 
+    # Treat empty/whitespace staging_handle as *unset*, not "present
+    # but invalid". The skill schema defaults staging_handle to ""
+    # (same shape as every other optional string arg); a caller that
+    # serializes defaults shouldn't see their inline diff= call
+    # rejected because the empty default looks like a bad handle.
+    if isinstance(staging_handle, str) and not staging_handle.strip():
+        staging_handle = None
+    elif staging_handle is not None and not isinstance(staging_handle, str):
+        return ("", {"error": "staging_handle must be a string"})
+
     if inline_payload and staging_handle:
         return ("", {
             "error": (
@@ -773,9 +783,7 @@ def _resolve_payload_or_staging(
             )
         })
 
-    if staging_handle is not None:
-        if not isinstance(staging_handle, str) or not staging_handle:
-            return ("", {"error": "staging_handle must be a non-empty string"})
+    if staging_handle:
         try:
             bundle = resolve_staging_handle(staging_handle)
         except StagingHandleError as exc:
@@ -958,14 +966,16 @@ class ReviewerAgent(BaseAgent):
             Skill(
                 "review_text",
                 "Run a review over arbitrary content. Returns structured "
-                "findings + usage record. The payload may be passed as "
-                "`content` (canonical), `diff` (alias accepted for "
-                "callers coming from the `review_diff` shape), OR "
-                "`staging_handle` (out-of-context byte handoff from "
+                "findings + usage record. The payload may be passed "
+                "inline as `content` (canonical) or `diff` (alias "
+                "accepted for callers coming from the `review_diff` "
+                "shape — both may be supplied, canonical wins on tie), "
+                "OR out-of-band via `staging_handle` (byte handoff from "
                 "kh-stage, e.g. `fs:<uuid>` — closes "
-                "fr_reviewer_800e851d). Exactly one of the three must "
-                "be set; `content`/`diff` are mutually exclusive with "
-                "`staging_handle`.",
+                "fr_reviewer_800e851d). The inline group "
+                "(`content`/`diff`) is mutually exclusive with "
+                "`staging_handle`; at least one path must carry a "
+                "non-empty payload.",
                 {
                     "kind": {"type": "string", "required": True},
                     # Canonical payload field. ``diff`` is also accepted
@@ -1047,12 +1057,14 @@ class ReviewerAgent(BaseAgent):
             Skill(
                 "review_diff",
                 "Shortcut for review_text with kind='pr_diff'. The "
-                "payload may be passed as `diff` (canonical), `content` "
-                "(alias), OR `staging_handle` (out-of-context byte "
-                "handoff from kh-stage, e.g. `fs:<uuid>` — closes "
-                "fr_reviewer_800e851d). Exactly one must be set; "
-                "`diff`/`content` are mutually exclusive with "
-                "`staging_handle`.",
+                "payload may be passed inline as `diff` (canonical) or "
+                "`content` (alias — both may be supplied, canonical "
+                "wins on tie), OR out-of-band via `staging_handle` "
+                "(byte handoff from kh-stage, e.g. `fs:<uuid>` — "
+                "closes fr_reviewer_800e851d). The inline group "
+                "(`diff`/`content`) is mutually exclusive with "
+                "`staging_handle`; at least one path must carry a "
+                "non-empty payload.",
                 {
                     # Canonical payload field. ``content`` is also
                     # accepted as an alias.

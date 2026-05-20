@@ -815,6 +815,63 @@ async def test_review_diff_missing_bundle_rejects(tmp_path, monkeypatch):
     assert "manifest not found" in result["error"]
 
 
+async def test_review_diff_empty_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    """Pass-2 finding: ``staging_handle=""`` (the schema default) used
+    to be treated as "present but invalid" and rejected — breaking
+    inline-payload callers that serialize defaults. Empty / whitespace
+    handle must fall through to the inline-payload path.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"diff": "diff --git a/x b/x\n", "staging_handle": ""},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request is not None
+    assert fake.last_request.content == "diff --git a/x b/x\n"
+
+
+async def test_review_diff_whitespace_only_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"diff": "diff body", "staging_handle": "   \t\n"},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request.content == "diff body"
+
+
+async def test_review_text_empty_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "inline body", "staging_handle": ""},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request.content == "inline body"
+
+
 async def test_review_diff_rejects_path_traversal_handle(tmp_path, monkeypatch):
     """Pass-1 finding: untrusted ``staging_handle`` must not traverse
     outside the staging root. ``fs:../etc`` reaches the handler ->

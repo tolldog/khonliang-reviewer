@@ -189,13 +189,10 @@ def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
             f"fs bundle path escapes staging root: bundle_id={bundle_id!r}"
         )
     manifest_path = bundle_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise StagingHandleError(
-            f"fs bundle manifest not found at {manifest_path}"
-        )
+    manifest_bytes = _read_regular_file_nofollow(manifest_path, "manifest")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StagingHandleError(
             f"fs bundle manifest unreadable at {manifest_path}: {exc}"
         ) from exc
@@ -215,17 +212,77 @@ def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
             "fr_khonliang-bus-lib_520ce3bf follow-ups)"
         )
     diff_path = bundle_dir / "diff.patch"
-    if not diff_path.is_file():
-        raise StagingHandleError(
-            f"fs bundle missing diff.patch at {diff_path}"
-        )
+    diff_bytes = _read_regular_file_nofollow(diff_path, "diff.patch")
+    return ResolvedBundle(kind=kind, diff_bytes=diff_bytes)
+
+
+def _read_regular_file_nofollow(path: Path, label: str) -> bytes:
+    """Read a regular file without following symlinks or blocking.
+
+    Defense beyond the bundle-dir containment check: even if the
+    bundle dir itself resolves cleanly under the staging root, a
+    *file inside* the dir could be a symlink pointing at
+    ``/etc/passwd`` or a FIFO that blocks the reviewer indefinitely.
+
+    Order matters:
+
+    1. ``lstat`` first (does not follow symlinks): reject anything
+       that isn't a regular file — symlink, FIFO, device, socket,
+       directory. This catches FIFOs *before* ``os.open``, which
+       would otherwise block forever waiting for a writer.
+    2. ``os.open(..., O_NOFOLLOW)``: TOCTOU defense — between the
+       lstat and the open, a symlink could be swapped in; the
+       kernel refuses to follow it (``ELOOP``).
+    3. ``fstat`` once more on the open fd: belt-and-suspenders
+       against a race that swapped the inode after the lstat passed
+       but before the open succeeded.
+    """
+    import stat as _stat
+
     try:
-        diff_bytes = diff_path.read_bytes()
+        lst = os.lstat(str(path))
+    except FileNotFoundError as exc:
+        raise StagingHandleError(
+            f"fs bundle {label} not found at {path}"
+        ) from exc
     except OSError as exc:
         raise StagingHandleError(
-            f"fs bundle diff.patch unreadable at {diff_path}: {exc}"
+            f"fs bundle {label} unstatable at {path}: {exc}"
         ) from exc
-    return ResolvedBundle(kind=kind, diff_bytes=diff_bytes)
+
+    if _stat.S_ISLNK(lst.st_mode):
+        raise StagingHandleError(
+            f"fs bundle {label} at {path} is a symlink"
+        )
+    if not _stat.S_ISREG(lst.st_mode):
+        raise StagingHandleError(
+            f"fs bundle {label} at {path} is not a regular file "
+            f"(mode={oct(lst.st_mode)})"
+        )
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)  # POSIX; absent on Windows
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        # ELOOP / EPERM / EACCES / TOCTOU race with a symlink swap —
+        # surface as a clean staging error rather than letting the OS
+        # error bubble as an internal-server-error shape.
+        raise StagingHandleError(
+            f"fs bundle {label} could not be opened at {path}: {exc}"
+        ) from exc
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise StagingHandleError(
+                f"fs bundle {label} at {path} is not a regular file "
+                f"(mode={oct(st.st_mode)})"
+            )
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read()
+    finally:
+        os.close(fd)
 
 
 def resolve(handle: str, *, root: Path | None = None) -> ResolvedBundle:

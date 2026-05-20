@@ -13,6 +13,7 @@ contract so failures point at the right layer.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -256,3 +257,64 @@ def test_is_within_helper(tmp_path: Path) -> None:
     assert staging._is_within(inside.resolve(), root.resolve()) is True
     assert staging._is_within(root.resolve(), root.resolve()) is True
     assert staging._is_within(outside.resolve(), root.resolve()) is False
+
+
+# ---------------------------------------------------------------------------
+# O_NOFOLLOW on bundle files (pass-2 finding).
+#
+# Path containment on the bundle *dir* is necessary but not sufficient:
+# a file inside the bundle dir can itself be a symlink pointing at
+# /etc/passwd. The bundle's writer (kh-stage) wouldn't put such a file
+# there, but the reviewer must not trust the contents of an
+# attacker-readable staging dir — bundles are group-writable in
+# principle.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_fs_rejects_symlinked_manifest(tmp_path: Path) -> None:
+    """manifest.json being a symlink to a file outside the bundle must
+    be rejected by the O_NOFOLLOW open, not silently followed.
+    """
+    outside_manifest = tmp_path / "outside_manifest.json"
+    outside_manifest.write_text(
+        json.dumps({"kind": "diff", "created_at": 1.0, "leaked": "yes"})
+    )
+    bundle_dir = tmp_path / "staging" / "abc"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "manifest.json").symlink_to(outside_manifest)
+    (bundle_dir / "diff.patch").write_bytes(b"X")
+
+    with pytest.raises(staging.StagingHandleError, match="manifest"):
+        staging.resolve_fs("abc", root=tmp_path / "staging")
+
+
+def test_resolve_fs_rejects_symlinked_diff(tmp_path: Path) -> None:
+    """diff.patch being a symlink must also be rejected — without
+    O_NOFOLLOW the reviewer would happily read the attacker-supplied
+    target into the model prompt.
+    """
+    outside_diff = tmp_path / "leaked.bytes"
+    outside_diff.write_bytes(b"SECRET")
+    bundle_dir = tmp_path / "staging" / "xyz"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "manifest.json").write_text(
+        json.dumps({"kind": "diff", "created_at": 1.0})
+    )
+    (bundle_dir / "diff.patch").symlink_to(outside_diff)
+
+    with pytest.raises(staging.StagingHandleError, match="diff.patch"):
+        staging.resolve_fs("xyz", root=tmp_path / "staging")
+
+
+def test_resolve_fs_rejects_non_regular_file(tmp_path: Path) -> None:
+    """A FIFO / device / socket in place of manifest.json must not be
+    read as if it were a file — ``fstat`` check catches that.
+    """
+    bundle_dir = tmp_path / "staging" / "fifo-bundle"
+    bundle_dir.mkdir(parents=True)
+    fifo_path = bundle_dir / "manifest.json"
+    os.mkfifo(fifo_path)
+    (bundle_dir / "diff.patch").write_bytes(b"X")
+
+    with pytest.raises(staging.StagingHandleError, match="not a regular file"):
+        staging.resolve_fs("fifo-bundle", root=tmp_path / "staging")
