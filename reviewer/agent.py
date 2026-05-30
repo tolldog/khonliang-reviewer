@@ -2340,6 +2340,18 @@ class ReviewerAgent(BaseAgent):
             and ollama_num_ctx_raw > 0
             else None
         )
+        # ``api_key`` is sent as ``Authorization: Bearer`` on native
+        # requests; thread it from config so an auth-required Ollama
+        # endpoint is fixable purely via ``config.yaml`` (otherwise the
+        # docstring's promise is unreachable). Treat-malformed-as-absent;
+        # only pass it through when set so the dataclass default
+        # (``"ollama"`` placeholder) still applies when config omits it.
+        ollama_api_key_raw = ollama_cfg.get("api_key")
+        ollama_api_key = (
+            ollama_api_key_raw.strip()
+            if isinstance(ollama_api_key_raw, str) and ollama_api_key_raw.strip()
+            else None
+        )
         registry.register(
             OllamaProvider(
                 OllamaProviderConfig(
@@ -2350,6 +2362,7 @@ class ReviewerAgent(BaseAgent):
                     default_model=ollama_default,
                     num_ctx=ollama_num_ctx,
                     format=ollama_format,
+                    **({"api_key": ollama_api_key} if ollama_api_key else {}),
                 )
             ),
             default_model=ollama_default,

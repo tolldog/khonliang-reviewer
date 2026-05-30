@@ -1739,6 +1739,50 @@ def test_ollama_num_ctx_threads_from_config_yaml_to_provider(tmp_path):
     assert ollama_provider.config.num_ctx == 16384
 
 
+def test_ollama_api_key_threads_from_config_yaml_to_provider(tmp_path):
+    """Operator sets ``providers.ollama.api_key`` in config.yaml → it
+    must land on ``OllamaProviderConfig.api_key`` so an auth-required
+    Ollama endpoint is fixable purely via config (the provider sends it
+    as ``Authorization: Bearer``). Without this threading the api_key
+    docstring's promise is unreachable — Copilot flagged it on PR #42.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    api_key: secret-token\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.api_key == "secret-token"
+
+
+def test_ollama_api_key_absent_keeps_placeholder_default(tmp_path):
+    """When config omits api_key the dataclass default placeholder is
+    preserved (not clobbered to None) — local Ollama keeps working and
+    the threading only overrides when an operator actually sets a key.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    ollama_provider = selector.providers["ollama"]
+    assert ollama_provider.config.api_key == "ollama"
+
+
 def test_ollama_format_absent_in_config_falls_back_to_none(tmp_path):
     """When config.yaml omits ``providers.ollama.format`` entirely the
     dataclass field stays ``None`` — the unconstrained default. Pre-FR
