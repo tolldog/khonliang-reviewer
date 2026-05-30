@@ -139,6 +139,17 @@ def test_skills_parameters_match_public_contract():
     for optional in ("instructions", "context", "backend", "model", "request_id", "metadata"):
         assert optional in skill.parameters
         assert skill.parameters[optional].get("required", False) is False
+    # ``staging_handle`` is declared on review_text, review_diff, and
+    # sign_off_trailer so bus-side schema discovery surfaces the new
+    # surface (fr_reviewer_800e851d). Optional; mutually exclusive
+    # with content/diff at the handler level.
+    for skill_name in ("review_text", "review_diff", "sign_off_trailer"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "staging_handle" in s.parameters, (
+            f"{skill_name} schema missing staging_handle"
+        )
+        assert s.parameters["staging_handle"]["type"] == "string"
+        assert s.parameters["staging_handle"].get("required", False) is False
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +673,244 @@ async def test_review_diff_missing_both_payload_args_returns_error():
     assert "error" in result
     assert "diff" in result["error"]
     assert "content" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# staging_handle (fr_reviewer_800e851d)
+#
+# review_diff / review_text grow a ``staging_handle`` arg that resolves to
+# the bundle bytes via ``reviewer.staging`` — the caller never routes the
+# diff through its MCP context. Pure resolver behavior lives in
+# ``test_staging.py``; these tests cover the agent-handler wiring.
+# ---------------------------------------------------------------------------
+
+
+import json as _json
+
+
+def _stage_fs_bundle(root, bundle_id: str, *, diff_bytes: bytes) -> None:
+    """Drop a minimal fs-backend bundle matching kh-stage's layout."""
+    from pathlib import Path as _Path
+    bundle_dir = _Path(root) / bundle_id
+    bundle_dir.mkdir(parents=True)
+    bundle_dir.joinpath("manifest.json").write_text(
+        _json.dumps({"kind": "diff", "created_at": 1.0, "files": ["diff.patch"]})
+    )
+    bundle_dir.joinpath("diff.patch").write_bytes(diff_bytes)
+
+
+async def test_review_diff_accepts_staging_handle(tmp_path, monkeypatch):
+    """The diff bytes resolved from a staging handle reach the provider
+    exactly as if the caller had passed ``diff=<bytes>`` inline.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    _stage_fs_bundle(tmp_path, "abc-123", diff_bytes=b"diff --git a/foo b/foo\n+ok\n")
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "fs:abc-123"},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request is not None
+    assert fake.last_request.kind == "pr_diff"
+    assert fake.last_request.content == "diff --git a/foo b/foo\n+ok\n"
+
+
+async def test_review_text_accepts_staging_handle(tmp_path, monkeypatch):
+    """``review_text`` also accepts staging_handle since the resolver
+    lives at the shared helper layer — pre-push sign_off_trailer
+    pass-through depends on this.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    _stage_fs_bundle(tmp_path, "review-text", diff_bytes=b"diff body via handle")
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "staging_handle": "fs:review-text"},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request is not None
+    assert fake.last_request.content == "diff body via handle"
+
+
+async def test_review_diff_both_inline_and_staging_handle_rejects(tmp_path, monkeypatch):
+    """Mutually exclusive: ``diff`` + ``staging_handle`` → error envelope."""
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    _stage_fs_bundle(tmp_path, "ambig", diff_bytes=b"X")
+
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"diff": "inline diff", "staging_handle": "fs:ambig"},
+    )
+
+    assert "error" in result
+    assert "staging_handle" in result["error"]
+
+
+async def test_review_text_both_inline_and_staging_handle_rejects(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    _stage_fs_bundle(tmp_path, "ambig2", diff_bytes=b"X")
+
+    harness = _make_harness()
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "inline", "staging_handle": "fs:ambig2"},
+    )
+
+    assert "error" in result
+    assert "staging_handle" in result["error"]
+
+
+async def test_review_diff_missing_handle_message_mentions_staging(tmp_path, monkeypatch):
+    """The "required" error message must mention ``staging_handle`` so
+    subagents see the new path without rereading the schema.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call("review_diff", {})
+    assert "error" in result
+    assert "staging_handle" in result["error"]
+
+
+async def test_review_diff_unknown_backend_in_handle_rejects(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "ipfs:Qm123"},
+    )
+    assert "error" in result
+    assert "unknown" in result["error"]
+    assert "staging_handle" in result["error"]
+
+
+async def test_review_diff_store_backend_handle_surfaces_not_implemented(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "store:art_123"},
+    )
+    assert "error" in result
+    assert "store" in result["error"]
+
+
+async def test_review_diff_missing_bundle_rejects(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "fs:does-not-exist"},
+    )
+    assert "error" in result
+    # A wholly absent bundle dir surfaces as a "not found" staging error
+    # (the openat on the bundle_id segment fails before any per-file read).
+    assert "not found" in result["error"]
+
+
+async def test_review_diff_empty_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    """Pass-2 finding: ``staging_handle=""`` (the schema default) used
+    to be treated as "present but invalid" and rejected — breaking
+    inline-payload callers that serialize defaults. Empty / whitespace
+    handle must fall through to the inline-payload path.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"diff": "diff --git a/x b/x\n", "staging_handle": ""},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request is not None
+    assert fake.last_request.content == "diff --git a/x b/x\n"
+
+
+async def test_review_diff_whitespace_only_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_diff",
+        {"diff": "diff body", "staging_handle": "   \t\n"},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request.content == "diff body"
+
+
+async def test_review_text_empty_staging_handle_treated_as_unset(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "inline body", "staging_handle": ""},
+    )
+
+    assert result.get("disposition") == "posted"
+    assert fake.last_request.content == "inline body"
+
+
+async def test_review_diff_rejects_path_traversal_handle(tmp_path, monkeypatch):
+    """Pass-1 finding: untrusted ``staging_handle`` must not traverse
+    outside the staging root. ``fs:../etc`` reaches the handler ->
+    resolver -> ``_validate_bundle_id_segment`` -> rejection envelope.
+    Tested end-to-end through the bus handler so a regression at
+    either layer (resolver hardening or handler surfacing) is caught.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    harness = _make_harness()
+    result = await harness.call(
+        "review_diff",
+        {"staging_handle": "fs:../etc"},
+    )
+    assert "error" in result
+    assert "staging_handle" in result["error"]
+
+
+async def test_review_diff_strips_staging_handle_from_forwarded_args(
+    tmp_path, monkeypatch
+):
+    """``staging_handle`` must not leak into ``review_text`` (which would
+    then forward it into provider metadata). The handler resolves it
+    and drops it before forwarding.
+    """
+    monkeypatch.setenv("KHONLIANG_STAGING_ROOT", str(tmp_path))
+    _stage_fs_bundle(tmp_path, "strip-me", diff_bytes=b"X")
+
+    fake = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"staging_handle": "fs:strip-me"},
+    )
+
+    assert fake.last_request is not None
+    assert "staging_handle" not in fake.last_request.metadata
 
 
 # ---------------------------------------------------------------------------
