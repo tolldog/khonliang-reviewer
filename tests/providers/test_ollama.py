@@ -462,18 +462,24 @@ def test_auth_headers_builds_bearer_for_real_key():
     assert _auth_headers(None) == {}
 
 
-def test_provider_threads_api_key_as_bearer_on_real_client():
+async def test_provider_threads_api_key_as_bearer_on_real_client():
     """A real httpx client carries Authorization from config.api_key so
     auth-required Ollama deployments are fixable via config (the 401/403
     paths become reachable)."""
     provider = OllamaProvider(OllamaProviderConfig(api_key="secret-token"))
-    # httpx header names are case-insensitive.
-    assert provider._http.headers.get("authorization") == "Bearer secret-token"
+    try:
+        # httpx header names are case-insensitive.
+        assert provider._http.headers.get("authorization") == "Bearer secret-token"
+    finally:
+        await provider._http.aclose()
 
 
-def test_provider_blank_api_key_sends_no_auth_header():
+async def test_provider_blank_api_key_sends_no_auth_header():
     provider = OllamaProvider(OllamaProviderConfig(api_key="  "))
-    assert "authorization" not in provider._http.headers
+    try:
+        assert "authorization" not in provider._http.headers
+    finally:
+        await provider._http.aclose()
 
 
 def test_native_base_url_strips_v1_suffix():
