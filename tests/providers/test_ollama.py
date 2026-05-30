@@ -87,10 +87,17 @@ class _FakeResponse:
         status_code: int = 200,
         json_data: Any = None,
         json_exc: BaseException | None = None,
+        request_method: str = "POST",
+        request_url: str = "http://localhost:11434/api/chat",
     ):
         self.status_code = status_code
         self._json_data = json_data
         self._json_exc = json_exc
+        # The originating request is reflected in the raised
+        # HTTPStatusError so a GET /api/tags failure isn't mislabeled as
+        # a POST /api/chat one.
+        self._request_method = request_method
+        self._request_url = request_url
 
     def json(self) -> Any:
         if self._json_exc is not None:
@@ -99,7 +106,7 @@ class _FakeResponse:
 
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
-            request = httpx.Request("POST", "http://localhost:11434/api/chat")
+            request = httpx.Request(self._request_method, self._request_url)
             response = httpx.Response(self.status_code, request=request)
             raise httpx.HTTPStatusError(
                 f"HTTP {self.status_code}", request=request, response=response
@@ -399,14 +406,26 @@ async def test_healthcheck_unreachable_raises():
 
 
 async def test_healthcheck_auth_rejection_raises_auth_error():
-    http = _make_http(get_response=_FakeResponse(status_code=401))
+    http = _make_http(
+        get_response=_FakeResponse(
+            status_code=401,
+            request_method="GET",
+            request_url="http://localhost:11434/api/tags",
+        )
+    )
     with pytest.raises(OllamaAuthError) as excinfo:
         await OllamaProvider(http_client=http).healthcheck()
     assert "rejected credentials" in str(excinfo.value)
 
 
 async def test_healthcheck_generic_status_falls_back_to_healthcheck_failed():
-    http = _make_http(get_response=_FakeResponse(status_code=500))
+    http = _make_http(
+        get_response=_FakeResponse(
+            status_code=500,
+            request_method="GET",
+            request_url="http://localhost:11434/api/tags",
+        )
+    )
     with pytest.raises(OllamaHealthcheckError) as excinfo:
         await OllamaProvider(http_client=http).healthcheck()
     assert "healthcheck failed" in str(excinfo.value)
@@ -428,6 +447,33 @@ async def test_healthcheck_error_is_runtime_error():
 async def test_provider_name_is_ollama():
     assert OllamaProvider.name == "ollama"
     assert OllamaProvider(http_client=_make_http()).name == "ollama"
+
+
+def test_auth_headers_builds_bearer_for_real_key():
+    from reviewer.providers.ollama import _auth_headers
+
+    assert _auth_headers("secret-token") == {"Authorization": "Bearer secret-token"}
+    # Default placeholder still produces a (harmless) header — parity with
+    # the old openai client which sent api_key as the bearer token.
+    assert _auth_headers("ollama") == {"Authorization": "Bearer ollama"}
+    # Blank / None → no header (don't send "Bearer " with nothing).
+    assert _auth_headers("") == {}
+    assert _auth_headers("   ") == {}
+    assert _auth_headers(None) == {}
+
+
+def test_provider_threads_api_key_as_bearer_on_real_client():
+    """A real httpx client carries Authorization from config.api_key so
+    auth-required Ollama deployments are fixable via config (the 401/403
+    paths become reachable)."""
+    provider = OllamaProvider(OllamaProviderConfig(api_key="secret-token"))
+    # httpx header names are case-insensitive.
+    assert provider._http.headers.get("authorization") == "Bearer secret-token"
+
+
+def test_provider_blank_api_key_sends_no_auth_header():
+    provider = OllamaProvider(OllamaProviderConfig(api_key="  "))
+    assert "authorization" not in provider._http.headers
 
 
 def test_native_base_url_strips_v1_suffix():

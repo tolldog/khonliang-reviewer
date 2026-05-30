@@ -79,9 +79,12 @@ class OllamaProviderConfig:
     #: ``options.num_ctx`` — bug_reviewer_832a909b). A base_url without
     #: ``/v1`` is used as-is.
     base_url: str = "http://localhost:11434/v1"
-    #: Ollama ignores the key for local models. Retained for parity / a
-    #: future cloud-Ollama deployment that does require auth; not sent on
-    #: the native local path today.
+    #: Sent as ``Authorization: Bearer <api_key>`` on every native
+    #: request. Local Ollama ignores it; an auth-required deployment
+    #: (cloud Ollama, or a reverse-proxied endpoint that enforces auth)
+    #: needs it, and it's what makes the 401/403 handling reachable-by-
+    #: config. The ``"ollama"`` default is a harmless placeholder for
+    #: local use — set a real token for an auth-gated endpoint.
     api_key: str = "ollama"
     default_model: str = "qwen2.5-coder:14b"
     timeout_seconds: float = 300.0
@@ -132,8 +135,11 @@ class OllamaProvider(ReviewProvider):
         #: Injectable for tests (a fake exposing async ``post``/``get``
         #: returning objects with ``status_code`` / ``json()`` /
         #: ``raise_for_status()``); production builds a real httpx client.
+        #: ``api_key`` is threaded as a Bearer token so auth-required
+        #: deployments work (local Ollama ignores it).
         self._http = http_client or httpx.AsyncClient(
             timeout=self.config.timeout_seconds,
+            headers=_auth_headers(self.config.api_key),
         )
 
     async def healthcheck(self) -> None:
@@ -335,6 +341,20 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
     if isinstance(override, str) and override:
         return override
     return default
+
+
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    """Build the ``Authorization`` header for native requests.
+
+    Mirrors what the old openai SDK did with ``api_key`` (it sent it as a
+    Bearer token). Empty / whitespace keys produce no header so a
+    deliberately-unset key doesn't send ``Bearer`` with nothing. The
+    default ``"ollama"`` placeholder is harmless for local endpoints and
+    keeps auth-required deployments fixable purely by config.
+    """
+    if isinstance(api_key, str) and api_key.strip():
+        return {"Authorization": f"Bearer {api_key}"}
+    return {}
 
 
 def _native_base_url(base_url: str) -> str:
