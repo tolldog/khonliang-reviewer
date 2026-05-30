@@ -497,6 +497,10 @@ def test_native_base_url_strips_v1_suffix():
     assert _native_base_url("http://host:11434/") == "http://host:11434"
     # A non-/v1 path is left intact (minus trailing slash).
     assert _native_base_url("http://host/ollama") == "http://host/ollama"
+    # Surrounding whitespace (e.g. a trailing newline from env/file) is
+    # stripped before the /v1 suffix check.
+    assert _native_base_url("http://localhost:11434/v1\n") == "http://localhost:11434"
+    assert _native_base_url("  http://localhost:11434/v1  ") == "http://localhost:11434"
 
 
 async def test_custom_base_url_native_route():

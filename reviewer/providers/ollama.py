@@ -373,10 +373,13 @@ def _native_base_url(base_url: str) -> str:
     trailing slash) to reach the native surface. A ``base_url`` that
     already lacks ``/v1`` is returned unchanged (minus trailing slash).
     """
-    trimmed = base_url.rstrip("/")
+    # ``.strip()`` first: an env/file-sourced base_url often carries a
+    # trailing newline ("http://host:11434/v1\n"), which would otherwise
+    # defeat the ``/v1`` suffix check and yield an unrequestable URL.
+    trimmed = base_url.strip().rstrip("/")
     if trimmed.endswith("/v1"):
         trimmed = trimmed[: -len("/v1")]
-    return trimmed or base_url
+    return trimmed or base_url.strip()
 
 
 def _native_to_compat(native: Any) -> dict[str, Any]:
