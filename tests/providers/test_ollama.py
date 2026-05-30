@@ -458,6 +458,9 @@ def test_auth_headers_builds_bearer_for_real_key():
     # Default placeholder still produces a (harmless) header — parity with
     # the old openai client which sent api_key as the bearer token.
     assert _auth_headers("ollama") == {"Authorization": "Bearer ollama"}
+    # Surrounding whitespace is stripped from the token, not carried into
+    # the Bearer value (which would fail auth on an otherwise-valid key).
+    assert _auth_headers("  secret  ") == {"Authorization": "Bearer secret"}
     # Blank / None → no header (don't send "Bearer " with nothing).
     assert _auth_headers("") == {}
     assert _auth_headers("   ") == {}
@@ -686,7 +689,7 @@ def test_resolve_format_ignores_invalid_caller_value():
 
     cfg = OllamaProviderConfig(format="json")
 
-    for bad_value in (None, 1, 0, True, False, "", [], {}, 1.5):
+    for bad_value in (None, 1, 0, True, False, "", "   ", [], {}, 1.5):
         request = ReviewRequest(
             kind="pr_diff",
             content="x",
@@ -696,6 +699,34 @@ def test_resolve_format_ignores_invalid_caller_value():
         assert _resolve_format(request, cfg) == "json", (
             f"bad value {bad_value!r} should fall through to config"
         )
+
+
+def test_resolve_format_strips_whitespace_from_valid_value():
+    from reviewer.providers.ollama import OllamaProviderConfig, _resolve_format
+
+    cfg = OllamaProviderConfig()
+    request = ReviewRequest(
+        kind="pr_diff",
+        content="x",
+        metadata={"format": "  json  "},
+        request_id="req-test",
+    )
+    assert _resolve_format(request, cfg) == "json"
+
+
+def test_resolve_model_treats_whitespace_override_as_unset():
+    from reviewer.providers.ollama import _resolve_model
+
+    # whitespace-only override → fall back to default, not a bogus model.
+    req_ws = ReviewRequest(
+        kind="pr_diff", content="x", metadata={"model": "   "}, request_id="r"
+    )
+    assert _resolve_model(req_ws, "qwen2.5-coder:14b") == "qwen2.5-coder:14b"
+    # surrounding whitespace on a real value is stripped.
+    req_pad = ReviewRequest(
+        kind="pr_diff", content="x", metadata={"model": "  glm-4.7-flash  "}, request_id="r"
+    )
+    assert _resolve_model(req_pad, "qwen2.5-coder:14b") == "glm-4.7-flash"
 
 
 async def test_caller_format_threads_to_native_payload():

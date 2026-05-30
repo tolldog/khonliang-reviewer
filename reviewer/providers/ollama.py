@@ -338,8 +338,10 @@ class OllamaProvider(ReviewProvider):
 def _resolve_model(request: ReviewRequest, default: str) -> str:
     """Use request-supplied model if present, else the provider default."""
     override = request.metadata.get("model")
-    if isinstance(override, str) and override:
-        return override
+    if isinstance(override, str) and override.strip():
+        # Strip stray whitespace; a whitespace-only override is "unset",
+        # not a (broken) model name that would 404 at the backend.
+        return override.strip()
     return default
 
 
@@ -353,7 +355,10 @@ def _auth_headers(api_key: str | None) -> dict[str, str]:
     keeps auth-required deployments fixable purely by config.
     """
     if isinstance(api_key, str) and api_key.strip():
-        return {"Authorization": f"Bearer {api_key}"}
+        # Use the stripped value — a config/bus key with stray
+        # leading/trailing whitespace would otherwise produce a bad
+        # ``Bearer <key> `` token and fail auth on an otherwise-valid key.
+        return {"Authorization": f"Bearer {api_key.strip()}"}
     return {}
 
 
@@ -564,8 +569,11 @@ def _coerce_format_value(value: Any) -> str | None:
     misconfigured payload (None, int, bool, list, empty string) falls
     through to the next resolution layer rather than crashing.
     """
-    if isinstance(value, str) and value:
-        return value
+    if isinstance(value, str) and value.strip():
+        # Strip so a whitespace-only value is "unset" (matching the
+        # docstring) instead of being forwarded to Ollama as a bogus
+        # ``format`` that triggers an avoidable backend error.
+        return value.strip()
     return None
 
 
