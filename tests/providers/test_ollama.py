@@ -54,8 +54,10 @@ def _native_response(
 
     Native fields differ from the OpenAI shape: the assistant text lives
     at ``message.content`` and token counts at ``prompt_eval_count`` /
-    ``eval_count``. ``None`` for either count omits the key entirely (so
-    the missing-usage path is exercised).
+    ``eval_count``. ``None`` for either count omits that key from the
+    native body; ``_native_to_compat`` then surfaces it as a ``None``
+    token value, which ``_build_usage`` / ``_safe_int`` coerce to 0
+    (exercising the zero/absent-token path).
     """
     body: dict[str, Any] = {
         "model": model,
