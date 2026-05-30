@@ -1,10 +1,21 @@
-"""Ollama review provider via the OpenAI-compatible endpoint.
+"""Ollama review provider via the **native** ``/api/chat`` endpoint.
 
-Hits Ollama's ``/v1/chat/completions`` endpoint with the ``openai`` SDK
-so any Ollama-served model — local (``qwen2.5-coder:14b``, ``glm-4.7-flash``) or
-cloud (``kimi-k2.5:cloud``, ``glm-5:cloud``) — can drive a review from
-the same provider. Model choice is per-request via
+Hits Ollama's native ``/api/chat`` endpoint (``httpx``) so any
+Ollama-served model — local (``qwen2.5-coder:14b``, ``glm-4.7-flash``)
+or cloud (``kimi-k2.5:cloud``, ``glm-5:cloud``) — can drive a review
+from the same provider. Model choice is per-request via
 ``request.metadata["model"]`` with a config-level fallback.
+
+**Why native, not the OpenAI-compat ``/v1`` shim:** the ``/v1`` shim
+silently DROPS ``options.num_ctx`` (verified 2026-05-30 — a 66k-token
+prompt reports ``prompt_tokens=4096`` with or without the override),
+so every review whose prompt exceeded the 4096-token default was
+truncated and returned a near-empty response indistinguishable from a
+clean approval (bug_reviewer_832a909b / bug_reviewer_a21581dc). The
+native endpoint honors ``options.num_ctx``, so the auto-bump heuristic
+(:func:`_suggest_num_ctx`) actually takes effect. Native responses are
+shaped back into the OpenAI chat-completion form by
+:func:`_native_to_compat` so the existing parsers stay unchanged.
 
 Unlike Claude-via-CLI, Ollama does not return a cost-per-call in its
 response. ``UsageEvent.estimated_api_cost_usd`` is populated later from
@@ -21,7 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import openai
+import httpx
 
 from khonliang_reviewer import (
     ReviewFinding,
@@ -62,10 +73,15 @@ class OllamaAuthError(OllamaHealthcheckError):
 class OllamaProviderConfig:
     """Construction-time configuration for :class:`OllamaProvider`."""
 
+    #: Kept pointing at the OpenAI-compat ``/v1`` base for config
+    #: back-compat; :func:`_native_base_url` strips the ``/v1`` suffix to
+    #: reach the native ``/api/*`` surface (the only one that honors
+    #: ``options.num_ctx`` — bug_reviewer_832a909b). A base_url without
+    #: ``/v1`` is used as-is.
     base_url: str = "http://localhost:11434/v1"
-    #: Ollama ignores the key for local models but the openai SDK requires
-    #: something. Use a descriptive placeholder so leaked logs are
-    #: obviously-local, not mistaken for a real key.
+    #: Ollama ignores the key for local models. Retained for parity / a
+    #: future cloud-Ollama deployment that does require auth; not sent on
+    #: the native local path today.
     api_key: str = "ollama"
     default_model: str = "qwen2.5-coder:14b"
     timeout_seconds: float = 300.0
@@ -78,18 +94,17 @@ class OllamaProviderConfig:
     #: ``num_ctx`` axis constant; the auto-bump heuristic varies with
     #: prompt size.
     num_ctx: int | None = None
-    #: Native Ollama ``format`` parameter (e.g. ``"json"``). When set,
-    #: forwarded via ``extra_body`` to ``/v1/chat/completions`` and
-    #: mapped to grammar-constrained decoding on the server. Use to
+    #: Native Ollama ``format`` parameter (e.g. ``"json"``). Sent on the
+    #: native ``/api/chat`` call to grammar-constrain decoding. Use to
     #: force structured output from small models that otherwise produce
     #: free-form text — see the 2026-04-22 evaluator-gate experiment
-    #: where ``llama3.2:3b`` failed to produce parseable JSON in
-    #: every prompt configuration tested. Caller can override per-call
-    #: via ``request.metadata["format"]``. ``None`` (default) =
-    #: unconstrained; the OpenAI-compat ``response_format`` kwarg
-    #: already on every call is silently ignored by Ollama for
-    #: non-cloud deployments, so this is the only knob that actually
-    #: bites.
+    #: where ``llama3.2:3b`` failed to produce parseable JSON in every
+    #: prompt configuration tested. Caller can override per-call via
+    #: ``request.metadata["format"]``. ``None`` (default) → the provider
+    #: applies ``"json"`` (the review schema is JSON and the parser
+    #: errors on non-JSON), so unlike the old ``/v1`` path — where
+    #: ``response_format`` was silently ignored for local models — JSON
+    #: is now actually enforced.
     format: str | None = None
 
 
@@ -106,44 +121,54 @@ class OllamaProvider(ReviewProvider):
         self,
         config: OllamaProviderConfig | None = None,
         *,
-        client: Any | None = None,
+        http_client: Any | None = None,
     ):
         self.config = config or OllamaProviderConfig()
-        self._client = client or openai.AsyncOpenAI(
-            base_url=self.config.base_url,
-            api_key=self.config.api_key,
+        #: Native Ollama API root. The ``/v1`` OpenAI-compat shim drops
+        #: ``options.num_ctx``; the native ``/api/*`` surface honors it
+        #: (bug_reviewer_832a909b), so all calls go through the native
+        #: root derived from ``base_url``.
+        self._native_url = _native_base_url(self.config.base_url)
+        #: Injectable for tests (a fake exposing async ``post``/``get``
+        #: returning objects with ``status_code`` / ``json()`` /
+        #: ``raise_for_status()``); production builds a real httpx client.
+        self._http = http_client or httpx.AsyncClient(
             timeout=self.config.timeout_seconds,
         )
 
     async def healthcheck(self) -> None:
-        """Verify the endpoint is reachable and accepts our credentials.
+        """Verify the native endpoint is reachable and serving models.
 
-        Hits ``models.list`` — Ollama implements it as a lightweight
-        "what models are available here" query. Failures split into
-        three categories so agent boot can act on each:
+        Hits the native ``/api/tags`` route — Ollama's lightweight "what
+        models are available here" query. Failures split into categories
+        so agent boot can act on each:
 
-        - :class:`OllamaAuthError` — credentials rejected (cloud-hosted
-          Ollama typically). Caller should fix the API key.
+        - :class:`OllamaAuthError` — credentials rejected (HTTP 401/403;
+          cloud-hosted Ollama typically). Caller should fix the API key.
         - :class:`OllamaHealthcheckError` ``"not reachable"`` — transport
           couldn't reach the server. Caller should check it's running
           and the URL is right.
         - :class:`OllamaHealthcheckError` ``"healthcheck failed"`` —
-          any other API error (bad request, rate limit, etc.). Caller
+          any other HTTP error (bad request, rate limit, etc.). Caller
           reads the message and investigates.
         """
         try:
-            await self._client.models.list()
-        except openai.AuthenticationError as exc:
-            raise OllamaAuthError(
-                f"ollama endpoint at {self.config.base_url} rejected credentials: {exc}"
-            ) from exc
-        except openai.APIConnectionError as exc:
+            response = await self._http.get(f"{self._native_url}/api/tags")
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (401, 403):
+                raise OllamaAuthError(
+                    f"ollama endpoint at {self._native_url} rejected "
+                    f"credentials (HTTP {status}): {exc}"
+                ) from exc
             raise OllamaHealthcheckError(
-                f"ollama endpoint not reachable at {self.config.base_url}: {exc}"
+                f"ollama healthcheck failed at {self._native_url} "
+                f"(HTTP {status}): {exc}"
             ) from exc
-        except openai.APIError as exc:
+        except httpx.HTTPError as exc:
             raise OllamaHealthcheckError(
-                f"ollama healthcheck failed at {self.config.base_url}: {exc}"
+                f"ollama endpoint not reachable at {self._native_url}: {exc}"
             ) from exc
 
     async def review(self, request: ReviewRequest) -> ReviewResult:
@@ -179,39 +204,35 @@ class OllamaProvider(ReviewProvider):
         # 4. ``None`` — let Ollama apply the model's documented
         #    default. Only fires when (1)-(3) all return None.
         num_ctx_override = _resolve_num_ctx(request, self.config, prompt)
-        format_override = _resolve_format(request, self.config)
-        create_kwargs: dict[str, Any] = {
+        # Default to JSON-constrained decoding: the review schema is JSON
+        # and _parse_response errors on non-JSON. ``format`` on the NATIVE
+        # endpoint actually constrains the grammar (the OpenAI-compat
+        # ``response_format`` was silently ignored for local models).
+        # Caller / config can override via the format axis.
+        fmt = _resolve_format(request, self.config) or "json"
+
+        # NATIVE ``/api/chat`` payload. Critically, ``options.num_ctx`` is
+        # honored here (the ``/v1`` shim drops it — bug_reviewer_832a909b),
+        # so a large prompt gets a context window that fits it instead of
+        # being silently truncated to 4096.
+        payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"},
-            "timeout": self.config.timeout_seconds,
+            "stream": False,
+            "format": fmt,
         }
-        # Ollama's OpenAI-compatible endpoint accepts native Ollama
-        # parameters via ``extra_body`` — ``options.num_ctx`` for the
-        # context window and top-level ``format`` for grammar-
-        # constrained decoding. The ``openai`` SDK forwards
-        # ``extra_body`` verbatim so this works without depending on
-        # a future schema-flag in the OpenAI types.
-        extra_body: dict[str, Any] = {}
         if num_ctx_override is not None:
-            extra_body["options"] = {"num_ctx": num_ctx_override}
-        if format_override is not None:
-            extra_body["format"] = format_override
-        if extra_body:
-            create_kwargs["extra_body"] = extra_body
+            payload["options"] = {"num_ctx": num_ctx_override}
 
         try:
-            response = await self._client.chat.completions.create(**create_kwargs)
-        except openai.APIConnectionError as exc:
-            return _errored(
-                request,
-                error=f"ollama endpoint unreachable: {exc}",
-                error_category="backend_error",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
+            http_response = await self._http.post(
+                f"{self._native_url}/api/chat",
+                json=payload,
+                timeout=self.config.timeout_seconds,
             )
-        except openai.APITimeoutError:
+            http_response.raise_for_status()
+            native = http_response.json()
+        except httpx.TimeoutException:
             return _errored(
                 request,
                 error=f"ollama request timed out after {self.config.timeout_seconds}s",
@@ -220,29 +241,41 @@ class OllamaProvider(ReviewProvider):
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
             )
-        except openai.AuthenticationError as exc:
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in (401, 403):
+                return _errored(
+                    request,
+                    error=f"ollama rejected credentials (HTTP {status}): {exc}",
+                    error_category="auth_not_provisioned",
+                    model=model,
+                    started_wall=started_wall,
+                    duration_ms=_elapsed_ms(started_mono),
+                )
             return _errored(
                 request,
-                error=f"ollama rejected credentials: {exc}",
-                error_category="auth_not_provisioned",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
-            )
-        except openai.NotFoundError as exc:
-            return _errored(
-                request,
-                error=f"ollama reported model or route not found: {exc}",
+                error=f"ollama returned HTTP {status}: {exc}",
                 error_category="backend_error",
                 model=model,
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
             )
-        except openai.APIError as exc:
+        except httpx.HTTPError as exc:
+            # ConnectError / transport / protocol failure — the native
+            # endpoint couldn't be reached or spoke badly.
             return _errored(
                 request,
-                error=f"ollama API error: {exc}",
+                error=f"ollama endpoint unreachable: {exc}",
                 error_category="backend_error",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=_elapsed_ms(started_mono),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            return _errored(
+                request,
+                error=f"ollama response body was not valid JSON: {exc}",
+                error_category="malformed_envelope",
                 model=model,
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),
@@ -250,7 +283,7 @@ class OllamaProvider(ReviewProvider):
 
         duration_ms = _elapsed_ms(started_mono)
         result = _parse_response(
-            response,
+            _native_to_compat(native),
             request=request,
             model=model,
             started_wall=started_wall,
@@ -302,6 +335,56 @@ def _resolve_model(request: ReviewRequest, default: str) -> str:
     if isinstance(override, str) and override:
         return override
     return default
+
+
+def _native_base_url(base_url: str) -> str:
+    """Map the OpenAI-compat base (``.../v1``) to the native Ollama root.
+
+    Ollama serves its native API at the host root (``/api/chat``,
+    ``/api/tags``) while the OpenAI-compat shim lives under ``/v1``. The
+    shim silently ignores ``options.num_ctx``; the native API honors it
+    (bug_reviewer_832a909b). Configs still point ``base_url`` at the
+    ``/v1`` shim for back-compat, so strip a trailing ``/v1`` (and any
+    trailing slash) to reach the native surface. A ``base_url`` that
+    already lacks ``/v1`` is returned unchanged (minus trailing slash).
+    """
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/v1"):
+        trimmed = trimmed[: -len("/v1")]
+    return trimmed or base_url
+
+
+def _native_to_compat(native: Any) -> dict[str, Any]:
+    """Shape a native ``/api/chat`` response like an OpenAI chat-completion.
+
+    Lets the existing OpenAI-shaped parsers (:func:`_parse_response`,
+    :func:`_extract_message_content`, :func:`_build_usage`) consume the
+    native response unchanged. Field mapping:
+
+    - ``message.content``    -> ``choices[0].message.content``
+    - ``done_reason``        -> ``choices[0].finish_reason``
+    - ``prompt_eval_count``  -> ``usage.prompt_tokens``
+    - ``eval_count``         -> ``usage.completion_tokens``
+
+    Tolerant of a non-dict body (returns an empty-content shape so the
+    parser raises the usual ``malformed_envelope`` rather than crashing).
+    """
+    body = native if isinstance(native, dict) else {}
+    message = body.get("message")
+    if not isinstance(message, dict):
+        message = {}
+    return {
+        "choices": [
+            {
+                "message": {"content": message.get("content")},
+                "finish_reason": body.get("done_reason"),
+            }
+        ],
+        "usage": {
+            "prompt_tokens": body.get("prompt_eval_count"),
+            "completion_tokens": body.get("eval_count"),
+        },
+    }
 
 
 # Threshold for the truncation-warning heuristic. ``input_tokens >
@@ -428,18 +511,20 @@ def _resolve_format(
 
     1. ``request.metadata["format"]`` — caller per-call override.
     2. ``config.format`` — operator-pinned default.
-    3. ``None`` — unconstrained; the model is free to return any text.
+    3. ``None`` — unset; the caller (:meth:`OllamaProvider.review`)
+       then applies ``"json"`` as the effective default, since the
+       review schema is JSON.
 
     Non-string / empty values at layers 1 or 2 are treated as "unset"
     and fall through. Mirrors :func:`_resolve_num_ctx` so a malformed
     bus payload (``format=42``, ``format=""``, ``format=True``) lands
     silently as the default rather than crashing the provider.
 
-    No enum restriction here — Ollama accepts ``"json"`` today and
-    may add schema-constrained variants tomorrow. Whatever the caller
-    sends is forwarded verbatim; Ollama returns an error if the value
-    is unsupported and that error reaches the caller via the existing
-    :class:`openai.APIError` handler.
+    No enum restriction here — Ollama accepts ``"json"`` today and may
+    add schema-constrained variants tomorrow. Whatever the caller sends
+    is forwarded verbatim to the native ``format`` field; an unsupported
+    value yields an HTTP error that reaches the caller via the
+    :class:`httpx.HTTPStatusError` handler in :meth:`review`.
     """
     caller_value = request.metadata.get("format")
     caller_str = _coerce_format_value(caller_value)
@@ -686,11 +771,13 @@ def _get(obj: Any, name: str, default: Any) -> Any:
 
 
 def _usage_to_dict(usage_obj: Any) -> dict[str, Any]:
-    """Best-effort conversion of an SDK usage object to a plain dict.
+    """Best-effort conversion of a usage object to a plain dict.
 
-    The ``openai`` SDK returns ``CompletionUsage`` pydantic models.
-    Falling back to ``model_dump`` keeps both test mocks (plain dicts)
-    and production responses (SDK models) on the same code path.
+    The native path hands :func:`_native_to_compat` a plain dict, so
+    this is normally a passthrough. Retained defensively for any
+    attribute-style object (e.g. an injected fake or a pydantic model):
+    ``model_dump`` then attribute-sniffing keeps every shape on one
+    code path.
     """
     if usage_obj is None:
         return {}
