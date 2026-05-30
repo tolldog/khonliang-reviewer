@@ -1186,12 +1186,14 @@ class ReviewerAgent(BaseAgent):
 
         # Accept ``content`` (canonical), ``diff`` (alias), or
         # ``staging_handle`` (out-of-context byte handoff via the
-        # kh-stage CLI — closes fr_reviewer_800e851d). Exactly one
-        # must be set; the resolver returns an error envelope on
-        # ambiguity, malformed handles, or unimplemented bundle kinds.
-        # ``content`` wins when both inline names are non-empty so the
-        # canonical name remains authoritative; ``staging_handle`` is
-        # mutually exclusive with either inline arg.
+        # kh-stage CLI — closes fr_reviewer_800e851d). The inline group
+        # (``content``/``diff``) is mutually exclusive with
+        # ``staging_handle`` — supply one or the other, not both; the
+        # resolver returns an error envelope on that ambiguity, on
+        # malformed handles, or on unimplemented bundle kinds. The two
+        # inline names are NOT mutually exclusive: both may be present,
+        # and ``content`` wins on a tie so the canonical name stays
+        # authoritative.
         content, payload_error = _resolve_payload_or_staging(args)
         if payload_error is not None:
             return payload_error

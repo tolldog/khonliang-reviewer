@@ -812,7 +812,9 @@ async def test_review_diff_missing_bundle_rejects(tmp_path, monkeypatch):
         {"staging_handle": "fs:does-not-exist"},
     )
     assert "error" in result
-    assert "manifest not found" in result["error"]
+    # A wholly absent bundle dir surfaces as a "not found" staging error
+    # (the openat on the bundle_id segment fails before any per-file read).
+    assert "not found" in result["error"]
 
 
 async def test_review_diff_empty_staging_handle_treated_as_unset(

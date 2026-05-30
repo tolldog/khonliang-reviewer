@@ -98,7 +98,9 @@ def test_resolve_fs_happy_path(tmp_path: Path) -> None:
 
 
 def test_resolve_fs_missing_bundle(tmp_path: Path) -> None:
-    with pytest.raises(staging.StagingHandleError, match="manifest not found"):
+    # A wholly absent bundle dir is reported as "not found" — the
+    # openat on the bundle_id segment fails before any per-file read.
+    with pytest.raises(staging.StagingHandleError, match="not found"):
         staging.resolve_fs("nonexistent", root=tmp_path)
 
 
@@ -308,7 +310,7 @@ def test_resolve_fs_rejects_symlinked_diff(tmp_path: Path) -> None:
 
 def test_resolve_fs_rejects_non_regular_file(tmp_path: Path) -> None:
     """A FIFO / device / socket in place of manifest.json must not be
-    read as if it were a file — ``fstat`` check catches that.
+    read as if it were a file — the lstat/fstat check catches that.
     """
     bundle_dir = tmp_path / "staging" / "fifo-bundle"
     bundle_dir.mkdir(parents=True)
@@ -318,3 +320,54 @@ def test_resolve_fs_rejects_non_regular_file(tmp_path: Path) -> None:
 
     with pytest.raises(staging.StagingHandleError, match="not a regular file"):
         staging.resolve_fs("fifo-bundle", root=tmp_path / "staging")
+
+
+# ---------------------------------------------------------------------------
+# Size cap + dir-fd anchoring (pass-3 findings on reviewer/staging.py).
+#
+# ``staging_handle`` bypasses the bus request-size limit, so an oversized
+# bundle file must be rejected on the read side rather than read into
+# memory. Reads are also anchored to an O_NOFOLLOW dir fd so a symlinked
+# bundle *directory* (not just a symlinked file) can't redirect access.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_fs_rejects_oversized_diff(tmp_path: Path, monkeypatch) -> None:
+    """A diff.patch larger than the cap is rejected via the fstat size
+    check before the whole file is read into memory."""
+    monkeypatch.setattr(staging, "MAX_BUNDLE_FILE_BYTES", 16)
+    _write_bundle(tmp_path, "big", diff_bytes=b"x" * 64)
+    with pytest.raises(staging.StagingHandleError, match="too large"):
+        staging.resolve_fs("big", root=tmp_path)
+
+
+def test_resolve_fs_rejects_oversized_manifest(tmp_path: Path, monkeypatch) -> None:
+    """The manifest is size-capped on the same path as the diff."""
+    monkeypatch.setattr(staging, "MAX_BUNDLE_FILE_BYTES", 8)
+    _write_bundle(tmp_path, "bigman", diff_bytes=b"x")
+    with pytest.raises(staging.StagingHandleError, match="too large"):
+        staging.resolve_fs("bigman", root=tmp_path)
+
+
+def test_resolve_fs_under_cap_allowed(tmp_path: Path, monkeypatch) -> None:
+    """A bundle whose files are under the cap reads normally — the size
+    guard only rejects ``size > cap``, not ``size <= cap``."""
+    monkeypatch.setattr(staging, "MAX_BUNDLE_FILE_BYTES", 4096)
+    _write_bundle(tmp_path, "ok", diff_bytes=b"y" * 16)
+    result = staging.resolve_fs("ok", root=tmp_path)
+    assert result.diff_bytes == b"y" * 16
+
+
+def test_resolve_fs_rejects_symlinked_bundle_dir_inside_root(tmp_path: Path) -> None:
+    """A bundle *directory* that is itself a symlink — even one pointing
+    to a real bundle inside the staging root — is refused by the
+    O_NOFOLLOW openat. kh-stage writes real dirs, never symlinks, so a
+    symlinked bundle dir is treated as tampering.
+    """
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    _write_bundle(staging_dir, "real", diff_bytes=b"body")
+    (staging_dir / "alias").symlink_to(staging_dir / "real")
+
+    with pytest.raises(staging.StagingHandleError):
+        staging.resolve_fs("alias", root=staging_dir)

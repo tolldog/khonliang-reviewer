@@ -28,6 +28,19 @@ from typing import NamedTuple
 DEFAULT_STAGING_ROOT = Path("/var/lib/khonliang/staging")
 ENV_STAGING_ROOT = "KHONLIANG_STAGING_ROOT"
 
+# Hard ceiling on any single bundle file (manifest.json / diff.patch).
+# ``staging_handle`` deliberately bypasses the bus request-size limits —
+# the whole point is to keep a large diff off the caller's MCP context —
+# so the size guard against a malicious or runaway bundle has to live
+# here, on the read side. 64 MiB is far above any real review diff.
+MAX_BUNDLE_FILE_BYTES = 64 * 1024 * 1024
+
+# ``os.open`` / ``os.lstat`` accept a ``dir_fd`` only on platforms that
+# advertise it (POSIX yes, Windows no). When present we anchor every
+# bundle read to an O_NOFOLLOW directory fd (openat semantics); when
+# absent we fall back to resolved-path reads. Computed once at import.
+_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+
 
 class StagingHandleError(ValueError):
     """Raised when a staging_handle is malformed or the bundle can't be read."""
@@ -129,6 +142,13 @@ def _validate_bundle_id_segment(bundle_id: str) -> None:
             f"staging_handle: bundle_id must be a single path segment "
             f"(got {bundle_id!r} containing path separator)"
         )
+    if Path(bundle_id).is_absolute():
+        # POSIX absolute paths are already caught by the separator check
+        # above; this honors the documented contract and also rejects the
+        # Windows drive / UNC shapes (``C:\...``, ``\\host\share``).
+        raise StagingHandleError(
+            f"staging_handle: bundle_id may not be absolute (got {bundle_id!r})"
+        )
     if bundle_id in (".", ".."):
         raise StagingHandleError(
             f"staging_handle: bundle_id may not be {bundle_id!r}"
@@ -160,23 +180,31 @@ def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
     raise :class:`StagingNotImplemented` so reviewer adoption can lag
     kh-stage by one ship cycle for each new depth mode.
 
-    Security: ``bundle_id`` is constrained to a single safe path segment
-    (see :func:`_validate_bundle_id_segment`) and the resolved bundle
-    dir is checked to live under the staging root before any read,
-    so an attacker-controlled handle can't escape via ``../`` or a
-    symlink swap.
+    Security (defense in depth; ``bundle_id`` is untrusted):
+
+    1. ``bundle_id`` is constrained to a single safe path segment
+       (see :func:`_validate_bundle_id_segment`).
+    2. The resolved bundle dir is verified to live under the resolved
+       staging root before any open — a clear early reject for ``../``
+       or symlink-to-outside bundle dirs.
+    3. Reads are anchored to an ``O_NOFOLLOW`` directory fd opened *at*
+       the staging root (openat semantics, where the platform supports
+       ``dir_fd``). This closes the TOCTOU gap between the containment
+       check and the read: a writable staging root can't swap
+       ``<root>/<bundle_id>`` for a symlink after the check to redirect
+       reads outside the root, and per-file ``O_NOFOLLOW`` rejects a
+       symlinked ``manifest.json`` / ``diff.patch``.
+    4. Each file is size-capped (:data:`MAX_BUNDLE_FILE_BYTES`) so a
+       handle — which bypasses the bus request-size limit — can't OOM
+       the reviewer.
     """
     if root is None:
         root = staging_root()
     _validate_bundle_id_segment(bundle_id)
     bundle_dir = root / bundle_id
-    # Defense in depth: even with the segment check above, a clever
-    # symlink under the staging root could redirect the bundle_dir
-    # resolution outside the root. ``Path.resolve()`` collapses any
-    # symlinks; if the result still lives under the resolved root, the
-    # access is safe. ``strict=False`` so a non-existent bundle still
-    # reaches the "manifest not found" branch (clearer error) rather
-    # than raising FileNotFoundError here.
+    # Step 2: collapse any symlinks and confirm containment under the
+    # root before any open. ``strict=False`` so a non-existent bundle
+    # still reaches the not-found branch below with a clear error.
     try:
         resolved_bundle = bundle_dir.resolve(strict=False)
         resolved_root = root.resolve(strict=False)
@@ -188,101 +216,192 @@ def resolve_fs(bundle_id: str, *, root: Path | None = None) -> ResolvedBundle:
         raise StagingHandleError(
             f"fs bundle path escapes staging root: bundle_id={bundle_id!r}"
         )
-    manifest_path = bundle_dir / "manifest.json"
-    manifest_bytes = _read_regular_file_nofollow(manifest_path, "manifest")
+
+    # Step 3: open the bundle dir as an O_NOFOLLOW fd anchored at the
+    # staging root, then read every file relative to that fd so an
+    # intermediate symlink swap can't redirect access after the check.
+    bundle_fd = _open_bundle_dir_fd(root, bundle_id, resolved_bundle)
     try:
-        manifest = json.loads(manifest_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise StagingHandleError(
-            f"fs bundle manifest unreadable at {manifest_path}: {exc}"
-        ) from exc
-    if not isinstance(manifest, dict):
-        raise StagingHandleError(
-            f"fs bundle manifest at {manifest_path} must be a JSON object"
+        manifest_bytes = _read_bundle_file(
+            bundle_fd, resolved_bundle, "manifest.json", "manifest"
         )
-    kind = manifest.get("kind")
-    if not isinstance(kind, str) or not kind:
-        raise StagingHandleError(
-            f"fs bundle manifest at {manifest_path} missing required 'kind' string"
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StagingHandleError(
+                f"fs bundle manifest unreadable in {bundle_dir}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise StagingHandleError(
+                f"fs bundle manifest in {bundle_dir} must be a JSON object"
+            )
+        kind = manifest.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise StagingHandleError(
+                f"fs bundle manifest in {bundle_dir} missing required 'kind' string"
+            )
+        if kind != "diff":
+            raise StagingNotImplemented(
+                f"fs bundle kind={kind!r} not yet wired in reviewer; "
+                "only 'diff' is implemented today (richer modes land per "
+                "fr_khonliang-bus-lib_520ce3bf follow-ups)"
+            )
+        diff_bytes = _read_bundle_file(
+            bundle_fd, resolved_bundle, "diff.patch", "diff.patch"
         )
-    if kind != "diff":
-        raise StagingNotImplemented(
-            f"fs bundle kind={kind!r} not yet wired in reviewer; "
-            "only 'diff' is implemented today (richer modes land per "
-            "fr_khonliang-bus-lib_520ce3bf follow-ups)"
-        )
-    diff_path = bundle_dir / "diff.patch"
-    diff_bytes = _read_regular_file_nofollow(diff_path, "diff.patch")
+    finally:
+        if bundle_fd is not None:
+            os.close(bundle_fd)
     return ResolvedBundle(kind=kind, diff_bytes=diff_bytes)
 
 
-def _read_regular_file_nofollow(path: Path, label: str) -> bytes:
-    """Read a regular file without following symlinks or blocking.
+def _open_bundle_dir_fd(
+    root: Path, bundle_id: str, resolved_bundle: Path
+) -> int | None:
+    """Open the bundle directory as an ``O_NOFOLLOW`` fd anchored at ``root``.
 
-    Defense beyond the bundle-dir containment check: even if the
-    bundle dir itself resolves cleanly under the staging root, a
-    *file inside* the dir could be a symlink pointing at
-    ``/etc/passwd`` or a FIFO that blocks the reviewer indefinitely.
+    Returns an open directory fd the caller must ``os.close``, or ``None``
+    on platforms without ``dir_fd`` support (callers then read via the
+    resolved path). The staging root itself is trusted configuration, so
+    following symlinks to *reach* it is fine; only the untrusted
+    ``bundle_id`` segment is opened ``O_NOFOLLOW | O_DIRECTORY`` relative
+    to the root fd. A symlink swapped in for ``<root>/<bundle_id>`` after
+    the containment check is therefore refused by the kernel (``ELOOP``)
+    rather than followed.
+    """
+    if not _SUPPORTS_DIR_FD:
+        return None
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        root_fd = os.open(str(root), dir_flags)
+    except OSError as exc:
+        raise StagingHandleError(
+            f"fs staging root could not be opened at {root}: {exc}"
+        ) from exc
+    try:
+        try:
+            return os.open(
+                bundle_id,
+                dir_flags | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError as exc:
+            raise StagingHandleError(
+                f"fs bundle not found at {resolved_bundle}"
+            ) from exc
+        except OSError as exc:
+            # ELOOP (symlinked bundle dir) / ENOTDIR (bundle_id is a
+            # file) / EACCES — surface as a clean staging error.
+            raise StagingHandleError(
+                f"fs bundle dir could not be opened at {resolved_bundle}: {exc}"
+            ) from exc
+    finally:
+        os.close(root_fd)
 
-    Order matters:
 
-    1. ``lstat`` first (does not follow symlinks): reject anything
-       that isn't a regular file — symlink, FIFO, device, socket,
-       directory. This catches FIFOs *before* ``os.open``, which
-       would otherwise block forever waiting for a writer.
-    2. ``os.open(..., O_NOFOLLOW)``: TOCTOU defense — between the
-       lstat and the open, a symlink could be swapped in; the
-       kernel refuses to follow it (``ELOOP``).
-    3. ``fstat`` once more on the open fd: belt-and-suspenders
-       against a race that swapped the inode after the lstat passed
-       but before the open succeeded.
+def _read_bundle_file(
+    bundle_fd: int | None,
+    resolved_bundle: Path,
+    name: str,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
+    """Read one regular bundle file: no symlink follow, no block, size-capped.
+
+    ``bundle_fd`` is the ``O_NOFOLLOW`` directory fd from
+    :func:`_open_bundle_dir_fd`; when it is ``None`` (no ``dir_fd``
+    support) the file is read via its resolved path instead. Either way:
+
+    1. ``lstat`` first (no follow, never blocks): reject symlink / FIFO /
+       device / socket / dir with a clear error before ``os.open``.
+    2. ``os.open`` with ``O_NOFOLLOW | O_NONBLOCK``: ``O_NOFOLLOW`` is the
+       TOCTOU defense against a symlink swapped in after the lstat;
+       ``O_NONBLOCK`` ensures a FIFO swapped in after the lstat returns
+       immediately instead of blocking the reviewer, then fails the
+       post-open ``fstat`` regular-file check.
+    3. ``fstat`` on the open fd: authoritative regular-file check plus the
+       size guard.
+    4. bounded read (``max_bytes + 1``) so a file that grows between the
+       fstat and the read is rejected, not silently truncated.
     """
     import stat as _stat
 
+    # Read the cap at call time (not as a default arg) so it stays a
+    # single live knob — tests monkeypatch the module constant.
+    if max_bytes is None:
+        max_bytes = MAX_BUNDLE_FILE_BYTES
+    display = resolved_bundle / name
+    if bundle_fd is not None:
+        target: str = name
+        fd_kwargs: dict[str, int] = {"dir_fd": bundle_fd}
+    else:
+        target = str(display)
+        fd_kwargs = {}
+
     try:
-        lst = os.lstat(str(path))
+        lst = os.lstat(target, **fd_kwargs)
     except FileNotFoundError as exc:
         raise StagingHandleError(
-            f"fs bundle {label} not found at {path}"
+            f"fs bundle {label} not found at {display}"
         ) from exc
     except OSError as exc:
         raise StagingHandleError(
-            f"fs bundle {label} unstatable at {path}: {exc}"
+            f"fs bundle {label} unstatable at {display}: {exc}"
         ) from exc
 
     if _stat.S_ISLNK(lst.st_mode):
         raise StagingHandleError(
-            f"fs bundle {label} at {path} is a symlink"
+            f"fs bundle {label} at {display} is a symlink"
         )
     if not _stat.S_ISREG(lst.st_mode):
         raise StagingHandleError(
-            f"fs bundle {label} at {path} is not a regular file "
+            f"fs bundle {label} at {display} is not a regular file "
             f"(mode={oct(lst.st_mode)})"
         )
 
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_NOFOLLOW", 0)  # POSIX; absent on Windows
-    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)  # POSIX; absent on Windows
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        fd = os.open(str(path), flags)
+        fd = os.open(target, flags, **fd_kwargs)
     except OSError as exc:
         # ELOOP / EPERM / EACCES / TOCTOU race with a symlink swap —
         # surface as a clean staging error rather than letting the OS
         # error bubble as an internal-server-error shape.
         raise StagingHandleError(
-            f"fs bundle {label} could not be opened at {path}: {exc}"
+            f"fs bundle {label} could not be opened at {display}: {exc}"
         ) from exc
     try:
         st = os.fstat(fd)
         if not _stat.S_ISREG(st.st_mode):
             raise StagingHandleError(
-                f"fs bundle {label} at {path} is not a regular file "
+                f"fs bundle {label} at {display} is not a regular file "
                 f"(mode={oct(st.st_mode)})"
             )
+        if st.st_size > max_bytes:
+            raise StagingHandleError(
+                f"fs bundle {label} at {display} too large: "
+                f"{st.st_size} bytes exceeds {max_bytes}-byte cap"
+            )
         with os.fdopen(fd, "rb", closefd=False) as f:
-            return f.read()
+            # Read one past the cap so a file that grew between the fstat
+            # and this read (TOCTOU) is rejected rather than truncated.
+            data = f.read(max_bytes + 1)
     finally:
         os.close(fd)
+    if len(data) > max_bytes:
+        raise StagingHandleError(
+            f"fs bundle {label} at {display} exceeds {max_bytes}-byte cap"
+        )
+    return data
 
 
 def resolve(handle: str, *, root: Path | None = None) -> ResolvedBundle:
