@@ -42,6 +42,13 @@ from typing import Any, Callable
 # finding 1.
 from reviewer.defaults import DEFAULT_REVIEWER_MODEL
 
+# One-way dependency: ``policy`` consults the audience-keyed distill table
+# to emit the ``(PolicyDecision, DistillConfig)`` pair from a single call.
+# ``reviewer.rules.distill`` never imports back from ``policy`` (its
+# ``decide_distill`` keys on a bare ``audience`` string), so there's no
+# cycle.
+from reviewer.rules.distill import Audience, DistillConfig, decide_distill
+
 
 #: Floor context window sizes, in input tokens. Matches the documented
 #: capability bands across ollama + claude at the time of writing.
@@ -63,6 +70,12 @@ class PolicyInput:
     diff_line_count: int = 0
     diff_file_count: int = 0
     profile: dict[str, Any] | None = None
+    #: Output-shape audience (who consumes the findings). Drives the
+    #: distill half of :func:`evaluate` via
+    #: :func:`reviewer.rules.distill.decide_distill`; ignored by the
+    #: provider rules, which key on diff size. Defaults to the
+    #: non-aggressive ``agent_consumption``.
+    audience: Audience = "agent_consumption"
 
 
 @dataclass(frozen=True)
@@ -188,6 +201,32 @@ def decide(
     return fallback
 
 
+def evaluate(
+    inp: PolicyInput,
+    *,
+    rules: list[Rule] | None = None,
+    fallback: PolicyDecision = DEFAULT_FALLBACK,
+) -> tuple[PolicyDecision, DistillConfig]:
+    """Single-call rule evaluation → ``(PolicyDecision, DistillConfig)``.
+
+    Closes ``fr_reviewer_de1694a8``'s connective-tissue goal: callers get
+    both halves of a review's config from one query instead of assembling
+    the provider decision and the distill config from separate surfaces.
+    The two halves key on orthogonal signals — provider on diff size
+    (:func:`decide`), distill on audience
+    (:func:`reviewer.rules.distill.decide_distill`) — so they're composed
+    here rather than crammed into one combinatorial rule table.
+
+    The returned :class:`DistillConfig` is the rule-table baseline for the
+    input's audience; a caller that explicitly pins ``severity_floor`` (or
+    other fields) layers that on top afterward via ``dataclasses.replace``.
+    """
+    return (
+        decide(inp, rules=rules, fallback=fallback),
+        decide_distill(inp.audience, inp.kind),
+    )
+
+
 __all__ = [
     "CTX_LARGE",
     "CTX_MEDIUM",
@@ -198,4 +237,5 @@ __all__ = [
     "PolicyInput",
     "Rule",
     "decide",
+    "evaluate",
 ]

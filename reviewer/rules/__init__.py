@@ -9,6 +9,11 @@ Two small modules:
   (WU5 wires ``researcher.knowledge_search`` for reads).
 """
 
+from reviewer.rules.distill import (
+    Audience,
+    DistillConfig,
+    decide_distill,
+)
 from reviewer.rules.policy import (
     CTX_LARGE,
     CTX_MEDIUM,
@@ -19,6 +24,7 @@ from reviewer.rules.policy import (
     PolicyInput,
     Rule,
     decide,
+    evaluate,
 )
 from reviewer.rules.profile import (
     PROFILE_KEY_PREFIX,
@@ -29,11 +35,13 @@ from reviewer.rules.profile import (
 
 
 __all__ = [
+    "Audience",
     "CTX_LARGE",
     "CTX_MEDIUM",
     "CTX_SMALL",
     "DEFAULT_FALLBACK",
     "DEFAULT_RULES",
+    "DistillConfig",
     "InMemoryProfileCache",
     "PROFILE_KEY_PREFIX",
     "PolicyDecision",
@@ -41,5 +49,7 @@ __all__ = [
     "ProfileCache",
     "Rule",
     "decide",
+    "decide_distill",
+    "evaluate",
     "profile_key",
 ]

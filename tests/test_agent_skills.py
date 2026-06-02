@@ -4563,3 +4563,80 @@ async def test_audience_non_audit_runs_severity_floor_through_pipeline():
     titles = [f["title"] for f in out["findings"]]
     # nit dropped; only concern survives.
     assert titles == ["real bug"]
+
+
+async def test_audience_github_comment_caps_findings_via_rule_table():
+    """github_comment audience pulls ``max_findings=10`` from the distill
+    rule table (fr_reviewer_de1694a8 Piece A), capping a long finding list;
+    agent_consumption (no cap) keeps them all. Only the audience-driven
+    shaping differs — same provider, same severity_floor.
+    """
+
+    def _harness_with_15():
+        findings = [
+            ReviewFinding(
+                severity="comment",  # type: ignore[arg-type]  # >= default nit floor
+                title=f"f{i}",
+                body="b",
+            )
+            for i in range(15)
+        ]
+        fake = _ScriptedProvider("ollama", [_consensus_result(findings)])
+        return _make_harness({"ollama": fake})
+
+    capped = await _harness_with_15().call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "audience": "github_comment"},
+    )
+    assert len(capped["findings"]) == 10  # max_findings=10 from the rule table
+
+    uncapped = await _harness_with_15().call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "audience": "agent_consumption"},
+    )
+    assert len(uncapped["findings"]) == 15  # no cap for the default audience
+
+
+async def test_audience_github_comment_floors_nits_via_rule_table():
+    """github_comment pulls ``severity_floor=comment`` from the rule table,
+    so an unpinned review drops nits; agent_consumption (default nit floor)
+    keeps them. No explicit ``severity_floor`` arg in either call.
+    """
+    nit = ReviewFinding(severity="nit", title="cosmetic", body="b")  # type: ignore[arg-type]
+    concern = ReviewFinding(severity="concern", title="real bug", body="b")  # type: ignore[arg-type]
+
+    def _h():
+        fake = _ScriptedProvider("ollama", [_consensus_result([nit, concern])])
+        return _make_harness({"ollama": fake})
+
+    gh = await _h().call(
+        "review_text", {"kind": "pr_diff", "content": "x", "audience": "github_comment"}
+    )
+    assert [f["title"] for f in gh["findings"]] == ["real bug"]  # nit floored out
+
+    agent = await _h().call(
+        "review_text", {"kind": "pr_diff", "content": "x", "audience": "agent_consumption"}
+    )
+    assert sorted(f["title"] for f in agent["findings"]) == ["cosmetic", "real bug"]
+
+
+async def test_explicit_severity_floor_overrides_audience_floor():
+    """An explicit caller ``severity_floor`` outranks the rule-table audience
+    floor. github_comment's audience floor is ``comment``, but a caller that
+    pins ``concern`` gets concern-only — the explicit pin wins.
+    """
+    comment_f = ReviewFinding(severity="comment", title="a comment", body="b")  # type: ignore[arg-type]
+    concern = ReviewFinding(severity="concern", title="real bug", body="b")  # type: ignore[arg-type]
+    fake = _ScriptedProvider("ollama", [_consensus_result([comment_f, concern])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "audience": "github_comment",
+            "severity_floor": "concern",  # explicit pin > audience's "comment"
+        },
+    )
+    assert [f["title"] for f in out["findings"]] == ["real bug"]

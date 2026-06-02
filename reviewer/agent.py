@@ -46,7 +46,7 @@ from khonliang_reviewer import (
 )
 
 from reviewer.distill import run_pipeline
-from reviewer.rules.distill import Audience, DistillConfig
+from reviewer.rules.distill import Audience
 
 from reviewer.config.prompts import (
     RepoPrompts,
@@ -71,7 +71,7 @@ from reviewer.providers import (
 )
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
-from reviewer.rules import PolicyDecision, PolicyInput, decide
+from reviewer.rules import PolicyInput, decide_distill, evaluate
 from reviewer.selector import (
     DEFAULT_REVIEWER_MODEL,
     ProviderSelector,
@@ -844,13 +844,19 @@ def _positive_float_or_none(val: Any) -> float | None:
 
 
 def _policy_input_for(
-    *, kind: str, content: str, context: dict[str, Any]
+    *,
+    kind: str,
+    content: str,
+    context: dict[str, Any],
+    audience: Audience = "agent_consumption",
 ) -> PolicyInput:
     """Build a :class:`PolicyInput` from the pieces available in the handler.
 
     Callers can supply authoritative ``diff_line_count`` /
     ``diff_file_count`` / ``profile`` in ``context``; otherwise they're
-    estimated from ``content`` (for diffs) or left empty.
+    estimated from ``content`` (for diffs) or left empty. ``audience``
+    drives the distill half of :func:`reviewer.rules.evaluate` (the
+    provider half ignores it).
     """
     est_lines, est_files = _estimate_diff_size(content, kind)
     return PolicyInput(
@@ -862,6 +868,7 @@ def _policy_input_for(
             if isinstance(context.get("profile"), dict)
             else None
         ),
+        audience=audience,
     )
 
 
@@ -1220,14 +1227,16 @@ class ReviewerAgent(BaseAgent):
         # the resolvers handle that case by falling through to defaults.
         repo_cfg = _load_repo_config_from_context(context)
 
-        # Resolve severity_floor precedence up-front so a validation
-        # error surfaces before we spend a provider call. Order matches
-        # the FR (skill arg → .reviewer/config.yaml → built-in default).
-        # The ``skill_arg`` step validates eagerly because the caller
-        # typo'd; the config-layer step validates because operators
-        # can typo their YAML too. Default is trusted (module constant).
+        # Resolve an *explicit* severity_floor override up-front so a
+        # validation error surfaces before we spend a provider call. The
+        # ``skill_arg`` step validates eagerly (the caller typo'd); the
+        # config-layer step validates because operators can typo their YAML
+        # too. Returns ``None`` when neither is set, so the rule-table
+        # audience floor (resolved below) fills the gap — full precedence is
+        # skill arg → .reviewer/config.yaml → rule-table audience floor →
+        # "nit".
         try:
-            effective_floor = self._resolve_severity_floor(args, repo_cfg)
+            override_floor = self._severity_floor_override(args, repo_cfg)
         except SeverityFloorError as exc:
             return {"error": str(exc)}
 
@@ -1247,9 +1256,20 @@ class ReviewerAgent(BaseAgent):
                     backend=caller_backend, model=caller_model
                 )
                 selection_reason = "caller override"
+                # Provider is caller-pinned, but distill shaping still
+                # comes from the audience rule table.
+                base_distill = decide_distill(effective_audience, kind)
             else:
-                decision = decide(
-                    _policy_input_for(kind=kind, content=content, context=context)
+                # One rule-table query yields both the provider decision
+                # AND the audience-shaped distill config — callers never
+                # split the query across two surfaces (fr_reviewer_de1694a8).
+                decision, base_distill = evaluate(
+                    _policy_input_for(
+                        kind=kind,
+                        content=content,
+                        context=context,
+                        audience=effective_audience,
+                    )
                 )
                 provider, chosen_model = selector.select(
                     backend=decision.backend, model=decision.model
@@ -1257,6 +1277,21 @@ class ReviewerAgent(BaseAgent):
                 selection_reason = f"rule-table: {decision.reason}"
         except UnknownBackendError as exc:
             return {"error": str(exc)}
+
+        # The distill config comes from the rule table per audience
+        # (body_mode / max_findings / dedup / consensus / severity_floor).
+        # An *explicit* caller/config severity_floor override wins; absent
+        # one, the rule-table audience floor applies (e.g. github_comment
+        # → comment). This is the precedence chain: caller arg →
+        # .reviewer/config.yaml → rule-table audience floor → "nit".
+        final_floor = (
+            override_floor if override_floor is not None
+            else base_distill.severity_floor
+        )
+        distill_config = dataclass_replace(
+            base_distill,
+            severity_floor=final_floor,  # type: ignore[arg-type]
+        )
 
         logger.debug(
             "reviewer.select: backend=%s model=%s reason=%s kind=%s",
@@ -1397,13 +1432,7 @@ class ReviewerAgent(BaseAgent):
                 # Defense in depth: still run the distill pipeline +
                 # record consensus usage before surfacing the error
                 # so the spend isn't lost.
-                result = run_pipeline(
-                    result,
-                    DistillConfig(
-                        severity_floor=effective_floor,
-                        audience=effective_audience,
-                    ),
-                )
+                result = run_pipeline(result, distill_config)
                 await self._record_usage(result)
                 return {"error": str(exc)}
 
@@ -1413,13 +1442,7 @@ class ReviewerAgent(BaseAgent):
         # the ``audit_corpus`` audience short-circuits the whole
         # pipeline so audit / benchmark callers always see raw
         # provider output.
-        result = run_pipeline(
-            result,
-            DistillConfig(
-                severity_floor=effective_floor,
-                audience=effective_audience,
-            ),
-        )
+        result = run_pipeline(result, distill_config)
         await self._record_usage(result)
         return result.to_dict()
 
@@ -1767,12 +1790,15 @@ class ReviewerAgent(BaseAgent):
             model=consensus_result.model,
         )
 
-    def _resolve_severity_floor(
+    def _severity_floor_override(
         self, args: dict[str, Any], cfg: RepoConfig | None
-    ) -> str:
-        """Resolve the effective severity_floor per the FR precedence chain.
+    ) -> str | None:
+        """Resolve an *explicit* severity_floor override, or ``None``.
 
-        High-to-low:
+        Returns the floor the caller or repo config explicitly set, so the
+        handler can distinguish "explicitly pinned" from "unset" and let
+        the rule-table audience floor (e.g. ``github_comment`` →
+        ``comment``) apply when nothing was pinned. Precedence:
 
         1. Skill-arg ``severity_floor`` (non-empty string) — **strict**.
            A bad value here is a caller bug; raise
@@ -1783,10 +1809,10 @@ class ReviewerAgent(BaseAgent):
            the caller passes a pre-loaded :class:`RepoConfig` (obtained
            via :func:`_load_repo_config_from_context`). A bad value in
            YAML shouldn't nuke every review for that repo — log a
-           warning naming the offending value and fall through to the
-           built-in default. Reviewing is more important than
-           config-layer correctness.
-        3. :data:`_DEFAULT_SEVERITY_FLOOR` (``"nit"`` — no filtering).
+           warning naming the offending value and fall through (``None``).
+           Reviewing is more important than config-layer correctness.
+        3. ``None`` — neither set. The handler then uses the rule-table
+           audience floor (default audiences carry ``"nit"`` = no filter).
 
         Rationale for asymmetric validation: the skill-arg path is a
         programmatic caller (another agent, a test, an orchestrator) —
@@ -1813,19 +1839,19 @@ class ReviewerAgent(BaseAgent):
                 # first, falling back to checks.severity_floor — the
                 # warning names the resolved key generically so operators
                 # aren't misled about which key actually carried the bad
-                # value.
+                # value. Fall through to None so the rule-table floor (or
+                # default) applies instead of the bad config value.
                 logger.warning(
                     "reviewer: ignoring invalid .reviewer/config.yaml "
                     "severity_floor=%r (checked review.severity_floor "
-                    "and checks.severity_floor); falling back to "
-                    "default %r (%s)",
+                    "and checks.severity_floor); falling back to the "
+                    "audience/default floor (%s)",
                     config_value,
-                    _DEFAULT_SEVERITY_FLOOR,
                     exc,
                 )
-                return _DEFAULT_SEVERITY_FLOOR
+                return None
 
-        return _DEFAULT_SEVERITY_FLOOR
+        return None
 
     @handler("review_diff")
     async def handle_review_diff(self, args: dict[str, Any]) -> dict[str, Any]:
