@@ -7,7 +7,12 @@ dependencies = [
     "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@main",
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
     "pyyaml>=6.0",
-    "openai>=1.40",
+    # The Ollama provider talks to the native ``/api/chat`` endpoint via
+    # httpx directly (the OpenAI-compat ``/v1`` shim silently drops
+    # ``options.num_ctx`` — bug_reviewer_832a909b). httpx is imported
+    # directly, so declare it directly rather than leaning on a
+    # transitive pull from githubkit / khonliang-bus-lib.
+    "httpx>=0.27",
     # ``GitHub.__init__`` renamed the ``token`` kwarg to ``auth`` around
     # 0.13; this provider passes ``auth=`` (see reviewer/github_client.py).
     # Bump the floor accordingly so the install fails loudly on stale

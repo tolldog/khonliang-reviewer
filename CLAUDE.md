@@ -22,7 +22,13 @@ When working here:
 
 The reviewer ships with two first-class backends:
 
-1. **Ollama** via `openai` SDK against `http://localhost:11434/v1`.
+1. **Ollama** via `httpx` against the **native** `/api/chat` endpoint
+   (`http://localhost:11434/api/chat`). Configs still set `base_url` to
+   the OpenAI-compat `/v1` base for back-compat; the provider strips the
+   `/v1` suffix to reach the native surface. The native endpoint is
+   required because the `/v1` OpenAI-compat shim *silently drops*
+   `options.num_ctx`, truncating every large review at the 4096-token
+   default (`bug_reviewer_832a909b`); the native endpoint honors it.
 2. **Claude-via-CLI** via subprocess around `claude -p --output-format=json`,
    consuming the Claude Pro/Max subscription quota via
    `CLAUDE_CODE_OAUTH_TOKEN` (provisioned per-machine via `claude setup-token`).
