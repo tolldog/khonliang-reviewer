@@ -1227,12 +1227,14 @@ class ReviewerAgent(BaseAgent):
         # the resolvers handle that case by falling through to defaults.
         repo_cfg = _load_repo_config_from_context(context)
 
-        # Resolve severity_floor precedence up-front so a validation
-        # error surfaces before we spend a provider call. Order matches
-        # the FR (skill arg → .reviewer/config.yaml → built-in default).
-        # The ``skill_arg`` step validates eagerly because the caller
-        # typo'd; the config-layer step validates because operators
-        # can typo their YAML too. Default is trusted (module constant).
+        # Resolve an *explicit* severity_floor override up-front so a
+        # validation error surfaces before we spend a provider call. The
+        # ``skill_arg`` step validates eagerly (the caller typo'd); the
+        # config-layer step validates because operators can typo their YAML
+        # too. Returns ``None`` when neither is set, so the rule-table
+        # audience floor (resolved below) fills the gap — full precedence is
+        # skill arg → .reviewer/config.yaml → rule-table audience floor →
+        # "nit".
         try:
             override_floor = self._severity_floor_override(args, repo_cfg)
         except SeverityFloorError as exc:
