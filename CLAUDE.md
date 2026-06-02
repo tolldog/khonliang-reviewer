@@ -74,3 +74,28 @@ within this repo; validate at every untrusted boundary.
 
 For provider changes, include focused coverage around transport mocking,
 usage-record population, and error dispositions.
+
+## Deployment
+
+The live agent runs from `/opt/khonliang/agents/reviewer/.venv` as a
+**non-editable copied install** (NOT editable against this dev checkout)
+and is supervised by the bus (no systemd). The source-of-truth clone is
+`/opt/khonliang/src/khonliang-reviewer`. So a merge to `main` does **not**
+go live until the source is pulled, the package reinstalled into the venv,
+and the agent restarted.
+
+`scripts/deploy.sh` does exactly that (parametrized for the sibling agents):
+pull the source clone over **HTTPS** (the `khonliang` service account is
+keyless; the repo is public), reinstall the package, sync dependencies only
+when `pyproject.toml` changed, then restart via the bus. It runs every
+mutating step as the venv-owning `khonliang` user (via `sudo -u`).
+
+```sh
+scripts/deploy.sh                 # pull main, reinstall, restart reviewer-primary
+scripts/deploy.sh --dry-run       # print the commands without running them
+scripts/deploy.sh --verify-review # after restart, prove a large diff is no longer
+                                  # truncated at 4096 input tokens (bug_reviewer_832a909b)
+```
+
+Requires passwordless `sudo` (or run as `khonliang`) and PyPI reachable (the
+venv has no setuptools, so `pip install` builds via isolation).
