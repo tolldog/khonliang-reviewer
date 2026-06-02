@@ -1234,7 +1234,7 @@ class ReviewerAgent(BaseAgent):
         # typo'd; the config-layer step validates because operators
         # can typo their YAML too. Default is trusted (module constant).
         try:
-            effective_floor = self._resolve_severity_floor(args, repo_cfg)
+            override_floor = self._severity_floor_override(args, repo_cfg)
         except SeverityFloorError as exc:
             return {"error": str(exc)}
 
@@ -1276,14 +1276,19 @@ class ReviewerAgent(BaseAgent):
         except UnknownBackendError as exc:
             return {"error": str(exc)}
 
-        # The distill config's shaping fields (body_mode / max_findings /
-        # dedup / consensus / audience) come from the rule table; the
-        # severity_floor keeps its own precedence chain (caller arg →
-        # .reviewer/config.yaml → default) resolved as ``effective_floor``.
-        # Audience-driven severity_floor is a deliberate follow-up.
+        # The distill config comes from the rule table per audience
+        # (body_mode / max_findings / dedup / consensus / severity_floor).
+        # An *explicit* caller/config severity_floor override wins; absent
+        # one, the rule-table audience floor applies (e.g. github_comment
+        # → comment). This is the precedence chain: caller arg →
+        # .reviewer/config.yaml → rule-table audience floor → "nit".
+        final_floor = (
+            override_floor if override_floor is not None
+            else base_distill.severity_floor
+        )
         distill_config = dataclass_replace(
             base_distill,
-            severity_floor=effective_floor,  # type: ignore[arg-type]
+            severity_floor=final_floor,  # type: ignore[arg-type]
         )
 
         logger.debug(
@@ -1783,12 +1788,15 @@ class ReviewerAgent(BaseAgent):
             model=consensus_result.model,
         )
 
-    def _resolve_severity_floor(
+    def _severity_floor_override(
         self, args: dict[str, Any], cfg: RepoConfig | None
-    ) -> str:
-        """Resolve the effective severity_floor per the FR precedence chain.
+    ) -> str | None:
+        """Resolve an *explicit* severity_floor override, or ``None``.
 
-        High-to-low:
+        Returns the floor the caller or repo config explicitly set, so the
+        handler can distinguish "explicitly pinned" from "unset" and let
+        the rule-table audience floor (e.g. ``github_comment`` →
+        ``comment``) apply when nothing was pinned. Precedence:
 
         1. Skill-arg ``severity_floor`` (non-empty string) — **strict**.
            A bad value here is a caller bug; raise
@@ -1799,10 +1807,10 @@ class ReviewerAgent(BaseAgent):
            the caller passes a pre-loaded :class:`RepoConfig` (obtained
            via :func:`_load_repo_config_from_context`). A bad value in
            YAML shouldn't nuke every review for that repo — log a
-           warning naming the offending value and fall through to the
-           built-in default. Reviewing is more important than
-           config-layer correctness.
-        3. :data:`_DEFAULT_SEVERITY_FLOOR` (``"nit"`` — no filtering).
+           warning naming the offending value and fall through (``None``).
+           Reviewing is more important than config-layer correctness.
+        3. ``None`` — neither set. The handler then uses the rule-table
+           audience floor (default audiences carry ``"nit"`` = no filter).
 
         Rationale for asymmetric validation: the skill-arg path is a
         programmatic caller (another agent, a test, an orchestrator) —
@@ -1829,19 +1837,19 @@ class ReviewerAgent(BaseAgent):
                 # first, falling back to checks.severity_floor — the
                 # warning names the resolved key generically so operators
                 # aren't misled about which key actually carried the bad
-                # value.
+                # value. Fall through to None so the rule-table floor (or
+                # default) applies instead of the bad config value.
                 logger.warning(
                     "reviewer: ignoring invalid .reviewer/config.yaml "
                     "severity_floor=%r (checked review.severity_floor "
-                    "and checks.severity_floor); falling back to "
-                    "default %r (%s)",
+                    "and checks.severity_floor); falling back to the "
+                    "audience/default floor (%s)",
                     config_value,
-                    _DEFAULT_SEVERITY_FLOOR,
                     exc,
                 )
-                return _DEFAULT_SEVERITY_FLOOR
+                return None
 
-        return _DEFAULT_SEVERITY_FLOOR
+        return None
 
     @handler("review_diff")
     async def handle_review_diff(self, args: dict[str, Any]) -> dict[str, Any]:

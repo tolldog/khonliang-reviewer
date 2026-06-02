@@ -4595,3 +4595,48 @@ async def test_audience_github_comment_caps_findings_via_rule_table():
         {"kind": "pr_diff", "content": "x", "audience": "agent_consumption"},
     )
     assert len(uncapped["findings"]) == 15  # no cap for the default audience
+
+
+async def test_audience_github_comment_floors_nits_via_rule_table():
+    """github_comment pulls ``severity_floor=comment`` from the rule table,
+    so an unpinned review drops nits; agent_consumption (default nit floor)
+    keeps them. No explicit ``severity_floor`` arg in either call.
+    """
+    nit = ReviewFinding(severity="nit", title="cosmetic", body="b")  # type: ignore[arg-type]
+    concern = ReviewFinding(severity="concern", title="real bug", body="b")  # type: ignore[arg-type]
+
+    def _h():
+        fake = _ScriptedProvider("ollama", [_consensus_result([nit, concern])])
+        return _make_harness({"ollama": fake})
+
+    gh = await _h().call(
+        "review_text", {"kind": "pr_diff", "content": "x", "audience": "github_comment"}
+    )
+    assert [f["title"] for f in gh["findings"]] == ["real bug"]  # nit floored out
+
+    agent = await _h().call(
+        "review_text", {"kind": "pr_diff", "content": "x", "audience": "agent_consumption"}
+    )
+    assert sorted(f["title"] for f in agent["findings"]) == ["cosmetic", "real bug"]
+
+
+async def test_explicit_severity_floor_overrides_audience_floor():
+    """An explicit caller ``severity_floor`` outranks the rule-table audience
+    floor. github_comment's audience floor is ``comment``, but a caller that
+    pins ``concern`` gets concern-only — the explicit pin wins.
+    """
+    comment_f = ReviewFinding(severity="comment", title="a comment", body="b")  # type: ignore[arg-type]
+    concern = ReviewFinding(severity="concern", title="real bug", body="b")  # type: ignore[arg-type]
+    fake = _ScriptedProvider("ollama", [_consensus_result([comment_f, concern])])
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "audience": "github_comment",
+            "severity_floor": "concern",  # explicit pin > audience's "comment"
+        },
+    )
+    assert [f["title"] for f in out["findings"]] == ["real bug"]
