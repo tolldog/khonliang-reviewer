@@ -70,10 +70,64 @@ class DistillConfig:
     audience: Audience = "agent_consumption"
 
 
+# ---------------------------------------------------------------------------
+# Audience-keyed distill rule table (fr_reviewer_de1694a8)
+# ---------------------------------------------------------------------------
+#
+# Output shaping keys on the *audience* (who consumes the findings),
+# which is orthogonal to provider selection (``reviewer.rules.policy``,
+# keyed on diff size). Keeping distill in its own small audience-indexed
+# table avoids multiplying the provider rules by audience. ``decide_distill``
+# is a pure lookup; an unmapped audience returns the non-aggressive default
+# config (carrying only the audience marker) so the default path stays a
+# no-op over raw provider output.
+_DISTILL_BY_AUDIENCE: dict[str, DistillConfig] = {
+    # User-facing GitHub comment lists must be terse: floor out nits,
+    # compact the bodies, cap the count.
+    "github_comment": DistillConfig(
+        severity_floor="comment",
+        body_mode="compact",
+        max_findings=10,
+        audience="github_comment",
+    ),
+    # Handoff to an implementing agent: keep every severity but trim
+    # bodies to brief so the consuming agent isn't flooded.
+    "developer_handoff": DistillConfig(
+        body_mode="brief",
+        audience="developer_handoff",
+    ),
+    # Audit / benchmark corpus: raw output. ``run_pipeline`` short-circuits
+    # on this audience, so the config is the inert default plus the marker.
+    "audit_corpus": DistillConfig(audience="audit_corpus"),
+}
+
+
+def decide_distill(
+    audience: Audience = "agent_consumption",
+    kind: str = "pr_diff",
+) -> DistillConfig:
+    """Return the :class:`DistillConfig` for an output ``audience``.
+
+    Distill shaping keys on the *audience* (who consumes the findings),
+    independent of the provider rule table (which keys on diff size).
+    Unmapped audiences (``agent_consumption``, ``human_review``) get the
+    non-aggressive default config carrying just the audience marker, so
+    the default path stays a no-op over raw provider output.
+
+    ``kind`` is accepted for forward-compatibility (a future row may
+    shape spec/doc reviews differently) but is not consulted yet.
+    """
+    mapped = _DISTILL_BY_AUDIENCE.get(audience)
+    if mapped is not None:
+        return mapped
+    return DistillConfig(audience=audience)
+
+
 __all__ = [
     "Audience",
     "BodyMode",
     "DedupStrategy",
     "DistillConfig",
     "SeverityFloor",
+    "decide_distill",
 ]

@@ -46,7 +46,7 @@ from khonliang_reviewer import (
 )
 
 from reviewer.distill import run_pipeline
-from reviewer.rules.distill import Audience, DistillConfig
+from reviewer.rules.distill import Audience
 
 from reviewer.config.prompts import (
     RepoPrompts,
@@ -71,7 +71,7 @@ from reviewer.providers import (
 )
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
-from reviewer.rules import PolicyDecision, PolicyInput, decide
+from reviewer.rules import PolicyInput, decide_distill, evaluate
 from reviewer.selector import (
     DEFAULT_REVIEWER_MODEL,
     ProviderSelector,
@@ -844,13 +844,15 @@ def _positive_float_or_none(val: Any) -> float | None:
 
 
 def _policy_input_for(
-    *, kind: str, content: str, context: dict[str, Any]
+    *, kind: str, content: str, context: dict[str, Any], audience: str = "agent_consumption"
 ) -> PolicyInput:
     """Build a :class:`PolicyInput` from the pieces available in the handler.
 
     Callers can supply authoritative ``diff_line_count`` /
     ``diff_file_count`` / ``profile`` in ``context``; otherwise they're
-    estimated from ``content`` (for diffs) or left empty.
+    estimated from ``content`` (for diffs) or left empty. ``audience``
+    drives the distill half of :func:`reviewer.rules.evaluate` (the
+    provider half ignores it).
     """
     est_lines, est_files = _estimate_diff_size(content, kind)
     return PolicyInput(
@@ -862,6 +864,7 @@ def _policy_input_for(
             if isinstance(context.get("profile"), dict)
             else None
         ),
+        audience=audience,  # type: ignore[arg-type]  # validated upstream by _resolve_audience
     )
 
 
@@ -1247,9 +1250,20 @@ class ReviewerAgent(BaseAgent):
                     backend=caller_backend, model=caller_model
                 )
                 selection_reason = "caller override"
+                # Provider is caller-pinned, but distill shaping still
+                # comes from the audience rule table.
+                base_distill = decide_distill(effective_audience, kind)
             else:
-                decision = decide(
-                    _policy_input_for(kind=kind, content=content, context=context)
+                # One rule-table query yields both the provider decision
+                # AND the audience-shaped distill config — callers never
+                # split the query across two surfaces (fr_reviewer_de1694a8).
+                decision, base_distill = evaluate(
+                    _policy_input_for(
+                        kind=kind,
+                        content=content,
+                        context=context,
+                        audience=effective_audience,
+                    )
                 )
                 provider, chosen_model = selector.select(
                     backend=decision.backend, model=decision.model
@@ -1257,6 +1271,16 @@ class ReviewerAgent(BaseAgent):
                 selection_reason = f"rule-table: {decision.reason}"
         except UnknownBackendError as exc:
             return {"error": str(exc)}
+
+        # The distill config's shaping fields (body_mode / max_findings /
+        # dedup / consensus / audience) come from the rule table; the
+        # severity_floor keeps its own precedence chain (caller arg →
+        # .reviewer/config.yaml → default) resolved as ``effective_floor``.
+        # Audience-driven severity_floor is a deliberate follow-up.
+        distill_config = dataclass_replace(
+            base_distill,
+            severity_floor=effective_floor,  # type: ignore[arg-type]
+        )
 
         logger.debug(
             "reviewer.select: backend=%s model=%s reason=%s kind=%s",
@@ -1397,13 +1421,7 @@ class ReviewerAgent(BaseAgent):
                 # Defense in depth: still run the distill pipeline +
                 # record consensus usage before surfacing the error
                 # so the spend isn't lost.
-                result = run_pipeline(
-                    result,
-                    DistillConfig(
-                        severity_floor=effective_floor,
-                        audience=effective_audience,
-                    ),
-                )
+                result = run_pipeline(result, distill_config)
                 await self._record_usage(result)
                 return {"error": str(exc)}
 
@@ -1413,13 +1431,7 @@ class ReviewerAgent(BaseAgent):
         # the ``audit_corpus`` audience short-circuits the whole
         # pipeline so audit / benchmark callers always see raw
         # provider output.
-        result = run_pipeline(
-            result,
-            DistillConfig(
-                severity_floor=effective_floor,
-                audience=effective_audience,
-            ),
-        )
+        result = run_pipeline(result, distill_config)
         await self._record_usage(result)
         return result.to_dict()
 

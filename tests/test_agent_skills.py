@@ -4563,3 +4563,35 @@ async def test_audience_non_audit_runs_severity_floor_through_pipeline():
     titles = [f["title"] for f in out["findings"]]
     # nit dropped; only concern survives.
     assert titles == ["real bug"]
+
+
+async def test_audience_github_comment_caps_findings_via_rule_table():
+    """github_comment audience pulls ``max_findings=10`` from the distill
+    rule table (fr_reviewer_de1694a8 Piece A), capping a long finding list;
+    agent_consumption (no cap) keeps them all. Only the audience-driven
+    shaping differs — same provider, same severity_floor.
+    """
+
+    def _harness_with_15():
+        findings = [
+            ReviewFinding(
+                severity="comment",  # type: ignore[arg-type]  # >= default nit floor
+                title=f"f{i}",
+                body="b",
+            )
+            for i in range(15)
+        ]
+        fake = _ScriptedProvider("ollama", [_consensus_result(findings)])
+        return _make_harness({"ollama": fake})
+
+    capped = await _harness_with_15().call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "audience": "github_comment"},
+    )
+    assert len(capped["findings"]) == 10  # max_findings=10 from the rule table
+
+    uncapped = await _harness_with_15().call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "audience": "agent_consumption"},
+    )
+    assert len(uncapped["findings"]) == 15  # no cap for the default audience
