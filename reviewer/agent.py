@@ -844,7 +844,11 @@ def _positive_float_or_none(val: Any) -> float | None:
 
 
 def _policy_input_for(
-    *, kind: str, content: str, context: dict[str, Any], audience: str = "agent_consumption"
+    *,
+    kind: str,
+    content: str,
+    context: dict[str, Any],
+    audience: Audience = "agent_consumption",
 ) -> PolicyInput:
     """Build a :class:`PolicyInput` from the pieces available in the handler.
 
@@ -864,7 +868,7 @@ def _policy_input_for(
             if isinstance(context.get("profile"), dict)
             else None
         ),
-        audience=audience,  # type: ignore[arg-type]  # validated upstream by _resolve_audience
+        audience=audience,
     )
 
 

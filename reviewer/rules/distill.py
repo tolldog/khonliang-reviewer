@@ -81,7 +81,7 @@ class DistillConfig:
 # is a pure lookup; an unmapped audience returns the non-aggressive default
 # config (carrying only the audience marker) so the default path stays a
 # no-op over raw provider output.
-_DISTILL_BY_AUDIENCE: dict[str, DistillConfig] = {
+_DISTILL_BY_AUDIENCE: dict[Audience, DistillConfig] = {
     # User-facing GitHub comment lists must be terse: floor out nits,
     # compact the bodies, cap the count.
     "github_comment": DistillConfig(
