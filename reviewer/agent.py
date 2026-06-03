@@ -46,7 +46,7 @@ from khonliang_reviewer import (
 )
 
 from reviewer.distill import run_pipeline
-from reviewer.rules.distill import Audience
+from reviewer.rules.distill import Audience, BodyMode, DedupStrategy
 
 from reviewer.config.prompts import (
     RepoPrompts,
@@ -236,6 +236,81 @@ def _resolve_audience(value: Any) -> Audience:
             f"{sorted(_VALID_AUDIENCES)}"
         )
     return value  # type: ignore[return-value]
+
+
+class DistillOverrideError(ValueError):
+    """Raised when a caller-supplied distill override (``body_mode`` /
+    ``dedup`` / ``max_findings``) isn't a valid value.
+
+    Subclass of :class:`ValueError`; the handler maps it to a structured
+    error response so the caller can fix the bad arg.
+    """
+
+
+_VALID_BODY_MODES: frozenset[str] = frozenset(typing.get_args(BodyMode))
+#: ``semantic`` is reserved (no transform implemented; ``apply_dedup``
+#: raises on it), so the skill arg accepts only the implemented strategies
+#: and rejects ``semantic`` up front rather than failing mid-pipeline.
+_VALID_DEDUP_OVERRIDES: frozenset[str] = frozenset({"none", "exact", "title_substring"})
+
+
+def _resolve_body_mode_override(value: Any) -> "BodyMode | None":
+    """Caller's ``body_mode`` distill override, or ``None`` when unset.
+
+    ``""`` / non-string = unset (the rule-table audience value applies).
+    A non-empty unknown value raises :class:`DistillOverrideError`.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value not in _VALID_BODY_MODES:
+        raise DistillOverrideError(
+            f"body_mode={value!r} is not valid; expected one of "
+            f"{sorted(_VALID_BODY_MODES)}"
+        )
+    return value  # type: ignore[return-value]
+
+
+def _resolve_dedup_override(value: Any) -> "DedupStrategy | None":
+    """Caller's ``dedup`` distill override, or ``None`` when unset.
+
+    ``""`` / non-string = unset. ``"semantic"`` is rejected with a clear
+    "reserved / not implemented" message; other unknowns also raise
+    :class:`DistillOverrideError`.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value == "semantic":
+        raise DistillOverrideError(
+            "dedup='semantic' is reserved for a future embedding-similarity "
+            "transform and is not implemented; use 'none', 'exact', or "
+            "'title_substring'"
+        )
+    if value not in _VALID_DEDUP_OVERRIDES:
+        raise DistillOverrideError(
+            f"dedup={value!r} is not valid; expected one of "
+            f"{sorted(_VALID_DEDUP_OVERRIDES)} (or unset)"
+        )
+    return value  # type: ignore[return-value]
+
+
+def _resolve_max_findings_override(value: Any) -> int | None:
+    """Caller's ``max_findings`` cap override, or ``None`` when unset.
+
+    ``0`` / non-int = unset (no cap from the skill arg; the rule-table
+    audience value applies). A positive int caps the count; a negative
+    int raises :class:`DistillOverrideError`. ``bool`` is rejected as
+    non-int (``True``/``False`` shouldn't land as 1/0).
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value == 0:
+        return None
+    if value < 0:
+        raise DistillOverrideError(
+            f"max_findings={value!r} is not valid; expected a positive "
+            "integer (or 0/unset)"
+        )
+    return value
 
 
 class ConsensusError(ValueError):
@@ -1016,6 +1091,16 @@ class ReviewerAgent(BaseAgent):
                     # "developer_handoff" / "human_review" reserved
                     # for future shaping transforms.
                     "audience": {"type": "string", "default": ""},
+                    # body_mode / max_findings / dedup: per-call distill
+                    # overrides; "" / 0 / unset = no override (the rule-table
+                    # audience value applies). body_mode shapes body+summary
+                    # length ("compact"|"brief"|"full"); max_findings caps
+                    # the returned count (positive int); dedup collapses
+                    # duplicates ("none"|"exact"|"title_substring";
+                    # "semantic" is reserved and rejected).
+                    "body_mode": {"type": "string", "default": ""},
+                    "max_findings": {"type": "integer", "default": 0},
+                    "dedup": {"type": "string", "default": ""},
                     # num_ctx: per-call Ollama context-window override.
                     # 0 / unset = no skill-arg override; provider falls
                     # through to its config default and then the
@@ -1089,6 +1174,9 @@ class ReviewerAgent(BaseAgent):
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
                     "audience": {"type": "string", "default": ""},
+                    "body_mode": {"type": "string", "default": ""},
+                    "max_findings": {"type": "integer", "default": 0},
+                    "dedup": {"type": "string", "default": ""},
                     "num_ctx": {"type": "integer", "default": 0},
                     "format": {"type": "string", "default": ""},
                     "consensus_runs": {"type": "integer", "default": 1},
@@ -1245,6 +1333,18 @@ class ReviewerAgent(BaseAgent):
         except AudienceError as exc:
             return {"error": str(exc)}
 
+        # Per-call distill overrides (each None when unset → the rule-table
+        # audience value applies). Resolved up-front so a bad value fails
+        # before we spend a provider call.
+        try:
+            override_body_mode = _resolve_body_mode_override(args.get("body_mode"))
+            override_dedup = _resolve_dedup_override(args.get("dedup"))
+            override_max_findings = _resolve_max_findings_override(
+                args.get("max_findings")
+            )
+        except DistillOverrideError as exc:
+            return {"error": str(exc)}
+
         try:
             selector = self._ensure_selector()
             # ``is not None`` (not truthiness) so explicit ``model=""``
@@ -1280,18 +1380,24 @@ class ReviewerAgent(BaseAgent):
 
         # The distill config comes from the rule table per audience
         # (body_mode / max_findings / dedup / consensus / severity_floor).
-        # An *explicit* caller/config severity_floor override wins; absent
-        # one, the rule-table audience floor applies (e.g. github_comment
-        # → comment). This is the precedence chain: caller arg →
-        # .reviewer/config.yaml → rule-table audience floor → "nit".
-        final_floor = (
-            override_floor if override_floor is not None
-            else base_distill.severity_floor
-        )
-        distill_config = dataclass_replace(
-            base_distill,
-            severity_floor=final_floor,  # type: ignore[arg-type]
-        )
+        # Per-call skill-arg overrides win over the rule-table baseline;
+        # absent an override, the audience value applies. For severity_floor
+        # the precedence chain is caller arg → .reviewer/config.yaml →
+        # rule-table audience floor → "nit"; body_mode / max_findings /
+        # dedup are caller-arg → rule-table audience value.
+        distill_overrides: dict[str, Any] = {
+            "severity_floor": (
+                override_floor if override_floor is not None
+                else base_distill.severity_floor
+            ),
+        }
+        if override_body_mode is not None:
+            distill_overrides["body_mode"] = override_body_mode
+        if override_max_findings is not None:
+            distill_overrides["max_findings"] = override_max_findings
+        if override_dedup is not None:
+            distill_overrides["dedup"] = override_dedup
+        distill_config = dataclass_replace(base_distill, **distill_overrides)
 
         logger.debug(
             "reviewer.select: backend=%s model=%s reason=%s kind=%s",

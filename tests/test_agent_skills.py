@@ -4640,3 +4640,78 @@ async def test_explicit_severity_floor_overrides_audience_floor():
         },
     )
     assert [f["title"] for f in out["findings"]] == ["real bug"]
+
+
+# ---------------------------------------------------------------------------
+# Distill skill-arg overrides: body_mode / max_findings / dedup
+# (fr_reviewer_de1694a8 — skill-arg surfacing of the transform slots).
+# ---------------------------------------------------------------------------
+
+
+def _comment_findings(n):
+    return [
+        ReviewFinding(severity="comment", title=f"f{i}", body="b")  # type: ignore[arg-type]
+        for i in range(n)
+    ]
+
+
+async def test_skill_arg_max_findings_caps_count():
+    fake = _ScriptedProvider("ollama", [_consensus_result(_comment_findings(8))])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "max_findings": 3}
+    )
+    assert len(out["findings"]) == 3
+
+
+async def test_skill_arg_max_findings_overrides_audience_value():
+    # github_comment's audience cap is 10; a caller max_findings=2 wins.
+    fake = _ScriptedProvider("ollama", [_consensus_result(_comment_findings(15))])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "audience": "github_comment", "max_findings": 2},
+    )
+    assert len(out["findings"]) == 2
+
+
+async def test_skill_arg_dedup_exact_collapses_duplicates():
+    dup_a = ReviewFinding(severity="comment", title="same", body="same")  # type: ignore[arg-type]
+    dup_b = ReviewFinding(severity="comment", title="same", body="same")  # type: ignore[arg-type]
+    other = ReviewFinding(severity="comment", title="diff", body="d")  # type: ignore[arg-type]
+    fake = _ScriptedProvider("ollama", [_consensus_result([dup_a, dup_b, other])])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "dedup": "exact"}
+    )
+    assert sorted(f["title"] for f in out["findings"]) == ["diff", "same"]
+
+
+async def test_skill_arg_body_mode_compact_empties_body():
+    f = ReviewFinding(severity="comment", title="t", body="a long body here")  # type: ignore[arg-type]
+    fake = _ScriptedProvider("ollama", [_consensus_result([f])])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "body_mode": "compact"}
+    )
+    assert out["findings"][0]["body"] == ""  # compact strips finding bodies
+
+
+async def test_skill_arg_invalid_body_mode_errors():
+    fake = _ScriptedProvider("ollama", [_consensus_result([_consensus_finding()])])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "body_mode": "nonsense"}
+    )
+    assert "error" in out and "body_mode=" in out["error"]
+
+
+async def test_skill_arg_dedup_semantic_rejected():
+    fake = _ScriptedProvider("ollama", [_consensus_result([_consensus_finding()])])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "dedup": "semantic"}
+    )
+    assert "error" in out and "semantic" in out["error"]
+
+
+async def test_skill_arg_negative_max_findings_errors():
+    fake = _ScriptedProvider("ollama", [_consensus_result([_consensus_finding()])])
+    out = await _make_harness({"ollama": fake}).call(
+        "review_text", {"kind": "pr_diff", "content": "x", "max_findings": -3}
+    )
+    assert "error" in out and "max_findings=" in out["error"]
