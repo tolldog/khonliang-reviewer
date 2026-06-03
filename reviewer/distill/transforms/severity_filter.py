@@ -89,6 +89,9 @@ def apply_severity_filter(
         findings=kept,
         summary=new_summary,
         usage=new_usage,
+        # Record what we removed onto the running audit trail so audit /
+        # benchmark corpora can recover the raw output (fr_reviewer_de1694a8).
+        dropped_findings=list(result.dropped_findings) + dropped,
     )
 
 

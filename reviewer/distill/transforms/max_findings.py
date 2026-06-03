@@ -71,6 +71,9 @@ def apply_max_findings(result: ReviewResult, config: DistillConfig) -> ReviewRes
     # preserves first-occurrence order among equal-rank findings.
     sorted_findings = sorted(result.findings, key=_sort_key)
     truncated = sorted_findings[:cap] if cap < len(sorted_findings) else sorted_findings
+    # The findings the cap removed (empty when nothing is over the cap;
+    # a pure reorder drops nothing).
+    overflow = sorted_findings[cap:] if cap < len(sorted_findings) else []
 
     # Identity-preserve when the (sorted, truncated) list is the same
     # tuple of objects in the same order as the input. ``is`` checks
@@ -80,7 +83,13 @@ def apply_max_findings(result: ReviewResult, config: DistillConfig) -> ReviewRes
         a is b for a, b in zip(truncated, result.findings)
     ):
         return result
-    return replace(result, findings=truncated)
+    return replace(
+        result,
+        findings=truncated,
+        # Record capped-away findings on the running audit trail
+        # (fr_reviewer_de1694a8).
+        dropped_findings=list(result.dropped_findings) + overflow,
+    )
 
 
 def _sort_key(f: ReviewFinding) -> int:

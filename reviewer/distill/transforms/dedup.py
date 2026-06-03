@@ -64,9 +64,9 @@ def apply_dedup(result: ReviewResult, config: DistillConfig) -> ReviewResult:
         return result
 
     if strategy == "exact":
-        merged = _merge(findings, _is_exact_duplicate)
+        merged, dropped = _merge(findings, _is_exact_duplicate)
     elif strategy == "title_substring":
-        merged = _merge(findings, _is_title_substring_duplicate)
+        merged, dropped = _merge(findings, _is_title_substring_duplicate)
     else:
         # Unknown strategy — typed as Literal so callers shouldn't get
         # here, but at the bus boundary this defends against a wider
@@ -80,16 +80,23 @@ def apply_dedup(result: ReviewResult, config: DistillConfig) -> ReviewResult:
         # No actual merging happened (no pairs matched). Return the
         # original result so identity-equality holds.
         return result
-    return replace(result, findings=merged)
+    return replace(
+        result,
+        findings=merged,
+        # Record collapsed-away duplicates on the running audit trail
+        # (fr_reviewer_de1694a8).
+        dropped_findings=list(result.dropped_findings) + dropped,
+    )
 
 
 def _merge(
     findings: list[ReviewFinding],
     is_duplicate: Callable[[ReviewFinding, ReviewFinding], bool],
-) -> list[ReviewFinding]:
+) -> tuple[list[ReviewFinding], list[ReviewFinding]]:
     """Walk findings in order; for each, either keep it (and let
     later duplicates merge into it) or merge it into the earliest
-    surviving duplicate.
+    surviving duplicate. Returns ``(survivors, dropped)`` where
+    ``dropped`` are the findings collapsed into a survivor.
 
     O(n^2) on finding count, which is fine for typical review sizes
     (~1-50 findings); a hashed pre-pass would only matter for the
@@ -97,14 +104,16 @@ def _merge(
     the hot path of any production review.
     """
     survivors: list[ReviewFinding] = []
+    dropped: list[ReviewFinding] = []
     for f in findings:
         for i, kept in enumerate(survivors):
             if is_duplicate(kept, f):
                 survivors[i] = _bumped(kept, f.severity)
+                dropped.append(f)
                 break
         else:
             survivors.append(f)
-    return survivors
+    return survivors, dropped
 
 
 def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
