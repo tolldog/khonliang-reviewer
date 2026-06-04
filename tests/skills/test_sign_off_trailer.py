@@ -136,11 +136,13 @@ def test_non_actionable_concern_is_discounted(caplog):
     assert any("discounting non-actionable concern" in rec.getMessage() for rec in caplog.records)
 
 
-def test_discounted_concern_noted_in_trailer_reason():
+def test_discounted_concern_does_not_block():
+    # A discounted-only review is approved-with-findings; the discount is
+    # surfaced via the INFO log, not the spec-locked trailer reason (MS-D).
     r = _result(findings=[_f("concern", "vague")])
     out = build_trailer(r)
     assert out["verdict"] == "approved-with-findings"
-    assert "1 concern discounted" in out["trailer_line"]
+    assert "concerns-raised" not in out["trailer_line"]
 
 
 def test_actionable_and_discounted_concern_blocks_on_the_actionable():

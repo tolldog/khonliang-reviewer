@@ -320,15 +320,13 @@ def _auto_reason(result: ReviewResult, verdict: Verdict) -> str:
             parts.append(
                 f"{counts['nit']} nit" + ("s" if counts["nit"] != 1 else "")
             )
-        reason = " + ".join(parts) + " filtered" if parts else ""
-        # Non-actionable concerns that were discounted to non-blocking are
-        # noted distinctly so the trailer is honest about what was flagged.
-        _, discounted = _partition_concerns(result)
-        if discounted:
-            n = len(discounted)
-            disc = f"{n} concern{'s' if n != 1 else ''} discounted"
-            reason = f"{reason}; {disc}" if reason else disc
-        return reason
+        if not parts:
+            return ""
+        # Keep the spec-locked "<histogram> filtered" shape (MS-D). Discounted
+        # non-actionable concerns are surfaced via the INFO log in
+        # compute_verdict, not appended here — the trailer reason stays the
+        # surviving comment/nit histogram.
+        return " + ".join(parts) + " filtered"
 
     # approved / escalated-approved.
     return ""
