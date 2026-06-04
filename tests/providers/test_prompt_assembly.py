@@ -299,3 +299,52 @@ def test_build_review_prompt_survives_non_repoprompts_value():
     assert "## Severity Rubric" not in got
     assert "## Examples" not in got
     assert got.rstrip().endswith("diff body")
+
+
+# -- doc-hunk routing (fr_reviewer_1262ce18) --------------------------
+
+
+from reviewer.providers._prompt import classify_diff_content  # noqa: E402
+
+_MD_DIFF = "+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
+_CODE_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+def f():\n+    return compute()\n"
+_COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
+_MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
+
+
+def test_classify_doc_file_diff_is_doc():
+    assert classify_diff_content(_MD_DIFF) == "doc"
+
+
+def test_classify_code_diff_is_code():
+    assert classify_diff_content(_CODE_DIFF) == "code"
+
+
+def test_classify_comment_heavy_code_file_is_doc():
+    assert classify_diff_content(_COMMENT_DIFF) == "doc"
+
+
+def test_classify_mixed_diff_is_mixed():
+    assert classify_diff_content(_MIXED_DIFF) == "mixed"
+
+
+def test_classify_non_diff_and_empty_are_code():
+    assert classify_diff_content("just some text, no diff markers") == "code"
+    assert classify_diff_content("") == "code"
+
+
+def test_doc_heavy_diff_gets_critique_instruction():
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MD_DIFF))
+    assert "CRITIQUE, do not summarize" in prompt
+    assert "paraphrases the change is not a finding" in prompt
+
+
+def test_code_diff_omits_critique_instruction():
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt
+
+
+def test_mixed_diff_omits_critique_instruction():
+    # Only clearly doc-heavy diffs are routed; mixed is conservative.
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt

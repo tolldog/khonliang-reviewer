@@ -35,9 +35,12 @@ everything else falls back to markdown fences.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 from khonliang_reviewer import ReviewRequest
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Imported for type hints only — keeping the runtime import out of
@@ -80,6 +83,79 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
 #: tokenization sensitivity.
 _SUPPORTED_EXAMPLE_FORMATS: frozenset[str] = frozenset({"xml", "json", "markdown"})
 _DEFAULT_EXAMPLE_FORMAT = "markdown"
+
+
+# ---------------------------------------------------------------------------
+# Doc-hunk routing (fr_reviewer_1262ce18)
+# ---------------------------------------------------------------------------
+#: File extensions whose changed lines are treated as documentation/prose.
+_DOC_FILE_EXTS: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
+#: Stripped-line prefixes that mark a comment/doc line inside a code file.
+_COMMENT_PREFIXES: tuple[str, ...] = (
+    "#", "//", "/*", "*", "--", ";", "<!--", '"""', "'''",
+)
+
+#: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
+#: cannot distinguish "summarize" from "critique" on prose, so they echo the
+#: changed text back as a "finding" (the dogfood prose-echo pattern). This
+#: instruction redirects them; the deeper fix (curated doc-review few-shots)
+#: lands with the examples library (fr_reviewer_afd4bab1).
+_DOC_REVIEW_INSTRUCTION = (
+    "NOTE: this change is predominantly documentation / comments / prose. "
+    "CRITIQUE, do not summarize. Only flag a finding if the prose is "
+    "factually WRONG, misleading, contradicts the code, or omits a stated "
+    "invariant. NEVER restate, rephrase, or summarize what the text says — a "
+    "finding that merely paraphrases the change is not a finding. If the "
+    "prose is accurate, return zero findings."
+)
+
+
+def classify_diff_content(content: str) -> str:
+    """Classify a diff payload as ``"doc"``, ``"code"``, or ``"mixed"`` by
+    its ADDED lines (fr_reviewer_1262ce18).
+
+    Doc-heavy = the added content is predominantly prose: lines in a
+    markdown / rst / txt file, comment lines, or blank lines. A doc-heavy
+    diff is routed to a critique-not-summarize prompt so the reviewer stops
+    echoing the prose back as findings.
+
+    Heuristic only (no LLM): walks the unified diff, tracking the current
+    file from ``+++`` headers, and buckets each added (``+``) content line.
+    Non-diff content (no added lines) classifies as ``"code"`` — there's
+    nothing to route, and full-document prose review is the artifact-review
+    pipeline's concern (fr_reviewer_19c871ab), not this one.
+
+    Thresholds: ``doc_ratio >= 0.7`` → ``"doc"``; ``<= 0.3`` → ``"code"``;
+    in between → ``"mixed"`` (only ``"doc"`` is routed, conservatively).
+    """
+    doc = 0
+    code = 0
+    current_is_doc_file = False
+    for raw in content.splitlines():
+        if raw.startswith("+++"):
+            # File header "+++ b/<path>" — track this file's doc-ness for
+            # the added lines that follow until the next header.
+            path = raw[3:].strip().lower()
+            current_is_doc_file = path.endswith(_DOC_FILE_EXTS)
+            continue
+        if raw.startswith(("---", "@@", "diff ", "index ")):
+            continue
+        if not raw.startswith("+"):
+            continue
+        line = raw[1:].strip()
+        if current_is_doc_file or not line or line.startswith(_COMMENT_PREFIXES):
+            doc += 1
+        else:
+            code += 1
+    total = doc + code
+    if total == 0:
+        return "code"
+    ratio = doc / total
+    if ratio >= 0.7:
+        return "doc"
+    if ratio <= 0.3:
+        return "code"
+    return "mixed"
 
 
 def build_review_prompt(
@@ -128,6 +204,18 @@ def build_review_prompt(
         "given. No prose outside the JSON.",
         "",
     ]
+
+    # Doc-hunk routing (fr_reviewer_1262ce18): a predominantly-prose change
+    # gets a critique-not-summarize instruction so the model doesn't echo the
+    # changed text back as a finding. Only fires for clearly doc-heavy diffs;
+    # code / mixed diffs are unchanged (byte-identical to the pre-FR prompt).
+    if classify_diff_content(request.content) == "doc":
+        logger.debug(
+            "doc-heavy review payload (kind=%s) — routing to "
+            "critique-not-summarize prompt",
+            request.kind,
+        )
+        lines += [_DOC_REVIEW_INSTRUCTION, ""]
 
     # Repo-side additions land between the built-in system and the
     # task-shape details (schema / instructions / context). An empty
@@ -288,4 +376,4 @@ def _wrap_example(severity: str, text: str, *, fmt: str) -> list[str]:
     ]
 
 
-__all__ = ["REVIEW_RESPONSE_SCHEMA", "build_review_prompt"]
+__all__ = ["REVIEW_RESPONSE_SCHEMA", "build_review_prompt", "classify_diff_content"]
