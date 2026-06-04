@@ -124,6 +124,11 @@ def test_malformed_location_is_not_a_diff_anchor():
     assert compute_verdict(_result(findings=[bad_line])) == "approved-with-findings"
     bool_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=True)  # type: ignore[arg-type]
     assert compute_verdict(_result(findings=[bool_line])) == "approved-with-findings"
+    # Non-positive line numbers aren't real diff anchors (GitHub rejects them).
+    zero_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=0)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[zero_line])) == "approved-with-findings"
+    neg_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=-1)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[neg_line])) == "approved-with-findings"
 
 
 def test_non_actionable_concern_is_discounted(caplog):
@@ -137,12 +142,24 @@ def test_non_actionable_concern_is_discounted(caplog):
 
 
 def test_discounted_concern_does_not_block():
-    # A discounted-only review is approved-with-findings; the discount is
-    # surfaced via the INFO log, not the spec-locked trailer reason (MS-D).
+    # A discounted-only review is approved-with-findings. MS-D requires a
+    # reason for that verdict, so the discount names it (the only
+    # non-histogram approved-with-findings shape).
     r = _result(findings=[_f("concern", "vague")])
     out = build_trailer(r)
     assert out["verdict"] == "approved-with-findings"
     assert "concerns-raised" not in out["trailer_line"]
+    assert "1 concern discounted" in out["trailer_line"]
+
+
+def test_histogram_findings_plus_discounted_keeps_filtered_shape():
+    # When surviving comment/nit findings exist, the reason stays the
+    # spec-locked "<histogram> filtered" — discounted concerns don't
+    # mutate the shape (they're in the log).
+    r = _result(findings=[_f("nit"), _f("concern", "vague")])
+    out = build_trailer(r)
+    assert out["verdict"] == "approved-with-findings"
+    assert out["trailer_line"].endswith("1 nit filtered")
 
 
 def test_actionable_and_discounted_concern_blocks_on_the_actionable():

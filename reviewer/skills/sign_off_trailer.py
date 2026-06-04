@@ -158,6 +158,10 @@ def _is_actionable_concern(f: ReviewFinding) -> bool:
         and bool(f.path.strip())
         and isinstance(f.line, int)
         and not isinstance(f.line, bool)
+        # A real diff anchor is a 1-based line number; 0 / negative aren't
+        # anchorable (GitHub rejects them), so they don't make a concern
+        # actionable.
+        and f.line > 0
     )
     return has_suggestion or has_location
 
@@ -320,13 +324,20 @@ def _auto_reason(result: ReviewResult, verdict: Verdict) -> str:
             parts.append(
                 f"{counts['nit']} nit" + ("s" if counts["nit"] != 1 else "")
             )
-        if not parts:
-            return ""
-        # Keep the spec-locked "<histogram> filtered" shape (MS-D). Discounted
-        # non-actionable concerns are surfaced via the INFO log in
-        # compute_verdict, not appended here — the trailer reason stays the
-        # surviving comment/nit histogram.
-        return " + ".join(parts) + " filtered"
+        if parts:
+            # Spec-locked "<histogram> filtered" shape (MS-D). Discounted
+            # concerns are surfaced via the INFO log, not appended here, so
+            # the shape stays a single comment/nit histogram.
+            return " + ".join(parts) + " filtered"
+        # No surviving comment/nit, so the verdict came purely from
+        # discounted concern(s). MS-D requires a reason for
+        # approved-with-findings, so name the discount (this is the only
+        # non-histogram approved-with-findings shape).
+        _, discounted = _partition_concerns(result)
+        if discounted:
+            n = len(discounted)
+            return f"{n} concern{'s' if n != 1 else ''} discounted"
+        return ""
 
     # approved / escalated-approved.
     return ""
