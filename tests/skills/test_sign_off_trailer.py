@@ -114,6 +114,18 @@ def test_diff_anchored_concern_is_concerns_raised():
     assert compute_verdict(r) == "concerns-raised"
 
 
+def test_malformed_location_is_not_a_diff_anchor():
+    # Bus boundary can deliver a non-string path / non-int line; neither
+    # counts as a diff-anchored location, so a suggestion-less concern is
+    # still discounted (Copilot PR #46 robustness finding).
+    bad_path = ReviewFinding(severity="concern", title="x", body="b", path={"a": 1}, line=5)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bad_path])) == "approved-with-findings"
+    bad_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line="12")  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bad_line])) == "approved-with-findings"
+    bool_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=True)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bool_line])) == "approved-with-findings"
+
+
 def test_non_actionable_concern_is_discounted(caplog):
     # A concern with no suggestion AND no diff-anchored location is the
     # dogfood prose-restatement pattern — reported but non-blocking, and

@@ -147,8 +147,18 @@ def _is_actionable_concern(f: ReviewFinding) -> bool:
     a prose restatement of the diff. Such a concern is still reported in the
     findings; it just doesn't flip the verdict to ``concerns-raised``.
     """
+    # Validate types at the bus boundary: a deserialized finding can carry
+    # any JSON shape, so a malformed path (dict/list) or non-int line must
+    # NOT count as a diff-anchored location (which would wrongly keep a
+    # noise concern blocking). path must be a non-empty string; line a real
+    # int (``bool`` is an int subclass — exclude it).
     has_suggestion = isinstance(f.suggestion, str) and bool(f.suggestion.strip())
-    has_location = bool(f.path) and f.line is not None
+    has_location = (
+        isinstance(f.path, str)
+        and bool(f.path.strip())
+        and isinstance(f.line, int)
+        and not isinstance(f.line, bool)
+    )
     return has_suggestion or has_location
 
 
