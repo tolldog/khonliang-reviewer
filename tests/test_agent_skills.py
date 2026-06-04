@@ -1093,7 +1093,15 @@ async def test_sign_off_trailer_caller_role_and_reason_override():
     # Add a finding so the verdict gives us a reason segment to
     # exercise the override.
     result_dict["findings"] = [
-        {"severity": "concern", "title": "race", "body": "b", "category": ""}
+        # Actionable concern (has a suggestion) → concerns-raised, so the
+        # reason-override path is exercised (fr_reviewer_fa2dd997).
+        {
+            "severity": "concern",
+            "title": "race",
+            "body": "b",
+            "category": "",
+            "suggestion": "guard with a lock",
+        }
     ]
 
     out = await harness.call(
