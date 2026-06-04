@@ -304,8 +304,12 @@ def test_build_review_prompt_survives_non_repoprompts_value():
 # -- doc-hunk routing (fr_reviewer_1262ce18) --------------------------
 
 
-_MD_DIFF ="+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
+_MD_DIFF = "+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
 _CODE_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+def f():\n+    return compute()\n"
+_PREPROC_DIFF = (
+    "+++ b/a.c\n@@ -1 +5 @@\n"
+    "+#include <stdio.h>\n+#define MAX 10\n+#ifndef FOO\n+int main(void){return 0;}\n"
+)
 _COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
 _MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
 
@@ -324,6 +328,12 @@ def test_classify_comment_heavy_code_file_is_doc():
 
 def test_classify_mixed_diff_is_mixed():
     assert classify_diff_content(_MIXED_DIFF) == "mixed"
+
+
+def test_classify_c_preprocessor_directives_are_code():
+    # "#include"/"#define"/"#ifndef" are C preprocessor directives, not
+    # comments — they must not be mistaken for documentation.
+    assert classify_diff_content(_PREPROC_DIFF) == "code"
 
 
 def test_classify_non_diff_and_empty_are_code():

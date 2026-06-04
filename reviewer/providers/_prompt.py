@@ -93,8 +93,26 @@ _DOC_FILE_EXTS: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
 #: Stripped-line prefixes that mark a comment/doc line inside a code file.
 #: Deliberately excludes ``*`` and ``;`` — both start real code lines (C
 #: pointer deref / block-comment-continuation; Lisp/asm vs C statements) so
-#: they'd misclassify code as doc.
-_COMMENT_PREFIXES: tuple[str, ...] = ("#", "//", "/*", "--", "<!--", '"""', "'''")
+#: they'd misclassify code as doc. ``#`` is handled separately in
+#: :func:`_is_doc_line` (it needs a trailing space to disambiguate a
+#: Python/shell comment from a C preprocessor directive).
+_COMMENT_PREFIXES: tuple[str, ...] = ("//", "/*", "--", "<!--", '"""', "'''")
+
+
+def _is_doc_line(line: str) -> bool:
+    """True iff a stripped, added line reads as documentation / prose.
+
+    Blank lines, ``#``-comments (Python / shell / yaml) or markdown ATX
+    headings, and the :data:`_COMMENT_PREFIXES` markers count as doc. ``#``
+    requires a trailing space (or end-of-line), so C/C++ preprocessor
+    directives (``#include`` / ``#define`` / ``#pragma`` …) are correctly
+    left as code rather than mistaken for comments.
+    """
+    if not line:
+        return True
+    if line == "#" or line.startswith("# "):
+        return True
+    return line.startswith(_COMMENT_PREFIXES)
 
 #: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
 #: cannot distinguish "summarize" from "critique" on prose, so they echo the
@@ -145,7 +163,7 @@ def classify_diff_content(content: str) -> str:
         if not raw.startswith("+"):
             continue
         line = raw[1:].strip()
-        if current_is_doc_file or not line or line.startswith(_COMMENT_PREFIXES):
+        if current_is_doc_file or _is_doc_line(line):
             doc += 1
         else:
             code += 1
