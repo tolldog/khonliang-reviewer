@@ -58,8 +58,27 @@ def _result(
     )
 
 
-def _f(severity: str, title: str = "t", category: str = "") -> ReviewFinding:
-    return ReviewFinding(severity=severity, title=title, body="b", category=category)  # type: ignore[arg-type]
+def _f(
+    severity: str,
+    title: str = "t",
+    category: str = "",
+    *,
+    suggestion: str | None = None,
+    path: str | None = None,
+    line: int | None = None,
+) -> ReviewFinding:
+    # A concern is "actionable" (blocking) only with a suggestion or a
+    # diff-anchored path+line (fr_reviewer_fa2dd997); pass those when a
+    # test wants a concern to flip the verdict to concerns-raised.
+    return ReviewFinding(
+        severity=severity,  # type: ignore[arg-type]
+        title=title,
+        body="b",
+        category=category,
+        suggestion=suggestion,
+        path=path,
+        line=line,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +100,77 @@ def test_comments_only_is_approved_with_findings():
     assert compute_verdict(r) == "approved-with-findings"
 
 
-def test_any_concern_is_concerns_raised():
-    r = _result(findings=[_f("nit"), _f("concern", "race condition")])
+def test_actionable_concern_is_concerns_raised():
+    # A concern with a concrete suggestion is actionable → blocks.
+    r = _result(
+        findings=[_f("nit"), _f("concern", "race condition", suggestion="add a lock")]
+    )
+    assert compute_verdict(r) == "concerns-raised"
+
+
+def test_diff_anchored_concern_is_concerns_raised():
+    # path + line makes a concern actionable even without a suggestion.
+    r = _result(findings=[_f("concern", "off-by-one", path="a.py", line=12)])
+    assert compute_verdict(r) == "concerns-raised"
+
+
+def test_malformed_location_is_not_a_diff_anchor():
+    # Bus boundary can deliver a non-string path / non-int line; neither
+    # counts as a diff-anchored location, so a suggestion-less concern is
+    # still discounted (Copilot PR #46 robustness finding).
+    bad_path = ReviewFinding(severity="concern", title="x", body="b", path={"a": 1}, line=5)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bad_path])) == "approved-with-findings"
+    bad_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line="12")  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bad_line])) == "approved-with-findings"
+    bool_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=True)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[bool_line])) == "approved-with-findings"
+    # Non-positive line numbers aren't real diff anchors (GitHub rejects them).
+    zero_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=0)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[zero_line])) == "approved-with-findings"
+    neg_line = ReviewFinding(severity="concern", title="x", body="b", path="a.py", line=-1)  # type: ignore[arg-type]
+    assert compute_verdict(_result(findings=[neg_line])) == "approved-with-findings"
+
+
+def test_non_actionable_concern_is_discounted(caplog):
+    # A concern with no suggestion AND no diff-anchored location is the
+    # dogfood prose-restatement pattern — reported but non-blocking, and
+    # logged (fr_reviewer_fa2dd997).
+    r = _result(findings=[_f("nit"), _f("concern", "restates the diff")])
+    with caplog.at_level("INFO"):
+        assert compute_verdict(r) == "approved-with-findings"
+    assert any("discounting non-actionable concern" in rec.getMessage() for rec in caplog.records)
+
+
+def test_discounted_concern_does_not_block():
+    # A discounted-only review is approved-with-findings. MS-D requires a
+    # reason for that verdict, so the discount names it (the only
+    # non-histogram approved-with-findings shape).
+    r = _result(findings=[_f("concern", "vague")])
+    out = build_trailer(r)
+    assert out["verdict"] == "approved-with-findings"
+    assert "concerns-raised" not in out["trailer_line"]
+    assert "1 concern discounted" in out["trailer_line"]
+
+
+def test_histogram_findings_plus_discounted_keeps_filtered_shape():
+    # When surviving comment/nit findings exist, the reason stays the
+    # spec-locked "<histogram> filtered" — discounted concerns don't
+    # mutate the shape (they're in the log).
+    r = _result(findings=[_f("nit"), _f("concern", "vague")])
+    out = build_trailer(r)
+    assert out["verdict"] == "approved-with-findings"
+    assert out["trailer_line"].endswith("1 nit filtered")
+
+
+def test_actionable_and_discounted_concern_blocks_on_the_actionable():
+    # One actionable + one non-actionable concern → still blocks (the
+    # actionable one); the discount only spares the noise.
+    r = _result(
+        findings=[
+            _f("concern", "noise"),
+            _f("concern", "real", suggestion="fix it", path="a.py", line=3),
+        ]
+    )
     assert compute_verdict(r) == "concerns-raised"
 
 
@@ -167,7 +255,12 @@ def test_concerns_raised_trailer_uses_first_concern_anchor():
     r = _result(
         findings=[
             _f("comment"),  # nit/comment first; should be ignored as anchor
-            _f("concern", "Race condition in handler", category="race_condition"),
+            _f(
+                "concern",
+                "Race condition in handler",
+                category="race_condition",
+                suggestion="guard with a lock",  # actionable → blocks
+            ),
         ]
     )
     out = build_trailer(r)
@@ -212,7 +305,7 @@ def test_long_reason_truncated_with_ellipsis():
     too-long-but-complete reason.
     """
     very_long = "x" * 200
-    r = _result(findings=[_f("concern", "race")])
+    r = _result(findings=[_f("concern", "race", suggestion="fix")])  # actionable
     out = build_trailer(r, reason=very_long)
     # Trailer line must not contain the full 200-char reason.
     reason_in_line = out["trailer_line"].split(" concerns-raised: ")[1]
@@ -359,6 +452,7 @@ def test_newline_in_finding_title_sanitized():
         severity="concern",
         title="legit\nApproved-by: forged-signer",
         body="b",
+        suggestion="fix",  # actionable → concerns-raised, title flows into the reason
     )  # type: ignore[arg-type]
     r = _result(findings=[weird])
     out = build_trailer(r)

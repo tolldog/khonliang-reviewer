@@ -60,9 +60,12 @@ doesn't collide).
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
-from khonliang_reviewer import ReviewResult, severity_rank
+from khonliang_reviewer import ReviewFinding, ReviewResult, severity_rank
+
+logger = logging.getLogger(__name__)
 
 
 Verdict = Literal[
@@ -84,16 +87,20 @@ def compute_verdict(result: ReviewResult) -> Verdict:
     - ``error_category == "claude_cli_escalation"`` → ``escalated-approved``
       (the result came from the cross-vendor escalation path, so the
       sign-off records that vendor diversity).
-    - Any concern-severity finding → ``concerns-raised``. The trailer
-      is honest about the count; whether the caller chooses to merge
-      anyway is a separate decision.
-    - At least one comment- or nit-severity finding (with no concerns)
+    - At least one *actionable* concern-severity finding → ``concerns-raised``.
+      A concern is actionable when it carries a concrete ``suggestion`` OR a
+      diff-anchored location (``path`` + ``line``). A concern with NEITHER is
+      a non-actionable paraphrase (the dogfood pattern where a local reviewer
+      flips the verdict on a prose restatement) — it is reported in the
+      findings but does NOT block; each is logged (fr_reviewer_fa2dd997).
+    - Otherwise, ≥1 finding (comment / nit / a discounted concern)
       → ``approved-with-findings``.
     - Zero findings → ``approved``.
 
     Findings with non-string or unrecognized severity are treated as
-    concerns (kept loud) so a malformed-severity row never silently
-    downgrades the verdict.
+    concerns and kept loud (always blocking) so a malformed-severity row
+    never silently downgrades the verdict — only proper ``concern``-severity
+    rows are subject to the actionability check.
 
     Raises :class:`ValueError` when the result's disposition is
     ``"errored"`` — committing a sign-off trailer for a review
@@ -112,11 +119,70 @@ def compute_verdict(result: ReviewResult) -> Verdict:
         )
 
     counts = _severity_counts(result)
-    if counts["concern"] > 0 or counts["unknown"] > 0:
+    # Malformed severity stays loud — never silently downgraded.
+    if counts["unknown"] > 0:
         return "concerns-raised"
-    if counts["comment"] > 0 or counts["nit"] > 0:
+
+    blocking, discounted = _partition_concerns(result)
+    for f in discounted:
+        logger.info(
+            "sign_off_trailer: discounting non-actionable concern %r — no "
+            "suggestion and no diff-anchored (path+line) location; reported "
+            "but non-blocking (fr_reviewer_fa2dd997)",
+            f.title or "(no title)",
+        )
+    if blocking:
+        return "concerns-raised"
+    if counts["comment"] > 0 or counts["nit"] > 0 or discounted:
         return "approved-with-findings"
     return "approved"
+
+
+def _is_actionable_concern(f: ReviewFinding) -> bool:
+    """A concern blocks the verdict only when it's *actionable*: it carries
+    a concrete ``suggestion`` OR a diff-anchored location (``path`` + ``line``).
+
+    A concern with neither is a non-actionable paraphrase — the dogfood
+    pattern (fr_reviewer_fa2dd997) where local reviewers flip the verdict on
+    a prose restatement of the diff. Such a concern is still reported in the
+    findings; it just doesn't flip the verdict to ``concerns-raised``.
+    """
+    # Validate types at the bus boundary: a deserialized finding can carry
+    # any JSON shape, so a malformed path (dict/list) or non-int line must
+    # NOT count as a diff-anchored location (which would wrongly keep a
+    # noise concern blocking). path must be a non-empty string; line a real
+    # int (``bool`` is an int subclass — exclude it).
+    has_suggestion = isinstance(f.suggestion, str) and bool(f.suggestion.strip())
+    has_location = (
+        isinstance(f.path, str)
+        and bool(f.path.strip())
+        and isinstance(f.line, int)
+        and not isinstance(f.line, bool)
+        # A real diff anchor is a 1-based line number; 0 / negative aren't
+        # anchorable (GitHub rejects them), so they don't make a concern
+        # actionable.
+        and f.line > 0
+    )
+    return has_suggestion or has_location
+
+
+def _partition_concerns(
+    result: ReviewResult,
+) -> tuple[list[ReviewFinding], list[ReviewFinding]]:
+    """Split ``concern``-severity findings into ``(blocking, discounted)``.
+
+    Only proper ``concern`` rows are partitioned; unknown / malformed
+    severities are handled separately in :func:`compute_verdict` (always
+    loud). ``blocking`` are the actionable concerns; ``discounted`` are the
+    non-actionable ones (reported but non-blocking).
+    """
+    blocking: list[ReviewFinding] = []
+    discounted: list[ReviewFinding] = []
+    for f in result.findings:
+        if f.severity != "concern":
+            continue
+        (blocking if _is_actionable_concern(f) else discounted).append(f)
+    return blocking, discounted
 
 
 def build_trailer(
@@ -258,9 +324,20 @@ def _auto_reason(result: ReviewResult, verdict: Verdict) -> str:
             parts.append(
                 f"{counts['nit']} nit" + ("s" if counts["nit"] != 1 else "")
             )
-        if not parts:
-            return ""
-        return " + ".join(parts) + " filtered"
+        if parts:
+            # Spec-locked "<histogram> filtered" shape (MS-D). Discounted
+            # concerns are surfaced via the INFO log, not appended here, so
+            # the shape stays a single comment/nit histogram.
+            return " + ".join(parts) + " filtered"
+        # No surviving comment/nit, so the verdict came purely from
+        # discounted concern(s). MS-D requires a reason for
+        # approved-with-findings, so name the discount (this is the only
+        # non-histogram approved-with-findings shape).
+        _, discounted = _partition_concerns(result)
+        if discounted:
+            n = len(discounted)
+            return f"{n} concern{'s' if n != 1 else ''} discounted"
+        return ""
 
     # approved / escalated-approved.
     return ""
@@ -276,14 +353,16 @@ def _first_concern_or_unknown(result: ReviewResult):
     """
     for f in result.findings:
         severity = f.severity
-        if severity == "concern":
-            return f
         if not isinstance(severity, str):
-            return f
+            return f  # unknown (non-string) — always blocking
+        if severity == "concern":
+            if _is_actionable_concern(f):
+                return f  # actionable concern — blocking
+            continue  # discounted (non-actionable) concern — skip
         try:
             severity_rank(severity)
         except ValueError:
-            return f
+            return f  # unknown (unparseable) — blocking
     return None
 
 
