@@ -310,6 +310,11 @@ _PREPROC_DIFF = (
     "+++ b/a.c\n@@ -1 +5 @@\n"
     "+#include <stdio.h>\n+#define MAX 10\n+#ifndef FOO\n+int main(void){return 0;}\n"
 )
+# C/C++ also permits whitespace between "#" and the directive keyword.
+_PREPROC_SPACED_DIFF = (
+    "+++ b/a.c\n@@ -1 +5 @@\n"
+    "+# include <stdio.h>\n+# define MAX 10\n+# ifndef FOO\n+int main(void){return 0;}\n"
+)
 _COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
 _MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
 
@@ -334,6 +339,12 @@ def test_classify_c_preprocessor_directives_are_code():
     # "#include"/"#define"/"#ifndef" are C preprocessor directives, not
     # comments — they must not be mistaken for documentation.
     assert classify_diff_content(_PREPROC_DIFF) == "code"
+
+
+def test_classify_spaced_c_preprocessor_directives_are_code():
+    # C/C++ allows whitespace after "#": "# include" is as valid as
+    # "#include" and must still classify as code, not doc.
+    assert classify_diff_content(_PREPROC_SPACED_DIFF) == "code"
 
 
 def test_classify_non_diff_and_empty_are_code():

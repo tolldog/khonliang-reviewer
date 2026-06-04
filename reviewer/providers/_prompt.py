@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from khonliang_reviewer import ReviewRequest
@@ -94,24 +95,41 @@ _DOC_FILE_EXTS: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
 #: Deliberately excludes ``*`` and ``;`` — both start real code lines (C
 #: pointer deref / block-comment-continuation; Lisp/asm vs C statements) so
 #: they'd misclassify code as doc. ``#`` is handled separately in
-#: :func:`_is_doc_line` (it needs a trailing space to disambiguate a
-#: Python/shell comment from a C preprocessor directive).
+#: :func:`_is_doc_line` (a C/C++ preprocessor directive vs a comment).
 _COMMENT_PREFIXES: tuple[str, ...] = ("//", "/*", "--", "<!--", '"""', "'''")
+
+#: C/C++ preprocessor directive keywords. A ``#`` line whose first token is
+#: one of these is code, not a comment — even with whitespace after the
+#: ``#`` (``# include`` is as valid as ``#include``). Trade-off: a prose
+#: comment that opens with one of these words (``# define the term``) is
+#: counted as code. That's symmetric and rare, and :func:`classify_diff_content`
+#: routes on a ratio, so a few miscounted lines don't flip a hunk's verdict.
+_PREPROCESSOR_DIRECTIVES: frozenset[str] = frozenset(
+    {
+        "include", "define", "undef", "if", "ifdef", "ifndef", "else",
+        "elif", "endif", "pragma", "error", "warning", "line", "import",
+    }
+)
+#: Matches the first lowercase token after a ``#`` and optional whitespace.
+_HASH_DIRECTIVE_RE = re.compile(r"#\s*([a-z_]+)")
 
 
 def _is_doc_line(line: str) -> bool:
     """True iff a stripped, added line reads as documentation / prose.
 
     Blank lines, ``#``-comments (Python / shell / yaml) or markdown ATX
-    headings, and the :data:`_COMMENT_PREFIXES` markers count as doc. ``#``
-    requires a trailing space (or end-of-line), so C/C++ preprocessor
-    directives (``#include`` / ``#define`` / ``#pragma`` …) are correctly
-    left as code rather than mistaken for comments.
+    headings, and the :data:`_COMMENT_PREFIXES` markers count as doc. A ``#``
+    line whose first token is a :data:`_PREPROCESSOR_DIRECTIVES` keyword is
+    code — covering both ``#include`` and the whitespace-after-hash form
+    ``# include`` — so C/C++ preprocessor lines are not mistaken for comments.
     """
     if not line:
         return True
-    if line == "#" or line.startswith("# "):
-        return True
+    if line.startswith("#"):
+        m = _HASH_DIRECTIVE_RE.match(line)
+        if m and m.group(1) in _PREPROCESSOR_DIRECTIVES:
+            return False
+        return line == "#" or line.startswith("# ")
     return line.startswith(_COMMENT_PREFIXES)
 
 #: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
