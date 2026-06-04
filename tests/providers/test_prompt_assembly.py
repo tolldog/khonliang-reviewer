@@ -10,6 +10,8 @@ primitive.
 
 from __future__ import annotations
 
+import logging
+
 from khonliang_reviewer import ReviewRequest
 
 from reviewer.config.prompts import RepoPrompts
@@ -383,6 +385,13 @@ def test_mixed_diff_omits_critique_instruction():
     # Only clearly doc-heavy diffs are routed; mixed is conservative.
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
     assert "CRITIQUE, do not summarize" not in prompt
+
+
+def test_pr_diff_logs_diff_classification(caplog):
+    with caplog.at_level(logging.DEBUG, logger="reviewer.providers._prompt"):
+        build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
+
+    assert "diff classification (kind=pr_diff): mixed" in caplog.text
 
 
 def test_classify_added_line_starting_with_plus_not_a_header():
