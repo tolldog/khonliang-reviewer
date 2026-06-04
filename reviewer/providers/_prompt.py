@@ -117,19 +117,22 @@ _HASH_DIRECTIVE_RE = re.compile(r"#\s*([a-z_]+)")
 def _is_doc_line(line: str) -> bool:
     """True iff a stripped, added line reads as documentation / prose.
 
-    Blank lines, ``#``-comments (Python / shell / yaml) or markdown ATX
-    headings, and the :data:`_COMMENT_PREFIXES` markers count as doc. A ``#``
-    line whose first token is a :data:`_PREPROCESSOR_DIRECTIVES` keyword is
-    code — covering both ``#include`` and the whitespace-after-hash form
-    ``# include`` — so C/C++ preprocessor lines are not mistaken for comments.
+    Blank lines, ``#``-comments (Python / shell / yaml, with or without a
+    space after the ``#``) or markdown ATX headings, and the
+    :data:`_COMMENT_PREFIXES` markers count as doc. The two ``#`` forms that
+    are *code*: a shebang (``#!...``) and a C/C++ preprocessor directive whose
+    first token is in :data:`_PREPROCESSOR_DIRECTIVES` — covering both
+    ``#include`` and the whitespace-after-hash form ``# include``.
     """
     if not line:
         return True
     if line.startswith("#"):
+        if line.startswith("#!"):  # shebang — code, not a comment
+            return False
         m = _HASH_DIRECTIVE_RE.match(line)
         if m and m.group(1) in _PREPROCESSOR_DIRECTIVES:
             return False
-        return line == "#" or line.startswith("# ")
+        return True  # any other "#..." is a comment / ATX heading
     return line.startswith(_COMMENT_PREFIXES)
 
 #: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
@@ -250,13 +253,13 @@ def build_review_prompt(
     # Gated on the diff kind so non-diff payloads (spec/doc/fr full documents)
     # skip the line scan entirely — those route through the artifact-review
     # pipeline (fr_reviewer_19c871ab), not here.
-    if request.kind == "pr_diff" and classify_diff_content(request.content) == "doc":
+    if request.kind == "pr_diff":
+        classification = classify_diff_content(request.content)
         logger.debug(
-            "doc-heavy review payload (kind=%s) — routing to "
-            "critique-not-summarize prompt",
-            request.kind,
+            "diff classification (kind=%s): %s", request.kind, classification
         )
-        lines += [_DOC_REVIEW_INSTRUCTION, ""]
+        if classification == "doc":
+            lines += [_DOC_REVIEW_INSTRUCTION, ""]
 
     # Repo-side additions land between the built-in system and the
     # task-shape details (schema / instructions / context). An empty

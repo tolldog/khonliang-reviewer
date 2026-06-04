@@ -316,6 +316,10 @@ _PREPROC_SPACED_DIFF = (
     "+# include <stdio.h>\n+# define MAX 10\n+# ifndef FOO\n+int main(void){return 0;}\n"
 )
 _COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
+# Comment styles without a space (or with a tab) after the "#" — still doc.
+_NOSPACE_COMMENT_DIFF = (
+    "+++ b/a.py\n@@ -1 +3 @@\n+#explain the why\n+#\tmore rationale\n+#and more\n"
+)
 _MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
 
 
@@ -329,6 +333,18 @@ def test_classify_code_diff_is_code():
 
 def test_classify_comment_heavy_code_file_is_doc():
     assert classify_diff_content(_COMMENT_DIFF) == "doc"
+
+
+def test_classify_nospace_and_tab_comments_are_doc():
+    # "#comment" (no space) and "#\tcomment" are comments, not code —
+    # only shebangs and preprocessor directives escape the "#" doc rule.
+    assert classify_diff_content(_NOSPACE_COMMENT_DIFF) == "doc"
+
+
+def test_classify_shebang_line_is_not_doc():
+    # A shebang is code, not a comment; a lone shebang diff is not doc-heavy.
+    shebang = "+++ b/run.sh\n@@ -1 +2 @@\n+#!/usr/bin/env bash\n+echo hi\n"
+    assert classify_diff_content(shebang) == "code"
 
 
 def test_classify_mixed_diff_is_mixed():
