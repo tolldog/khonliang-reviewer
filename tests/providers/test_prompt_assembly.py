@@ -13,7 +13,7 @@ from __future__ import annotations
 from khonliang_reviewer import ReviewRequest
 
 from reviewer.config.prompts import RepoPrompts
-from reviewer.providers._prompt import build_review_prompt
+from reviewer.providers._prompt import build_review_prompt, classify_diff_content
 
 
 # -- no repo prompts = pre-FR bytes -----------------------------------
@@ -304,9 +304,7 @@ def test_build_review_prompt_survives_non_repoprompts_value():
 # -- doc-hunk routing (fr_reviewer_1262ce18) --------------------------
 
 
-from reviewer.providers._prompt import classify_diff_content  # noqa: E402
-
-_MD_DIFF = "+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
+_MD_DIFF ="+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
 _CODE_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+def f():\n+    return compute()\n"
 _COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
 _MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
@@ -347,4 +345,18 @@ def test_code_diff_omits_critique_instruction():
 def test_mixed_diff_omits_critique_instruction():
     # Only clearly doc-heavy diffs are routed; mixed is conservative.
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt
+
+
+def test_classify_added_line_starting_with_plus_not_a_header():
+    # An ADDED line whose content begins with "+++" renders as "++++..." and
+    # must NOT be mistaken for a "+++ " file header (Copilot PR #47).
+    diff = "+++ b/a.py\n@@ -1 +2 @@\n++++ not a header, real code\n+x = 1\n"
+    assert classify_diff_content(diff) == "code"
+
+
+def test_doc_routing_gated_on_pr_diff_kind():
+    # A doc-classified payload under a non-diff kind is NOT routed (those go
+    # through the artifact-review pipeline, not doc-hunk routing).
+    prompt = build_review_prompt(ReviewRequest(kind="spec", content=_MD_DIFF))
     assert "CRITIQUE, do not summarize" not in prompt

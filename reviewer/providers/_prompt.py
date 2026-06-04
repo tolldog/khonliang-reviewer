@@ -91,9 +91,10 @@ _DEFAULT_EXAMPLE_FORMAT = "markdown"
 #: File extensions whose changed lines are treated as documentation/prose.
 _DOC_FILE_EXTS: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
 #: Stripped-line prefixes that mark a comment/doc line inside a code file.
-_COMMENT_PREFIXES: tuple[str, ...] = (
-    "#", "//", "/*", "*", "--", ";", "<!--", '"""', "'''",
-)
+#: Deliberately excludes ``*`` and ``;`` — both start real code lines (C
+#: pointer deref / block-comment-continuation; Lisp/asm vs C statements) so
+#: they'd misclassify code as doc.
+_COMMENT_PREFIXES: tuple[str, ...] = ("#", "//", "/*", "--", "<!--", '"""', "'''")
 
 #: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
 #: cannot distinguish "summarize" from "critique" on prose, so they echo the
@@ -132,13 +133,14 @@ def classify_diff_content(content: str) -> str:
     code = 0
     current_is_doc_file = False
     for raw in content.splitlines():
-        if raw.startswith("+++"):
-            # File header "+++ b/<path>" — track this file's doc-ness for
-            # the added lines that follow until the next header.
-            path = raw[3:].strip().lower()
-            current_is_doc_file = path.endswith(_DOC_FILE_EXTS)
-            continue
-        if raw.startswith(("---", "@@", "diff ", "index ")):
+        # The unified-diff "+++ " file header has a trailing space ("+++ b/x",
+        # "+++ /dev/null"); match it precisely so an ADDED line whose content
+        # itself starts with "+++" (rendered "++++..." with the + prefix) is
+        # NOT mistaken for a header. Every other non-added line (context,
+        # removed, "---"/"@@"/"diff"/"index" headers) doesn't start with "+",
+        # so the next check skips it.
+        if raw.startswith("+++ "):
+            current_is_doc_file = raw[4:].strip().lower().endswith(_DOC_FILE_EXTS)
             continue
         if not raw.startswith("+"):
             continue
@@ -209,7 +211,10 @@ def build_review_prompt(
     # gets a critique-not-summarize instruction so the model doesn't echo the
     # changed text back as a finding. Only fires for clearly doc-heavy diffs;
     # code / mixed diffs are unchanged (byte-identical to the pre-FR prompt).
-    if classify_diff_content(request.content) == "doc":
+    # Gated on the diff kind so non-diff payloads (spec/doc/fr full documents)
+    # skip the line scan entirely — those route through the artifact-review
+    # pipeline (fr_reviewer_19c871ab), not here.
+    if request.kind == "pr_diff" and classify_diff_content(request.content) == "doc":
         logger.debug(
             "doc-heavy review payload (kind=%s) — routing to "
             "critique-not-summarize prompt",
