@@ -35,9 +35,13 @@ everything else falls back to markdown fences.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from khonliang_reviewer import ReviewRequest
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Imported for type hints only — keeping the runtime import out of
@@ -80,6 +84,119 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
 #: tokenization sensitivity.
 _SUPPORTED_EXAMPLE_FORMATS: frozenset[str] = frozenset({"xml", "json", "markdown"})
 _DEFAULT_EXAMPLE_FORMAT = "markdown"
+
+
+# ---------------------------------------------------------------------------
+# Doc-hunk routing (fr_reviewer_1262ce18)
+# ---------------------------------------------------------------------------
+#: File extensions whose changed lines are treated as documentation/prose.
+_DOC_FILE_EXTS: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
+#: Stripped-line prefixes that mark a comment/doc line inside a code file.
+#: Deliberately excludes ``*`` and ``;`` — both start real code lines (C
+#: pointer deref / block-comment-continuation; Lisp/asm vs C statements) so
+#: they'd misclassify code as doc. ``#`` is handled separately in
+#: :func:`_is_doc_line` (a C/C++ preprocessor directive vs a comment).
+_COMMENT_PREFIXES: tuple[str, ...] = ("//", "/*", "--", "<!--", '"""', "'''")
+
+#: C/C++ preprocessor directive keywords. A ``#`` line whose first token is
+#: one of these is code, not a comment — even with whitespace after the
+#: ``#`` (``# include`` is as valid as ``#include``). Trade-off: a prose
+#: comment that opens with one of these words (``# define the term``) is
+#: counted as code. That's symmetric and rare, and :func:`classify_diff_content`
+#: routes on a ratio, so a few miscounted lines don't flip a hunk's verdict.
+_PREPROCESSOR_DIRECTIVES: frozenset[str] = frozenset(
+    {
+        "include", "define", "undef", "if", "ifdef", "ifndef", "else",
+        "elif", "endif", "pragma", "error", "warning", "line", "import",
+    }
+)
+#: Matches the first lowercase token after a ``#`` and optional whitespace.
+_HASH_DIRECTIVE_RE = re.compile(r"#\s*([a-z_]+)")
+
+
+def _is_doc_line(line: str) -> bool:
+    """True iff a stripped, added line reads as documentation / prose.
+
+    Blank lines, ``#``-comments (Python / shell / yaml, with or without a
+    space after the ``#``) or markdown ATX headings, and the
+    :data:`_COMMENT_PREFIXES` markers count as doc. The two ``#`` forms that
+    are *code*: a shebang (``#!...``) and a C/C++ preprocessor directive whose
+    first token is in :data:`_PREPROCESSOR_DIRECTIVES` — covering both
+    ``#include`` and the whitespace-after-hash form ``# include``.
+    """
+    if not line:
+        return True
+    if line.startswith("#"):
+        if line.startswith("#!"):  # shebang — code, not a comment
+            return False
+        m = _HASH_DIRECTIVE_RE.match(line)
+        if m and m.group(1) in _PREPROCESSOR_DIRECTIVES:
+            return False
+        return True  # any other "#..." is a comment / ATX heading
+    return line.startswith(_COMMENT_PREFIXES)
+
+#: Appended to the prompt for doc-heavy reviews. Small local hot-tier models
+#: cannot distinguish "summarize" from "critique" on prose, so they echo the
+#: changed text back as a "finding" (the dogfood prose-echo pattern). This
+#: instruction redirects them; the deeper fix (curated doc-review few-shots)
+#: lands with the examples library (fr_reviewer_afd4bab1).
+_DOC_REVIEW_INSTRUCTION = (
+    "NOTE: this change is predominantly documentation / comments / prose. "
+    "CRITIQUE, do not summarize. Only flag a finding if the prose is "
+    "factually WRONG, misleading, contradicts the code, or omits a stated "
+    "invariant. NEVER restate, rephrase, or summarize what the text says — a "
+    "finding that merely paraphrases the change is not a finding. If the "
+    "prose is accurate, return zero findings."
+)
+
+
+def classify_diff_content(content: str) -> str:
+    """Classify a diff payload as ``"doc"``, ``"code"``, or ``"mixed"`` by
+    its ADDED lines (fr_reviewer_1262ce18).
+
+    Doc-heavy = the added content is predominantly prose: lines in a
+    markdown / rst / txt file, comment lines, or blank lines. A doc-heavy
+    diff is routed to a critique-not-summarize prompt so the reviewer stops
+    echoing the prose back as findings.
+
+    Heuristic only (no LLM): walks the unified diff, tracking the current
+    file from ``+++`` headers, and buckets each added (``+``) content line.
+    Non-diff content (no added lines) classifies as ``"code"`` — there's
+    nothing to route, and full-document prose review is the artifact-review
+    pipeline's concern (fr_reviewer_19c871ab), not this one.
+
+    Thresholds: ``doc_ratio >= 0.7`` → ``"doc"``; ``<= 0.3`` → ``"code"``;
+    in between → ``"mixed"`` (only ``"doc"`` is routed, conservatively).
+    """
+    doc = 0
+    code = 0
+    current_is_doc_file = False
+    for raw in content.splitlines():
+        # The unified-diff "+++ " file header has a trailing space ("+++ b/x",
+        # "+++ /dev/null"); match it precisely so an ADDED line whose content
+        # itself starts with "+++" (rendered "++++..." with the + prefix) is
+        # NOT mistaken for a header. Every other non-added line (context,
+        # removed, "---"/"@@"/"diff"/"index" headers) doesn't start with "+",
+        # so the next check skips it.
+        if raw.startswith("+++ "):
+            current_is_doc_file = raw[4:].strip().lower().endswith(_DOC_FILE_EXTS)
+            continue
+        if not raw.startswith("+"):
+            continue
+        line = raw[1:].strip()
+        if current_is_doc_file or _is_doc_line(line):
+            doc += 1
+        else:
+            code += 1
+    total = doc + code
+    if total == 0:
+        return "code"
+    ratio = doc / total
+    if ratio >= 0.7:
+        return "doc"
+    if ratio <= 0.3:
+        return "code"
+    return "mixed"
 
 
 def build_review_prompt(
@@ -128,6 +245,21 @@ def build_review_prompt(
         "given. No prose outside the JSON.",
         "",
     ]
+
+    # Doc-hunk routing (fr_reviewer_1262ce18): a predominantly-prose change
+    # gets a critique-not-summarize instruction so the model doesn't echo the
+    # changed text back as a finding. Only fires for clearly doc-heavy diffs;
+    # code / mixed diffs are unchanged (byte-identical to the pre-FR prompt).
+    # Gated on the diff kind so non-diff payloads (spec/doc/fr full documents)
+    # skip the line scan entirely — those route through the artifact-review
+    # pipeline (fr_reviewer_19c871ab), not here.
+    if request.kind == "pr_diff":
+        classification = classify_diff_content(request.content)
+        logger.debug(
+            "diff classification (kind=%s): %s", request.kind, classification
+        )
+        if classification == "doc":
+            lines += [_DOC_REVIEW_INSTRUCTION, ""]
 
     # Repo-side additions land between the built-in system and the
     # task-shape details (schema / instructions / context). An empty
@@ -288,4 +420,4 @@ def _wrap_example(severity: str, text: str, *, fmt: str) -> list[str]:
     ]
 
 
-__all__ = ["REVIEW_RESPONSE_SCHEMA", "build_review_prompt"]
+__all__ = ["REVIEW_RESPONSE_SCHEMA", "build_review_prompt", "classify_diff_content"]

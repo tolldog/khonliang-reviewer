@@ -10,10 +10,12 @@ primitive.
 
 from __future__ import annotations
 
+import logging
+
 from khonliang_reviewer import ReviewRequest
 
 from reviewer.config.prompts import RepoPrompts
-from reviewer.providers._prompt import build_review_prompt
+from reviewer.providers._prompt import build_review_prompt, classify_diff_content
 
 
 # -- no repo prompts = pre-FR bytes -----------------------------------
@@ -299,3 +301,108 @@ def test_build_review_prompt_survives_non_repoprompts_value():
     assert "## Severity Rubric" not in got
     assert "## Examples" not in got
     assert got.rstrip().endswith("diff body")
+
+
+# -- doc-hunk routing (fr_reviewer_1262ce18) --------------------------
+
+
+_MD_DIFF = "+++ b/README.md\n@@ -1 +1 @@\n+# Title\n+Some clarifying prose here.\n"
+_CODE_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+def f():\n+    return compute()\n"
+_PREPROC_DIFF = (
+    "+++ b/a.c\n@@ -1 +5 @@\n"
+    "+#include <stdio.h>\n+#define MAX 10\n+#ifndef FOO\n+int main(void){return 0;}\n"
+)
+# C/C++ also permits whitespace between "#" and the directive keyword.
+_PREPROC_SPACED_DIFF = (
+    "+++ b/a.c\n@@ -1 +5 @@\n"
+    "+# include <stdio.h>\n+# define MAX 10\n+# ifndef FOO\n+int main(void){return 0;}\n"
+)
+_COMMENT_DIFF = "+++ b/a.py\n@@ -1 +3 @@\n+# explain the why\n+# more rationale\n+# and more\n"
+# Comment styles without a space (or with a tab) after the "#" — still doc.
+_NOSPACE_COMMENT_DIFF = (
+    "+++ b/a.py\n@@ -1 +3 @@\n+#explain the why\n+#\tmore rationale\n+#and more\n"
+)
+_MIXED_DIFF = "+++ b/a.py\n@@ -1 +2 @@\n+# a comment\n+def f(): return real_work()\n"
+
+
+def test_classify_doc_file_diff_is_doc():
+    assert classify_diff_content(_MD_DIFF) == "doc"
+
+
+def test_classify_code_diff_is_code():
+    assert classify_diff_content(_CODE_DIFF) == "code"
+
+
+def test_classify_comment_heavy_code_file_is_doc():
+    assert classify_diff_content(_COMMENT_DIFF) == "doc"
+
+
+def test_classify_nospace_and_tab_comments_are_doc():
+    # "#comment" (no space) and "#\tcomment" are comments, not code —
+    # only shebangs and preprocessor directives escape the "#" doc rule.
+    assert classify_diff_content(_NOSPACE_COMMENT_DIFF) == "doc"
+
+
+def test_classify_shebang_line_is_not_doc():
+    # A shebang is code, not a comment; a lone shebang diff is not doc-heavy.
+    shebang = "+++ b/run.sh\n@@ -1 +2 @@\n+#!/usr/bin/env bash\n+echo hi\n"
+    assert classify_diff_content(shebang) == "code"
+
+
+def test_classify_mixed_diff_is_mixed():
+    assert classify_diff_content(_MIXED_DIFF) == "mixed"
+
+
+def test_classify_c_preprocessor_directives_are_code():
+    # "#include"/"#define"/"#ifndef" are C preprocessor directives, not
+    # comments — they must not be mistaken for documentation.
+    assert classify_diff_content(_PREPROC_DIFF) == "code"
+
+
+def test_classify_spaced_c_preprocessor_directives_are_code():
+    # C/C++ allows whitespace after "#": "# include" is as valid as
+    # "#include" and must still classify as code, not doc.
+    assert classify_diff_content(_PREPROC_SPACED_DIFF) == "code"
+
+
+def test_classify_non_diff_and_empty_are_code():
+    assert classify_diff_content("just some text, no diff markers") == "code"
+    assert classify_diff_content("") == "code"
+
+
+def test_doc_heavy_diff_gets_critique_instruction():
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MD_DIFF))
+    assert "CRITIQUE, do not summarize" in prompt
+    assert "paraphrases the change is not a finding" in prompt
+
+
+def test_code_diff_omits_critique_instruction():
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt
+
+
+def test_mixed_diff_omits_critique_instruction():
+    # Only clearly doc-heavy diffs are routed; mixed is conservative.
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt
+
+
+def test_pr_diff_logs_diff_classification(caplog):
+    with caplog.at_level(logging.DEBUG, logger="reviewer.providers._prompt"):
+        build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
+
+    assert "diff classification (kind=pr_diff): mixed" in caplog.text
+
+
+def test_classify_added_line_starting_with_plus_not_a_header():
+    # An ADDED line whose content begins with "+++" renders as "++++..." and
+    # must NOT be mistaken for a "+++ " file header (Copilot PR #47).
+    diff = "+++ b/a.py\n@@ -1 +2 @@\n++++ not a header, real code\n+x = 1\n"
+    assert classify_diff_content(diff) == "code"
+
+
+def test_doc_routing_gated_on_pr_diff_kind():
+    # A doc-classified payload under a non-diff kind is NOT routed (those go
+    # through the artifact-review pipeline, not doc-hunk routing).
+    prompt = build_review_prompt(ReviewRequest(kind="spec", content=_MD_DIFF))
+    assert "CRITIQUE, do not summarize" not in prompt
