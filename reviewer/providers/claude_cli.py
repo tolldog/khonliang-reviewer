@@ -390,6 +390,7 @@ def _parse_envelope(
             path=item.get("path"),
             line=_int_or_none(item.get("line")),
             suggestion=item.get("suggestion"),
+            section=item.get("section") if isinstance(item.get("section"), str) else None,
         )
         for item in raw_findings
         if isinstance(item, dict)

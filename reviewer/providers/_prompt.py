@@ -72,6 +72,7 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
                     "body": {"type": "string"},
                     "path": {"type": ["string", "null"]},
                     "line": {"type": ["integer", "null"]},
+                    "section": {"type": ["string", "null"]},
                     "suggestion": {"type": ["string", "null"]},
                 },
             },

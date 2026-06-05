@@ -1252,6 +1252,134 @@ async def test_rule_table_routes_design_artifact_to_claude():
     assert claude.last_request.metadata["model"] == "claude"
 
 
+# -- review_artifact skill (fr_reviewer_19c871ab) ---------------------
+
+
+async def test_review_artifact_content_fr_routes_to_ollama():
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "khonliang-reviewer", "content": "# An FR\n\nbody"},
+    )
+
+    assert ollama.last_request is not None
+    assert claude.last_request is None
+    assert ollama.last_request.kind == "fr"
+    assert ollama.last_request.content == "# An FR\n\nbody"
+    assert ollama.last_request.metadata["project"] == "khonliang-reviewer"
+
+
+async def test_review_artifact_content_spec_routes_to_claude():
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider(
+        "claude_cli", _make_result(backend="claude_cli", model="claude")
+    )
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_artifact",
+        {"kind": "spec", "project": "khonliang-reviewer", "content": "# Spec\n\nbody"},
+    )
+
+    assert claude.last_request is not None
+    assert ollama.last_request is None
+    assert claude.last_request.kind == "spec"
+
+
+async def test_review_artifact_threads_provenance_metadata():
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    await harness.call(
+        "review_artifact",
+        {
+            "kind": "fr",
+            "project": "khonliang-reviewer",
+            "content": "# FR\n\nbody",
+            "fr_id": "fr_reviewer_abc123",
+        },
+    )
+
+    md = ollama.last_request.metadata
+    assert md["project"] == "khonliang-reviewer"
+    assert md["fr_id"] == "fr_reviewer_abc123"
+
+
+async def test_review_artifact_bad_kind_errors():
+    harness = _make_harness()
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "pr_diff", "project": "p", "content": "x"},
+    )
+    assert "error" in res
+    assert "kind" in res["error"]
+
+
+async def test_review_artifact_requires_project():
+    harness = _make_harness()
+    res = await harness.call("review_artifact", {"kind": "fr", "content": "x"})
+    assert "error" in res
+    assert "project" in res["error"]
+
+
+async def test_review_artifact_requires_exactly_one_source():
+    harness = _make_harness()
+    # neither
+    r1 = await harness.call("review_artifact", {"kind": "fr", "project": "p"})
+    assert "error" in r1 and "ingestion source" in r1["error"]
+    # both
+    r2 = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "x", "path": "specs/a.md"},
+    )
+    assert "error" in r2 and "exactly one" in r2["error"]
+    # artifact_id not yet supported
+    r3 = await harness.call(
+        "review_artifact", {"kind": "fr", "project": "p", "artifact_id": "art_x"}
+    )
+    assert "error" in r3 and "artifact_id" in r3["error"]
+
+
+async def test_review_artifact_path_ingestion_via_git_show(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    import reviewer.agent as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod,
+        "_git_show_text",
+        lambda root, sha, rel, *, git_binary: "# Spec from base SHA\n\nbody",
+    )
+
+    await harness.call(
+        "review_artifact",
+        {
+            "kind": "fr",
+            "project": "khonliang-reviewer",
+            "path": "specs/MS-B/spec.md",
+            "repo_root": "/tmp/repo",
+            "base_sha": "deadbeef",
+        },
+    )
+
+    assert ollama.last_request is not None
+    assert ollama.last_request.content == "# Spec from base SHA\n\nbody"
+
+
+async def test_review_artifact_path_missing_repo_context_errors():
+    harness = _make_harness()
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "path": "specs/a.md"},
+    )
+    assert "error" in res
+    assert "repo_root" in res["error"] and "base_sha" in res["error"]
+
+
 async def test_rule_table_routes_large_diff_to_claude():
     """≥2000 lines (or ≥20 files) → claude_cli per rule table."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
