@@ -31,6 +31,7 @@ import re
 import sys
 import typing
 import uuid
+from pathlib import Path
 from typing import Any
 
 from khonliang_bus import BaseAgent, Skill, Welcome, WelcomeEntryPoint, handler
@@ -55,6 +56,8 @@ from reviewer.config.prompts import (
 from reviewer.config.repo import (
     RepoConfig,
     RepoConfigUnreachableError,
+    _assert_base_sha_reachable,
+    _git_show_text,
     load as load_repo_config,
     provider_to_vendor,
 )
@@ -236,6 +239,92 @@ def _resolve_audience(value: Any) -> Audience:
             f"{sorted(_VALID_AUDIENCES)}"
         )
     return value  # type: ignore[return-value]
+
+
+class ArtifactKindError(ValueError):
+    """Raised when ``review_artifact``'s ``kind`` isn't a valid artifact type.
+
+    Subclass of :class:`ValueError`; the handler maps it to a structured
+    error response so the caller can fix the bad arg.
+    """
+
+
+#: Planning-artifact review kinds accepted by ``review_artifact``. Kept in
+#: sync with ``reviewer.providers._prompt._ARTIFACT_KINDS`` and the
+#: ``_artifact_design_kind`` / ``_docs_kind`` predicates in the rule table.
+_VALID_ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
+
+
+def _resolve_artifact_kind(value: Any) -> str:
+    """Validate ``review_artifact``'s required ``kind`` arg.
+
+    Unlike ``audience`` there is no safe default — an artifact review with
+    no kind can't pick a rubric or provider, so an empty / unknown value
+    raises :class:`ArtifactKindError`.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ArtifactKindError(
+            "kind is required and must be one of "
+            f"{sorted(_VALID_ARTIFACT_KINDS)}"
+        )
+    kind = value.strip()
+    if kind not in _VALID_ARTIFACT_KINDS:
+        raise ArtifactKindError(
+            f"kind={kind!r} is not a valid artifact kind; expected one of "
+            f"{sorted(_VALID_ARTIFACT_KINDS)}"
+        )
+    return kind
+
+
+def _resolve_artifact_content(args: dict[str, Any]) -> tuple[str | None, dict | None]:
+    """Resolve the artifact body from exactly one ingestion source.
+
+    Accepts raw ``content`` or a repo ``path`` resolved from ``base_sha``
+    (via ``git show`` — same base-branch trust boundary as the ``.reviewer/``
+    loaders). Returns ``(content, None)`` on success or ``(None, error)`` on
+    failure. ``artifact_id`` (bus-artifact fetch) is deferred to Phase B and
+    rejected with a hint here.
+    """
+    if args.get("artifact_id"):
+        return None, {
+            "error": (
+                "artifact_id ingestion is not yet supported; pass `content` "
+                "(raw markdown) or `path` (+ repo_root + base_sha)"
+            )
+        }
+    content = args.get("content")
+    path = args.get("path")
+    has_content = isinstance(content, str) and content.strip()
+    has_path = isinstance(path, str) and path.strip()
+    if has_content and has_path:
+        return None, {"error": "provide exactly one of `content` or `path`, not both"}
+    if has_content:
+        return content, None
+    if has_path:
+        repo_root = str(args.get("repo_root") or "").strip()
+        base_sha = str(args.get("base_sha") or "").strip()
+        if not repo_root or not base_sha:
+            return None, {
+                "error": "`path` ingestion requires `repo_root` and `base_sha`"
+            }
+        # Probe reachability first so a shallow clone / unreachable base_sha
+        # surfaces a targeted fetch-depth hint instead of being mistaken for a
+        # missing file (same gating as the .reviewer/ loaders).
+        try:
+            _assert_base_sha_reachable(Path(repo_root), base_sha, git_binary="git")
+        except RepoConfigUnreachableError as exc:
+            return None, {"error": str(exc), "error_category": "base_sha_unreachable"}
+        text = _git_show_text(
+            Path(repo_root), base_sha, path.strip(), git_binary="git"
+        )
+        if text is None or not text.strip():
+            return None, {
+                "error": f"artifact path {path.strip()!r} not found at base_sha {base_sha!r}"
+            }
+        return text, None
+    return None, {
+        "error": "review_artifact requires exactly one ingestion source: `content` or `path`"
+    }
 
 
 class DistillOverrideError(ValueError):
@@ -994,6 +1083,10 @@ class ReviewerAgent(BaseAgent):
                 when_to_use="review free-form code or text snippets that aren't a diff or PR",
             ),
             WelcomeEntryPoint(
+                skill="review_artifact",
+                when_to_use="review a planning artifact (FR / spec / milestone) as a full document with a per-kind rubric",
+            ),
+            WelcomeEntryPoint(
                 skill="usage_summary",
                 when_to_use="token + cost summary across recent calls; useful for budget tracking",
             ),
@@ -1202,6 +1295,38 @@ class ReviewerAgent(BaseAgent):
                     "severity_floor": {"type": "string", "default": ""},
                 },
                 since="0.1.0",
+            ),
+            Skill(
+                "review_artifact",
+                "Review a planning artifact (FR / spec / milestone) as a full "
+                "document with a per-kind rubric — sibling to review_diff for "
+                "the diff path. `kind` (fr|spec|milestone) and `project` are "
+                "required. Provide the artifact body by exactly one of: "
+                "`content` (raw markdown), or `path` + `repo_root` + `base_sha` "
+                "(resolved from base-branch HEAD via git show). spec/milestone "
+                "route to claude_cli, fr to ollama qwen. Findings anchor to a "
+                "named `section` rather than a diff line. (`artifact_id` "
+                "ingestion + persisted review history land in a later phase of "
+                "fr_reviewer_19c871ab.)",
+                {
+                    "kind": {"type": "string", "required": True},
+                    "project": {"type": "string", "required": True},
+                    "content": {"type": "string", "default": ""},
+                    "path": {"type": "string", "default": ""},
+                    "repo_root": {"type": "string", "default": ""},
+                    "base_sha": {"type": "string", "default": ""},
+                    # Optional provenance threaded into finding metadata.
+                    "fr_id": {"type": "string", "default": ""},
+                    "spec_id": {"type": "string", "default": ""},
+                    "ms_id": {"type": "string", "default": ""},
+                    "instructions": {"type": "string", "default": ""},
+                    "backend": {"type": "string", "default": ""},
+                    "model": {"type": "string", "default": ""},
+                    "request_id": {"type": "string", "default": ""},
+                    "severity_floor": {"type": "string", "default": ""},
+                    "num_ctx": {"type": "integer", "default": 0},
+                },
+                since="0.3.0",
             ),
             Skill(
                 "sign_off_trailer",
@@ -2108,6 +2233,57 @@ class ReviewerAgent(BaseAgent):
                 "event": event,
             },
         }
+
+    @handler("review_artifact")
+    async def handle_review_artifact(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Review a planning artifact (FR / spec / milestone) as a full document.
+
+        Sibling to ``review_diff``/``review_pr`` for the artifact-review
+        pipeline (fr_reviewer_19c871ab). Validates the artifact ``kind`` +
+        ``project``, resolves the body from exactly one ingestion source
+        (raw ``content`` or repo ``path`` at ``base_sha``), threads provenance
+        ids into the request metadata, then forwards to ``review_text`` — which
+        applies the full-document framing + per-kind rubric (prompt assembly)
+        and the spec/milestone→claude / fr→qwen routing (rule table).
+        """
+        try:
+            kind = _resolve_artifact_kind(args.get("kind"))
+        except ArtifactKindError as exc:
+            return {"error": str(exc)}
+
+        project = str(args.get("project") or "").strip()
+        if not project:
+            return {"error": "project is required for review_artifact"}
+
+        content, ingest_error = _resolve_artifact_content(args)
+        if ingest_error is not None:
+            return ingest_error
+
+        # Provenance threaded into metadata so findings (and Phase-B
+        # persistence) can reconstruct which artifact was reviewed.
+        # Caller-supplied metadata is merged under the provenance keys, which
+        # win on conflict.
+        metadata: dict[str, Any] = {}
+        caller_meta = args.get("metadata")
+        if isinstance(caller_meta, dict):
+            metadata.update(caller_meta)
+        metadata["project"] = project
+        for key in ("fr_id", "spec_id", "ms_id"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                metadata[key] = val.strip()
+
+        # Forward to the review_text core. Strip the artifact-only args so they
+        # don't leak into review_text (which would ignore them anyway).
+        _artifact_only = {
+            "kind", "content", "path", "repo_root", "base_sha", "project",
+            "fr_id", "spec_id", "ms_id", "metadata", "artifact_id",
+        }
+        forwarded = {k: v for k, v in args.items() if k not in _artifact_only}
+        forwarded["kind"] = kind
+        forwarded["content"] = content
+        forwarded["metadata"] = metadata
+        return await self.handle_review_text(forwarded)
 
     @handler("sign_off_trailer")
     async def handle_sign_off_trailer(

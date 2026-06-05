@@ -344,6 +344,30 @@ async def test_non_object_json_content_errored():
     assert "not a JSON object" in result.error
 
 
+async def test_section_field_parses_for_artifact_findings():
+    # Artifact reviews anchor findings to a named section (fr_reviewer_19c871ab).
+    content = json.dumps(
+        {
+            "summary": "spec review",
+            "findings": [
+                {
+                    "severity": "concern",
+                    "title": "Acceptance untestable",
+                    "body": "no observable signal",
+                    "section": "§Acceptance Criteria",
+                },
+                # non-string section is coerced to None at the boundary
+                {"severity": "nit", "title": "t", "body": "b", "section": 123},
+            ],
+        }
+    )
+    http = _make_http(post_response=_FakeResponse(json_data=_native_response(content)))
+    result = await OllamaProvider(http_client=http).review(_make_request())
+    assert result.findings[0].section == "§Acceptance Criteria"
+    assert result.findings[0].line is None
+    assert result.findings[1].section is None
+
+
 async def test_findings_filters_non_dict_items():
     content = json.dumps(
         {

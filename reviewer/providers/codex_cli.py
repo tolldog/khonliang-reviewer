@@ -439,6 +439,7 @@ def _parse_payload(
             path=item.get("path") if isinstance(item.get("path"), str) else None,
             line=_int_or_none(item.get("line")),
             suggestion=item.get("suggestion") if isinstance(item.get("suggestion"), str) else None,
+            section=item.get("section") if isinstance(item.get("section"), str) else None,
         )
         for item in raw_findings
         if isinstance(item, dict)
