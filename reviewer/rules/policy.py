@@ -119,8 +119,26 @@ def _long_context_diff(inp: PolicyInput) -> bool:
 
 
 def _docs_kind(inp: PolicyInput) -> bool:
-    """Kinds that are likely short / free-form text (spec, doc, pr_description)."""
-    return inp.kind in {"spec", "doc", "pr_description", "fr"}
+    """Light text kinds — cheap qwen suffices (doc, pr_description, fr).
+
+    ``fr`` is a pre-design seed: a duplicate/target/dead-dep sanity pass, not
+    full design rigor, so the cheap local model is the right tool. ``spec`` and
+    ``milestone`` are handled by :func:`_artifact_design_kind` (claude) — full
+    design documents that gate code work and reward Claude's priors.
+    """
+    return inp.kind in {"doc", "pr_description", "fr"}
+
+
+def _artifact_design_kind(inp: PolicyInput) -> bool:
+    """Design-rigor artifact kinds — specs and milestones route to Claude.
+
+    These are full planning documents (a spec is 5K-25K+ tokens; a milestone's
+    FR cluster needs holistic coherence judgement) that gate downstream code
+    work. Claude's priors earn their keep here, and the CLI handles the large
+    context transparently — no diff-size signal applies (artifact reviews carry
+    no diff).
+    """
+    return inp.kind in {"spec", "milestone"}
 
 
 DEFAULT_RULES: list[Rule] = [
@@ -146,7 +164,21 @@ DEFAULT_RULES: list[Rule] = [
             reason=">=2000 diff lines or >=20 files — architectural review",
         ),
     ),
-    # Docs / spec / FR reviews: short, cheap, qwen is fine.
+    # Design artifacts (specs, milestones): full documents that gate code —
+    # route to Claude for design-rigor reasoning over the whole artifact.
+    # Placed before the docs/qwen rule so spec/milestone win; the diff-size
+    # rules above don't fire for artifact reviews (no diff).
+    Rule(
+        name="artifact_design_kind_to_claude",
+        predicate=_artifact_design_kind,
+        decision=PolicyDecision(
+            backend="claude_cli",
+            model="claude",
+            context_window_floor=CTX_LARGE,
+            reason="design artifact (spec/milestone) — full-document review on claude",
+        ),
+    ),
+    # Light text kinds (doc / pr_description / fr): short, cheap, qwen is fine.
     Rule(
         name="docs_kind_to_qwen_small",
         predicate=_docs_kind,
@@ -154,7 +186,7 @@ DEFAULT_RULES: list[Rule] = [
             backend="ollama",
             model="qwen2.5-coder:14b",
             context_window_floor=CTX_SMALL,
-            reason="text-kind review (spec/doc/fr/pr_description) — qwen2.5-coder:14b suffices",
+            reason="text-kind review (doc/fr/pr_description) — qwen2.5-coder:14b suffices",
         ),
     ),
 ]

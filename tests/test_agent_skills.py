@@ -272,8 +272,8 @@ async def test_review_text_forwards_instructions_and_context():
     await harness.call(
         "review_text",
         {
-            "kind": "spec",
-            "content": "spec body",
+            "kind": "fr",
+            "content": "fr body",
             "instructions": "prioritize correctness",
             "context": {"repo_profile": "python-async"},
         },
@@ -1219,9 +1219,27 @@ async def test_review_text_empty_content_falls_through_to_diff():
 
 
 async def test_rule_table_routes_docs_kind_to_ollama():
-    """A spec / doc / fr review (no override) → ollama + qwen2.5-coder:14b per rule table."""
+    """A doc / fr / pr_description review (no override) → ollama + qwen2.5-coder:14b."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
     claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_text",
+        {"kind": "fr", "content": "# A small FR\n\nContent."},
+    )
+
+    assert ollama.last_request is not None
+    assert claude.last_request is None
+    assert ollama.last_request.metadata["model"] == "qwen2.5-coder:14b"
+
+
+async def test_rule_table_routes_design_artifact_to_claude():
+    """A spec / milestone review (no override) → claude_cli per rule table."""
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider(
+        "claude_cli", _make_result(backend="claude_cli", model="claude")
+    )
     harness = _make_harness({"ollama": ollama, "claude_cli": claude})
 
     await harness.call(
@@ -1229,9 +1247,9 @@ async def test_rule_table_routes_docs_kind_to_ollama():
         {"kind": "spec", "content": "# A small spec\n\nContent."},
     )
 
-    assert ollama.last_request is not None
-    assert claude.last_request is None
-    assert ollama.last_request.metadata["model"] == "qwen2.5-coder:14b"
+    assert claude.last_request is not None
+    assert ollama.last_request is None
+    assert claude.last_request.metadata["model"] == "claude"
 
 
 async def test_rule_table_routes_large_diff_to_claude():

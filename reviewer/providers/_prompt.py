@@ -34,6 +34,8 @@ everything else falls back to markdown fences.
 
 from __future__ import annotations
 
+import functools
+import importlib.resources
 import json
 import logging
 import re
@@ -150,6 +152,45 @@ _DOC_REVIEW_INSTRUCTION = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Artifact review (fr_reviewer_19c871ab)
+# ---------------------------------------------------------------------------
+#: Planning-artifact review kinds. These carry a whole document (an FR, a
+#: spec, a milestone) — not a diff — so they skip the diff-hunk classifier and
+#: get a full-document framing instruction plus a per-kind rubric.
+_ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
+
+#: Prepended for artifact reviews. The reviewer is reading a whole planning
+#: document, not a code change, so findings are holistic and anchor to a named
+#: SECTION (e.g. "§Acceptance Criteria"), not a line number.
+_ARTIFACT_REVIEW_INSTRUCTION = (
+    "NOTE: this is a complete planning artifact (not a diff). Review the "
+    "document AS A WHOLE for internal consistency against the rubric below. "
+    "Each finding must anchor to a named section via the 'section' field "
+    "(e.g. \"§Acceptance Criteria\"); leave 'line' unset — there are no diff "
+    "lines. Do not summarize the artifact; critique it. If it is sound, "
+    "return zero findings."
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _builtin_kind_rubric(kind: str) -> str | None:
+    """Return the packaged ``{kind}_rubric.md`` text, or ``None`` if absent.
+
+    Built-in rubrics ship under ``reviewer/data/prompts/`` and are the
+    fallback when a repo doesn't override the rubric via
+    ``.reviewer/prompts/{kind}_rubric.md``. Cached — the files don't change
+    within a process. Same resource-loading pattern as
+    ``reviewer/tools/benchmark_sweep.py``.
+    """
+    try:
+        res = importlib.resources.files("reviewer.data.prompts") / f"{kind}_rubric.md"
+        text = res.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return None
+    return text if text.strip() else None
+
+
 def classify_diff_content(content: str) -> str:
     """Classify a diff payload as ``"doc"``, ``"code"``, or ``"mixed"`` by
     its ADDED lines (fr_reviewer_1262ce18).
@@ -260,6 +301,20 @@ def build_review_prompt(
         )
         if classification == "doc":
             lines += [_DOC_REVIEW_INSTRUCTION, ""]
+    elif request.kind in _ARTIFACT_KINDS:
+        # Full-document framing + per-kind rubric. A repo override
+        # (.reviewer/prompts/<kind>_rubric.md, surfaced via RepoPrompts)
+        # wins over the packaged built-in fallback. Built-in fires even when
+        # repo_prompts is None (the raw-content ingestion path).
+        from reviewer.config.prompts import RepoPrompts  # cold-path local import
+
+        lines += [_ARTIFACT_REVIEW_INSTRUCTION, ""]
+        rubric: str | None = None
+        if isinstance(repo_prompts, RepoPrompts):
+            rubric = repo_prompts.kind_rubrics.get(request.kind)
+        rubric = rubric or _builtin_kind_rubric(request.kind)
+        if rubric:
+            lines += [f"## {request.kind.capitalize()} Rubric", "", rubric.rstrip(), ""]
 
     # Repo-side additions land between the built-in system and the
     # task-shape details (schema / instructions / context). An empty

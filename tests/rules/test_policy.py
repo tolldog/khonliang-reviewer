@@ -38,12 +38,23 @@ def test_small_code_diff_hits_fallback():
 
 
 def test_docs_kind_routes_to_qwen_small():
-    for kind in ("spec", "doc", "fr", "pr_description"):
+    # fr stays a cheap seed-phase pass; spec/milestone now route to claude.
+    for kind in ("doc", "fr", "pr_description"):
         decision = decide(PolicyInput(kind=kind, diff_line_count=20))
         assert decision.backend == "ollama"
         assert decision.model == "qwen2.5-coder:14b"
         assert decision.context_window_floor == CTX_SMALL
         assert "text-kind" in decision.reason
+
+
+def test_design_artifact_kinds_route_to_claude():
+    # Specs and milestones are full design documents → claude, large context.
+    for kind in ("spec", "milestone"):
+        decision = decide(PolicyInput(kind=kind))
+        assert decision.backend == "claude_cli"
+        assert decision.model == "claude"
+        assert decision.context_window_floor == CTX_LARGE
+        assert "design artifact" in decision.reason
 
 
 def test_large_diff_routes_to_claude():

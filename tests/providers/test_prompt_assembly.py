@@ -406,3 +406,32 @@ def test_doc_routing_gated_on_pr_diff_kind():
     # through the artifact-review pipeline, not doc-hunk routing).
     prompt = build_review_prompt(ReviewRequest(kind="spec", content=_MD_DIFF))
     assert "CRITIQUE, do not summarize" not in prompt
+
+
+# -- artifact review (fr_reviewer_19c871ab) ---------------------------
+
+
+def test_artifact_kinds_get_full_doc_instruction_and_builtin_rubric():
+    for kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(ReviewRequest(kind=kind, content="# Doc\n\nbody"))
+        # full-document framing, not diff framing
+        assert "complete planning artifact" in prompt
+        assert "anchor to a named section" in prompt
+        # packaged built-in rubric injected under a per-kind header
+        assert f"## {kind.capitalize()} Rubric" in prompt
+
+
+def test_artifact_repo_rubric_override_wins_over_builtin():
+    rp = RepoPrompts(kind_rubrics={"spec": "REPO-SPECIFIC SPEC RUBRIC TEXT"})
+    prompt = build_review_prompt(
+        ReviewRequest(kind="spec", content="# Spec\n\nbody"), repo_prompts=rp
+    )
+    assert "REPO-SPECIFIC SPEC RUBRIC TEXT" in prompt
+    assert "## Spec Rubric" in prompt
+
+
+def test_pr_diff_has_no_artifact_instruction():
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content="+++ b/a.py\n@@ -1 +1 @@\n+x = 1\n")
+    )
+    assert "complete planning artifact" not in prompt

@@ -89,6 +89,12 @@ logger = logging.getLogger(__name__)
 #: examples-assembly tests.
 _SEVERITY_ORDER: tuple[str, ...] = ("nit", "comment", "concern")
 
+#: Artifact-review kinds whose ``.reviewer/prompts/<kind>_rubric.md`` override
+#: the loader will read (fr_reviewer_19c871ab). Kept in sync with
+#: ``reviewer.providers._prompt._ARTIFACT_KINDS``; the packaged built-in
+#: rubrics under ``reviewer/data/prompts/`` are the fallback.
+_ARTIFACT_RUBRIC_KINDS: tuple[str, ...] = ("fr", "spec", "milestone")
+
 
 @dataclass(frozen=True)
 class RepoPrompts:
@@ -126,6 +132,13 @@ class RepoPrompts:
     #: Consumers filter by ``kind`` at prompt-assembly time so a
     #: ``pr_diff`` review never sees ``spec`` examples (and vice versa).
     examples: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    #: Per-kind rubric overrides from ``.reviewer/prompts/<kind>_rubric.md``
+    #: (e.g. ``"spec"`` → text of ``spec_rubric.md``). Empty when the repo
+    #: ships no per-kind rubric; the prompt assembler then falls back to the
+    #: packaged built-in under ``reviewer/data/prompts/``. Only the
+    #: artifact-review kinds (``fr`` / ``spec`` / ``milestone``) are loaded.
+    kind_rubrics: dict[str, str] = field(default_factory=dict)
 
     #: Base SHA this snapshot was loaded from. Kept for diagnostics +
     #: symmetry with :class:`reviewer.config.repo.RepoConfig`.
@@ -259,10 +272,26 @@ def load_repo_prompts(
                 if text:
                     examples[(kind_name, severity)] = text
 
+    # Per-kind rubric overrides (artifact-review kinds only). Only read the
+    # files actually listed in the prompts/ tree — no speculative git calls
+    # for repos that don't ship per-kind rubrics. The prompt assembler falls
+    # back to the packaged built-in when a kind isn't present here.
+    kind_rubrics: dict[str, str] = {}
+    for kind_name in _ARTIFACT_RUBRIC_KINDS:
+        file_name = f"{kind_name}_rubric.md"
+        if file_name not in tree_entries:
+            continue
+        text = _read_optional(
+            root, base_sha, f"{prompts_dir}/{file_name}", git_binary=git_binary
+        )
+        if text:
+            kind_rubrics[kind_name] = text
+
     return RepoPrompts(
         system_preamble=system_preamble,
         severity_rubric=severity_rubric,
         examples=examples,
+        kind_rubrics=kind_rubrics,
         base_sha=base_sha,
     )
 

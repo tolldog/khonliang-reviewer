@@ -140,6 +140,30 @@ def test_reads_from_base_sha_not_working_tree(git_repo: Path) -> None:
     assert prompts.severity_rubric == "LEGIT RUBRIC\n"
 
 
+def test_loads_per_kind_rubric_overrides(git_repo: Path) -> None:
+    """`.reviewer/prompts/<kind>_rubric.md` populates RepoPrompts.kind_rubrics."""
+    _write(git_repo / ".reviewer" / "prompts" / "spec_rubric.md", "REPO SPEC RUBRIC\n")
+    _write(git_repo / ".reviewer" / "prompts" / "fr_rubric.md", "REPO FR RUBRIC\n")
+    sha = _commit_all(git_repo)
+
+    prompts = load_repo_prompts(git_repo, base_sha=sha)
+    assert prompts.kind_rubrics["spec"] == "REPO SPEC RUBRIC\n"
+    assert prompts.kind_rubrics["fr"] == "REPO FR RUBRIC\n"
+    # milestone_rubric.md absent → not present (falls back to built-in at assembly)
+    assert "milestone" not in prompts.kind_rubrics
+
+
+def test_kind_rubrics_empty_when_absent(git_repo: Path) -> None:
+    """A repo shipping only a severity rubric has no per-kind overrides."""
+    _write(
+        git_repo / ".reviewer" / "prompts" / "severity_rubric.md", "GENERIC\n"
+    )
+    sha = _commit_all(git_repo)
+
+    prompts = load_repo_prompts(git_repo, base_sha=sha)
+    assert prompts.kind_rubrics == {}
+
+
 def test_pr_branch_cannot_inject_example(git_repo: Path) -> None:
     """Adding a new example on the working tree doesn't appear in the load."""
     _write(
