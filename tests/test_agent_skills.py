@@ -1350,6 +1350,9 @@ async def test_review_artifact_path_ingestion_via_git_show(monkeypatch):
     import reviewer.agent as agent_mod
 
     monkeypatch.setattr(
+        agent_mod, "_assert_base_sha_reachable", lambda root, sha, *, git_binary: None
+    )
+    monkeypatch.setattr(
         agent_mod,
         "_git_show_text",
         lambda root, sha, rel, *, git_binary: "# Spec from base SHA\n\nbody",
@@ -1368,6 +1371,31 @@ async def test_review_artifact_path_ingestion_via_git_show(monkeypatch):
 
     assert ollama.last_request is not None
     assert ollama.last_request.content == "# Spec from base SHA\n\nbody"
+
+
+async def test_review_artifact_path_shallow_clone_surfaces_hint(monkeypatch):
+    harness = _make_harness()
+    import reviewer.agent as agent_mod
+    from reviewer.config.repo import RepoConfigUnreachableError
+
+    def _raise(root, sha, *, git_binary):
+        raise RepoConfigUnreachableError("base SHA not reachable; set fetch-depth: 0")
+
+    monkeypatch.setattr(agent_mod, "_assert_base_sha_reachable", _raise)
+
+    res = await harness.call(
+        "review_artifact",
+        {
+            "kind": "spec",
+            "project": "p",
+            "path": "specs/a.md",
+            "repo_root": "/tmp/repo",
+            "base_sha": "deadbeef",
+        },
+    )
+    assert "error" in res
+    assert "fetch-depth" in res["error"]
+    assert res.get("error_category") == "base_sha_unreachable"
 
 
 async def test_review_artifact_path_missing_repo_context_errors():

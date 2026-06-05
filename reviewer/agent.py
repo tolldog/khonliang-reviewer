@@ -56,6 +56,7 @@ from reviewer.config.prompts import (
 from reviewer.config.repo import (
     RepoConfig,
     RepoConfigUnreachableError,
+    _assert_base_sha_reachable,
     _git_show_text,
     load as load_repo_config,
     provider_to_vendor,
@@ -306,6 +307,13 @@ def _resolve_artifact_content(args: dict[str, Any]) -> tuple[str | None, dict | 
             return None, {
                 "error": "`path` ingestion requires `repo_root` and `base_sha`"
             }
+        # Probe reachability first so a shallow clone / unreachable base_sha
+        # surfaces a targeted fetch-depth hint instead of being mistaken for a
+        # missing file (same gating as the .reviewer/ loaders).
+        try:
+            _assert_base_sha_reachable(Path(repo_root), base_sha, git_binary="git")
+        except RepoConfigUnreachableError as exc:
+            return None, {"error": str(exc), "error_category": "base_sha_unreachable"}
         text = _git_show_text(
             Path(repo_root), base_sha, path.strip(), git_binary="git"
         )
