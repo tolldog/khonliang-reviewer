@@ -2498,7 +2498,13 @@ class ReviewerAgent(BaseAgent):
         fr_ids = milestone.get("fr_ids")
         if not isinstance(fr_ids, list):
             return []
-        return [str(x).strip() for x in fr_ids if isinstance(x, str) and x.strip()]
+        # Order-preserving dedup — a milestone cluster with duplicate ids must
+        # not cause redundant developer fetches / duplicate findings.
+        return list(
+            dict.fromkeys(
+                x.strip() for x in fr_ids if isinstance(x, str) and x.strip()
+            )
+        )
 
     @handler("review_artifact")
     async def handle_review_artifact(self, args: dict[str, Any]) -> dict[str, Any]:

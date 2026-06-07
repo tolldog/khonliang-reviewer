@@ -1866,6 +1866,30 @@ async def test_cross_reference_derives_cluster_from_ms_id(monkeypatch):
     assert "fr_dead" in xref[0]["title"] and "archived" in xref[0]["title"]
 
 
+async def test_cross_reference_ms_cluster_dedupes(monkeypatch):
+    # A milestone cluster with duplicate fr_ids -> one fetch / finding each.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    fr_fetches: list[str] = []
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": {"fr_ids": ["fr_dup", "fr_dup"]}}}
+        if operation == "get_fr_local":
+            fr_fetches.append(args["fr_id"])
+            return {"result": {"id": args["fr_id"], "status": "archived"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_x"},
+    )
+    assert fr_fetches == ["fr_dup"]
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+
+
 async def test_cross_reference_explicit_ids_beat_ms_id(monkeypatch):
     # Explicit related_fr_ids → milestone is NOT fetched.
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
