@@ -1685,6 +1685,119 @@ async def test_get_review_not_found_errors(monkeypatch):
     assert "art_missing" in res["error"]
 
 
+# -- review_artifact cross-reference (fr_reviewer_19c871ab B3) ---------
+
+
+def _fake_bus_crossref(monkeypatch, harness, *, fr_status):
+    """Fake developer get_fr_local + store artifact_create.
+
+    ``fr_status``: fr_id -> status string; a value of None simulates not-found.
+    """
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if agent_type == "developer" and operation == "get_fr_local":
+            fid = args.get("fr_id")
+            st = fr_status.get(fid, None)
+            if st is None:
+                return {"result": {"error": "not found", "fr_id": fid}}
+            return {"result": {"id": fid, "status": st}}
+        if operation == "artifact_create":
+            return {"result": {"id": "art_rev"}}
+        return {"result": {"error": f"unexpected {agent_type}.{operation}"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+
+
+async def test_cross_reference_flags_archived_fr(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    _fake_bus_crossref(monkeypatch, harness, fr_status={"fr_dead": "archived"})
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS\n\nbody",
+         "related_fr_ids": ["fr_dead"]},
+    )
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+    assert "archived" in xref[0]["title"]
+    assert xref[0]["section"] == "§References"
+    assert xref[0]["severity"] == "concern"
+
+
+async def test_cross_reference_flags_missing_fr(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    _fake_bus_crossref(monkeypatch, harness, fr_status={})  # all not-found
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS",
+         "related_fr_ids": ["fr_ghost"]},
+    )
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+    assert "not found" in xref[0]["title"]
+
+
+async def test_cross_reference_clean_active_frs_no_findings(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    _fake_bus_crossref(
+        monkeypatch, harness,
+        fr_status={"fr_a": "open", "fr_b": "in_progress", "fr_c": "merged"},
+    )
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS",
+         "related_fr_ids": ["fr_a", "fr_b", "fr_c"]},
+    )
+    # open/in_progress/merged are healthy — no cross-reference findings.
+    assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
+
+
+async def test_cross_reference_developer_unreachable_non_fatal():
+    # No fake → self.request hits the mock bus and raises → cross-ref skipped,
+    # review still succeeds.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS",
+         "related_fr_ids": ["fr_a"], "persist": False},
+    )
+    assert not res.get("error")
+    assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
+
+
+async def test_cross_reference_persists_with_review(monkeypatch):
+    # Cross-ref findings are appended before persistence, so the stored review
+    # includes them.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    captured = {}
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if agent_type == "developer" and operation == "get_fr_local":
+            return {"result": {"id": args["fr_id"], "status": "archived"}}
+        if operation == "artifact_create":
+            captured["content"] = args["content"]
+            return {"result": {"id": "art_rev"}}
+        return {"result": {"error": "unexpected"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS",
+         "related_fr_ids": ["fr_dead"]},
+    )
+    stored = _json.loads(captured["content"])
+    assert any(
+        f.get("category") == "cross-reference" for f in stored.get("findings", [])
+    )
+
+
 async def test_rule_table_routes_large_diff_to_claude():
     """≥2000 lines (or ≥20 files) → claude_cli per rule table."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
