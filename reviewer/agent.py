@@ -1348,7 +1348,9 @@ class ReviewerAgent(BaseAgent):
                 "anchor to a named `section` rather than a diff line. "
                 "`related_fr_ids` (FR ids the artifact references) are "
                 "cross-checked against the developer store — dangling or "
-                "archived references become concern findings. On success the "
+                "archived references become concern findings; if `ms_id` is "
+                "given without `related_fr_ids`, the milestone's FR cluster is "
+                "fetched and cross-checked. On success the "
                 "result is persisted as a store artifact (append-only review "
                 "history) and its id returned as `review_artifact_id`; pass "
                 "`persist=false` to skip.",
@@ -2470,6 +2472,34 @@ class ReviewerAgent(BaseAgent):
                 )
         return findings
 
+    async def _milestone_fr_ids(self, ms_id: str) -> list[str]:
+        """Best-effort fetch of a milestone's FR cluster (``fr_ids``).
+
+        Lets a spec / milestone review cross-reference the milestone's *actual*
+        cluster when the caller passes ``ms_id`` but no explicit
+        ``related_fr_ids``. Developer unreachable / unknown milestone / bad
+        shape all return ``[]`` (cross-reference is best-effort).
+        """
+        try:
+            resp = await self.request(
+                agent_type="developer",
+                operation="get_milestone",
+                args={"milestone_id": ms_id},
+            )
+        except Exception as exc:  # developer unreachable / transport error
+            logger.warning(
+                "milestone cluster fetch skipped (developer unreachable): %s", exc
+            )
+            return []
+        payload = _unwrap(resp)
+        milestone = payload.get("milestone") if isinstance(payload, dict) else None
+        if not isinstance(milestone, dict):
+            return []
+        fr_ids = milestone.get("fr_ids")
+        if not isinstance(fr_ids, list):
+            return []
+        return [str(x).strip() for x in fr_ids if isinstance(x, str) and x.strip()]
+
     @handler("review_artifact")
     async def handle_review_artifact(self, args: dict[str, Any]) -> dict[str, Any]:
         """Review a planning artifact (FR / spec / milestone) as a full document.
@@ -2564,10 +2594,15 @@ class ReviewerAgent(BaseAgent):
             if isinstance(raw_ids, list)
             else []
         )
-        if related_fr_ids and isinstance(result, dict) and not result.get("error"):
-            xref = await self._cross_reference_frs(related_fr_ids)
-            if xref:
-                result.setdefault("findings", []).extend(xref)
+        if isinstance(result, dict) and not result.get("error"):
+            # No explicit related_fr_ids but an ms_id was supplied → derive the
+            # cross-reference set from the milestone's actual FR cluster.
+            if not related_fr_ids and provenance.get("ms_id"):
+                related_fr_ids = await self._milestone_fr_ids(provenance["ms_id"])
+            if related_fr_ids:
+                xref = await self._cross_reference_frs(related_fr_ids)
+                if xref:
+                    result.setdefault("findings", []).extend(xref)
 
         # Best-effort, append-only persistence (review history). A store
         # failure never fails the review — the result is the deliverable.
