@@ -1345,8 +1345,11 @@ class ReviewerAgent(BaseAgent):
                 "(fetched from the store — e.g. a milestone draft_spec, so a "
                 "freshly-proposed artifact is reviewable without a disk commit). "
                 "spec/milestone route to claude_cli, fr to ollama qwen. Findings "
-                "anchor to a named `section` rather than a diff line. On success "
-                "the result is persisted as a store artifact (append-only review "
+                "anchor to a named `section` rather than a diff line. "
+                "`related_fr_ids` (FR ids the artifact references) are "
+                "cross-checked against the developer store — dangling or "
+                "archived references become concern findings. On success the "
+                "result is persisted as a store artifact (append-only review "
                 "history) and its id returned as `review_artifact_id`; pass "
                 "`persist=false` to skip.",
                 {
@@ -1363,6 +1366,11 @@ class ReviewerAgent(BaseAgent):
                     "fr_id": {"type": "string", "default": ""},
                     "spec_id": {"type": "string", "default": ""},
                     "ms_id": {"type": "string", "default": ""},
+                    # FR ids the artifact references (e.g. a milestone's
+                    # cluster). Each is cross-checked against the developer FR
+                    # store; dangling / archived references become concern
+                    # findings appended to the review.
+                    "related_fr_ids": {"type": "array", "default": []},
                     # Persist the result as a store artifact (default true).
                     "persist": {"type": "boolean", "default": True},
                     "instructions": {"type": "string", "default": ""},
@@ -2382,6 +2390,86 @@ class ReviewerAgent(BaseAgent):
             return None
         return resp.get("id") or (resp.get("artifact") or {}).get("id")
 
+    async def _cross_reference_frs(
+        self, related_fr_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Deterministic cross-reference findings for referenced FR ids.
+
+        Fetches each FR from the developer agent and flags structural
+        problems an LLM rubric can't see reliably: a referenced FR that
+        doesn't exist (dangling reference) or is ``archived`` (an abandoned FR
+        clustered into an active artifact). ``completed`` / ``merged`` are
+        healthy terminal states and are NOT flagged. Best-effort — if the
+        developer agent is unreachable the whole pass is skipped (returns
+        ``[]``), never failing the review. Findings are ``concern``-severity,
+        ``section``-anchored to ``§References``.
+        """
+        findings: list[dict[str, Any]] = []
+        for fr_id in related_fr_ids:
+            try:
+                resp = await self.request(
+                    agent_type="developer",
+                    operation="get_fr_local",
+                    args={"fr_id": fr_id},
+                )
+            except Exception as exc:  # developer unreachable / transport error
+                logger.warning(
+                    "cross-reference skipped (developer unreachable): %s", exc
+                )
+                return []
+            fr = _unwrap(resp)
+            if not isinstance(fr, dict):
+                logger.warning(
+                    "cross-reference: unexpected response for %s; skipping", fr_id
+                )
+                continue
+            err = fr.get("error")
+            if err:
+                # Only a genuine "not found" is a dangling reference. Other
+                # errors (transient / transport) must NOT become false-positive
+                # findings — skip and log instead.
+                if "not found" not in str(err).lower():
+                    logger.warning(
+                        "cross-reference: developer error for %s (%s); skipping",
+                        fr_id,
+                        err,
+                    )
+                    continue
+                findings.append(
+                    {
+                        "severity": "concern",
+                        "title": f"Referenced FR {fr_id} not found",
+                        "body": (
+                            f"This artifact references {fr_id!r}, which does not "
+                            "exist in the developer FR store — a dangling reference."
+                        ),
+                        "category": "cross-reference",
+                        "path": None,
+                        "line": None,
+                        "section": "§References",
+                        "suggestion": None,
+                    }
+                )
+                continue
+            if str(fr.get("status") or "") == "archived":
+                findings.append(
+                    {
+                        "severity": "concern",
+                        "title": f"Referenced FR {fr_id} is archived",
+                        "body": (
+                            f"{fr_id!r} is archived (abandoned), but this artifact "
+                            "clusters/depends on it. Drop the reference or revive "
+                            "the FR."
+                        ),
+                        "category": "cross-reference",
+                        "path": None,
+                        "line": None,
+                        "section": "§References",
+                        "suggestion": None,
+                    }
+                )
+        return findings
+
     @handler("review_artifact")
     async def handle_review_artifact(self, args: dict[str, Any]) -> dict[str, Any]:
         """Review a planning artifact (FR / spec / milestone) as a full document.
@@ -2453,12 +2541,33 @@ class ReviewerAgent(BaseAgent):
         _artifact_only = {
             "kind", "content", "path", "repo_root", "base_sha", "project",
             "fr_id", "spec_id", "ms_id", "metadata", "artifact_id", "persist",
+            "related_fr_ids",
         }
         forwarded = {k: v for k, v in args.items() if k not in _artifact_only}
         forwarded["kind"] = kind
         forwarded["content"] = content
         forwarded["metadata"] = metadata
         result = await self.handle_review_text(forwarded)
+
+        # Deterministic cross-reference findings for any FR ids the artifact
+        # references (e.g. a milestone's cluster). Appended post-distill so the
+        # structural concerns always surface; runs only on a clean review.
+        raw_ids = args.get("related_fr_ids")
+        related_fr_ids = (
+            # Order-preserving dedup so duplicate ids don't cause redundant
+            # developer fetches or duplicate cross-reference findings.
+            list(
+                dict.fromkeys(
+                    x.strip() for x in raw_ids if isinstance(x, str) and x.strip()
+                )
+            )
+            if isinstance(raw_ids, list)
+            else []
+        )
+        if related_fr_ids and isinstance(result, dict) and not result.get("error"):
+            xref = await self._cross_reference_frs(related_fr_ids)
+            if xref:
+                result.setdefault("findings", []).extend(xref)
 
         # Best-effort, append-only persistence (review history). A store
         # failure never fails the review — the result is the deliverable.
