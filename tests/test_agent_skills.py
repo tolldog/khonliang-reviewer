@@ -1756,6 +1756,49 @@ async def test_cross_reference_clean_active_frs_no_findings(monkeypatch):
     assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
 
 
+async def test_cross_reference_transient_error_not_flagged(monkeypatch):
+    # A non-"not found" developer error (transient) must NOT become a
+    # false-positive dangling-reference finding.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if agent_type == "developer" and operation == "get_fr_local":
+            return {"result": {"error": "database is locked", "fr_id": args["fr_id"]}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "related_fr_ids": ["fr_x"]},
+    )
+    assert not res.get("error")
+    assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
+
+
+async def test_cross_reference_dedupes_related_ids(monkeypatch):
+    # Duplicate ids -> one fetch, one finding (not N).
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    fetches: list[str] = []
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if agent_type == "developer" and operation == "get_fr_local":
+            fetches.append(args["fr_id"])
+            return {"result": {"id": args["fr_id"], "status": "archived"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS",
+         "related_fr_ids": ["fr_dup", "fr_dup", "fr_dup"]},
+    )
+    assert fetches == ["fr_dup"]
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+
+
 async def test_cross_reference_developer_unreachable_non_fatal():
     # No fake → self.request hits the mock bus and raises → cross-ref skipped,
     # review still succeeds.

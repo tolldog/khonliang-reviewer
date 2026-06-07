@@ -2418,7 +2418,23 @@ class ReviewerAgent(BaseAgent):
                 )
                 return []
             fr = _unwrap(resp)
-            if not isinstance(fr, dict) or fr.get("error"):
+            if not isinstance(fr, dict):
+                logger.warning(
+                    "cross-reference: unexpected response for %s; skipping", fr_id
+                )
+                continue
+            err = fr.get("error")
+            if err:
+                # Only a genuine "not found" is a dangling reference. Other
+                # errors (transient / transport) must NOT become false-positive
+                # findings — skip and log instead.
+                if "not found" not in str(err).lower():
+                    logger.warning(
+                        "cross-reference: developer error for %s (%s); skipping",
+                        fr_id,
+                        err,
+                    )
+                    continue
                 findings.append(
                     {
                         "severity": "concern",
@@ -2538,7 +2554,13 @@ class ReviewerAgent(BaseAgent):
         # structural concerns always surface; runs only on a clean review.
         raw_ids = args.get("related_fr_ids")
         related_fr_ids = (
-            [x.strip() for x in raw_ids if isinstance(x, str) and x.strip()]
+            # Order-preserving dedup so duplicate ids don't cause redundant
+            # developer fetches or duplicate cross-reference findings.
+            list(
+                dict.fromkeys(
+                    x.strip() for x in raw_ids if isinstance(x, str) and x.strip()
+                )
+            )
             if isinstance(raw_ids, list)
             else []
         )
