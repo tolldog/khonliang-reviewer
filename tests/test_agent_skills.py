@@ -1550,6 +1550,118 @@ async def test_review_artifact_id_empty_body_errors(monkeypatch):
     assert "no text body" in res["error"]
 
 
+# -- list_reviews / get_review (fr_reviewer_19c871ab B1) --------------
+
+
+def _fake_store_list(monkeypatch, harness, *, artifacts, get_text=None):
+    """Stub harness.agent.request for artifact_list / artifact_get reads."""
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "artifact_list":
+            return {"result": {"artifacts": artifacts}}
+        if operation == "artifact_get":
+            return {"result": {"artifact": {"id": args["id"]}, "text": get_text or ""}}
+        return {"result": {"error": f"unexpected op {operation}"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+
+
+async def test_list_reviews_filters_by_fr_id(monkeypatch):
+    harness = _make_harness()
+    arts = [
+        {"id": "art_1", "created_at": "2026-06-07 10:00:00", "title": "review:fr:a",
+         "size_bytes": 10, "metadata": {"review_kind": "fr", "fr_id": "fr_a"}},
+        {"id": "art_2", "created_at": "2026-06-07 11:00:00", "title": "review:fr:b",
+         "size_bytes": 20, "metadata": {"review_kind": "fr", "fr_id": "fr_b"}},
+        {"id": "art_3", "created_at": "2026-06-07 12:00:00", "title": "review:fr:a2",
+         "size_bytes": 30, "metadata": {"review_kind": "fr", "fr_id": "fr_a"}},
+    ]
+    _fake_store_list(monkeypatch, harness, artifacts=arts)
+
+    res = await harness.call("list_reviews", {"fr_id": "fr_a"})
+    assert res["count"] == 2
+    assert {r["review_artifact_id"] for r in res["reviews"]} == {"art_1", "art_3"}
+
+
+async def test_list_reviews_limit_caps_results(monkeypatch):
+    harness = _make_harness()
+    arts = [
+        {"id": f"art_{i}", "created_at": "2026-06-07 10:00:00", "title": "t",
+         "size_bytes": 1, "metadata": {"project": "p"}}
+        for i in range(5)
+    ]
+    _fake_store_list(monkeypatch, harness, artifacts=arts)
+
+    res = await harness.call("list_reviews", {"project": "p", "limit": 2})
+    assert res["count"] == 2
+
+
+async def test_list_reviews_since_days_filters_old(monkeypatch):
+    harness = _make_harness()
+    import time as _time
+    from datetime import datetime as _dt
+
+    recent = _dt.fromtimestamp(_time.time() - 3600).isoformat(sep=" ")
+    old = _dt.fromtimestamp(_time.time() - 10 * 86400).isoformat(sep=" ")
+    arts = [
+        {"id": "art_recent", "created_at": recent, "title": "t", "size_bytes": 1,
+         "metadata": {"project": "p"}},
+        {"id": "art_old", "created_at": old, "title": "t", "size_bytes": 1,
+         "metadata": {"project": "p"}},
+    ]
+    _fake_store_list(monkeypatch, harness, artifacts=arts)
+
+    res = await harness.call("list_reviews", {"project": "p", "since_days": 1})
+    assert [r["review_artifact_id"] for r in res["reviews"]] == ["art_recent"]
+
+
+async def test_list_reviews_store_unreachable_errors():
+    harness = _make_harness()  # no stub → request hits mock bus and raises
+    res = await harness.call("list_reviews", {"fr_id": "fr_a"})
+    assert "error" in res
+    assert res.get("error_category") == "store_unreachable"
+
+
+async def test_get_review_parses_persisted_json(monkeypatch):
+    harness = _make_harness()
+    payload = {"summary": "ok", "findings": [], "backend": "ollama"}
+    _fake_store_list(
+        monkeypatch, harness, artifacts=[], get_text=_json.dumps(payload)
+    )
+
+    res = await harness.call("get_review", {"review_artifact_id": "art_rev"})
+    assert res["review"] == payload
+    assert res["raw"] is None
+    assert res["review_artifact_id"] == "art_rev"
+
+
+async def test_get_review_unparseable_falls_back_to_raw(monkeypatch):
+    harness = _make_harness()
+    _fake_store_list(monkeypatch, harness, artifacts=[], get_text="not json {")
+
+    res = await harness.call("get_review", {"review_artifact_id": "art_rev"})
+    assert res["review"] is None
+    assert res["raw"] == "not json {"
+
+
+async def test_get_review_requires_id():
+    harness = _make_harness()
+    res = await harness.call("get_review", {})
+    assert "error" in res
+    assert "review_artifact_id" in res["error"]
+
+
+async def test_get_review_not_found_errors(monkeypatch):
+    harness = _make_harness()
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        return {"result": {"error": "artifact not found"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call("get_review", {"review_artifact_id": "art_missing"})
+    assert "error" in res
+    assert "art_missing" in res["error"]
+
+
 async def test_rule_table_routes_large_diff_to_claude():
     """≥2000 lines (or ≥20 files) → claude_cli per rule table."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
