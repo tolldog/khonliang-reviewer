@@ -276,55 +276,57 @@ def _resolve_artifact_kind(value: Any) -> str:
     return kind
 
 
-def _resolve_artifact_content(args: dict[str, Any]) -> tuple[str | None, dict | None]:
-    """Resolve the artifact body from exactly one ingestion source.
+def _unwrap(envelope: Any) -> Any:
+    """Pull the inner payload from a bus request envelope.
 
-    Accepts raw ``content`` or a repo ``path`` resolved from ``base_sha``
-    (via ``git show`` — same base-branch trust boundary as the ``.reviewer/``
-    loaders). Returns ``(content, None)`` on success or ``(None, error)`` on
-    failure. ``artifact_id`` (bus-artifact fetch) is deferred to Phase B and
-    rejected with a hint here.
+    ``self.request`` returns either ``{"result": <payload>}`` or a flat
+    error/payload dict; both store callers want the payload. Mirrors the
+    researcher's ``repo_docs._unwrap``.
     """
-    if args.get("artifact_id"):
-        return None, {
-            "error": (
-                "artifact_id ingestion is not yet supported; pass `content` "
-                "(raw markdown) or `path` (+ repo_root + base_sha)"
-            )
-        }
+    if isinstance(envelope, dict):
+        return envelope.get("result", envelope)
+    return envelope
+
+
+def _resolve_artifact_content(args: dict[str, Any]) -> tuple[str | None, dict | None]:
+    """Resolve a ``content`` / ``path`` artifact body.
+
+    Precondition: the handler has already established that exactly one of
+    ``content`` / ``path`` is the chosen source (``artifact_id`` ingestion is
+    async and handled in the handler via the store). Accepts raw ``content``
+    or a repo ``path`` resolved from ``base_sha`` via ``git show`` — same
+    base-branch trust boundary as the ``.reviewer/`` loaders. Returns
+    ``(content, None)`` on success or ``(None, error)`` on failure.
+    """
     content = args.get("content")
-    path = args.get("path")
-    has_content = isinstance(content, str) and content.strip()
-    has_path = isinstance(path, str) and path.strip()
-    if has_content and has_path:
-        return None, {"error": "provide exactly one of `content` or `path`, not both"}
-    if has_content:
+    if isinstance(content, str) and content.strip():
         return content, None
-    if has_path:
-        repo_root = str(args.get("repo_root") or "").strip()
-        base_sha = str(args.get("base_sha") or "").strip()
-        if not repo_root or not base_sha:
-            return None, {
-                "error": "`path` ingestion requires `repo_root` and `base_sha`"
-            }
-        # Probe reachability first so a shallow clone / unreachable base_sha
-        # surfaces a targeted fetch-depth hint instead of being mistaken for a
-        # missing file (same gating as the .reviewer/ loaders).
-        try:
-            _assert_base_sha_reachable(Path(repo_root), base_sha, git_binary="git")
-        except RepoConfigUnreachableError as exc:
-            return None, {"error": str(exc), "error_category": "base_sha_unreachable"}
-        text = _git_show_text(
-            Path(repo_root), base_sha, path.strip(), git_binary="git"
-        )
-        if text is None or not text.strip():
-            return None, {
-                "error": f"artifact path {path.strip()!r} not found at base_sha {base_sha!r}"
-            }
-        return text, None
-    return None, {
-        "error": "review_artifact requires exactly one ingestion source: `content` or `path`"
-    }
+    # Otherwise the chosen source is ``path``.
+    path = str(args.get("path") or "").strip()
+    repo_root = str(args.get("repo_root") or "").strip()
+    base_sha = str(args.get("base_sha") or "").strip()
+    if not repo_root or not base_sha:
+        return None, {"error": "`path` ingestion requires `repo_root` and `base_sha`"}
+    # Probe reachability first so a shallow clone / unreachable base_sha
+    # surfaces a targeted fetch-depth hint instead of being mistaken for a
+    # missing file (same gating as the .reviewer/ loaders).
+    try:
+        _assert_base_sha_reachable(Path(repo_root), base_sha, git_binary="git")
+    except RepoConfigUnreachableError as exc:
+        return None, {"error": str(exc), "error_category": "base_sha_unreachable"}
+    text = _git_show_text(Path(repo_root), base_sha, path, git_binary="git")
+    if text is None or not text.strip():
+        return None, {
+            "error": f"artifact path {path!r} not found at base_sha {base_sha!r}"
+        }
+    return text, None
+
+
+#: Upper bound on the body window pulled for ``artifact_id`` ingestion. Specs
+#: top out ~25K chars (per fr_reviewer_19c871ab); 200K leaves generous room.
+#: The store's ``artifact_get`` is windowed; a larger artifact surfaces
+#: ``truncated: true`` and the reviewer reviews the (large) prefix.
+_ARTIFACT_GET_MAX_CHARS = 200_000
 
 
 class DistillOverrideError(ValueError):
@@ -1302,12 +1304,15 @@ class ReviewerAgent(BaseAgent):
                 "document with a per-kind rubric — sibling to review_diff for "
                 "the diff path. `kind` (fr|spec|milestone) and `project` are "
                 "required. Provide the artifact body by exactly one of: "
-                "`content` (raw markdown), or `path` + `repo_root` + `base_sha` "
-                "(resolved from base-branch HEAD via git show). spec/milestone "
-                "route to claude_cli, fr to ollama qwen. Findings anchor to a "
-                "named `section` rather than a diff line. (`artifact_id` "
-                "ingestion + persisted review history land in a later phase of "
-                "fr_reviewer_19c871ab.)",
+                "`content` (raw markdown), `path` + `repo_root` + `base_sha` "
+                "(resolved from base-branch HEAD via git show), or `artifact_id` "
+                "(fetched from the store — e.g. a milestone draft_spec, so a "
+                "freshly-proposed artifact is reviewable without a disk commit). "
+                "spec/milestone route to claude_cli, fr to ollama qwen. Findings "
+                "anchor to a named `section` rather than a diff line. On success "
+                "the result is persisted as a store artifact (append-only review "
+                "history) and its id returned as `review_artifact_id`; pass "
+                "`persist=false` to skip.",
                 {
                     "kind": {"type": "string", "required": True},
                     "project": {"type": "string", "required": True},
@@ -1315,10 +1320,15 @@ class ReviewerAgent(BaseAgent):
                     "path": {"type": "string", "default": ""},
                     "repo_root": {"type": "string", "default": ""},
                     "base_sha": {"type": "string", "default": ""},
-                    # Optional provenance threaded into finding metadata.
+                    # Bus-artifact ingestion (e.g. a milestone draft_spec).
+                    "artifact_id": {"type": "string", "default": ""},
+                    # Optional provenance threaded into finding metadata + the
+                    # persisted review record.
                     "fr_id": {"type": "string", "default": ""},
                     "spec_id": {"type": "string", "default": ""},
                     "ms_id": {"type": "string", "default": ""},
+                    # Persist the result as a store artifact (default true).
+                    "persist": {"type": "boolean", "default": True},
                     "instructions": {"type": "string", "default": ""},
                     "backend": {"type": "string", "default": ""},
                     "model": {"type": "string", "default": ""},
@@ -2234,6 +2244,80 @@ class ReviewerAgent(BaseAgent):
             },
         }
 
+    async def _store_request(
+        self, operation: str, op_args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Single store-agent skill call via the bus, unwrapped to the payload.
+
+        Raises whatever ``self.request`` raises when the bus is unreachable;
+        callers wrap it so persistence/ingestion failures stay non-fatal.
+        """
+        resp = await self.request(
+            agent_type="store", operation=operation, args=op_args
+        )
+        return _unwrap(resp)
+
+    async def _fetch_artifact_body(
+        self, artifact_id: str
+    ) -> tuple[str | None, dict | None]:
+        """Fetch a bus artifact's text body for ``artifact_id`` ingestion."""
+        try:
+            resp = await self._store_request(
+                "artifact_get",
+                {"id": artifact_id, "offset": 0, "max_chars": _ARTIFACT_GET_MAX_CHARS},
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            return None, {
+                "error": f"artifact_id {artifact_id!r} fetch failed: {exc}",
+                "error_category": "store_unreachable",
+            }
+        if not isinstance(resp, dict) or "error" in resp:
+            detail = resp.get("error") if isinstance(resp, dict) else "bad store response"
+            return None, {"error": f"artifact_id {artifact_id!r} not retrievable: {detail}"}
+        text = resp.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None, {"error": f"artifact {artifact_id!r} has no text body"}
+        return text, None
+
+    async def _persist_review(
+        self,
+        result: dict[str, Any],
+        *,
+        kind: str,
+        project: str,
+        provenance: dict[str, str],
+    ) -> str | None:
+        """Best-effort: persist a ReviewResult dict as a store artifact.
+
+        Returns the new review-artifact id, or ``None`` when the store is
+        unreachable / errors. Persistence is secondary to the review itself —
+        a store failure must never fail the review, so every failure path
+        logs and returns ``None`` (review history is append-only; no dedupe).
+        """
+        anchor = next(iter(provenance.values()), project)
+        title = f"review:{kind}:{anchor}"[:200]
+        try:
+            resp = await self._store_request(
+                "artifact_create",
+                {
+                    "kind": "reviewer_artifact_review",
+                    "title": title,
+                    "content": json.dumps(result, indent=2, sort_keys=True),
+                    "content_type": "application/json",
+                    "producer": getattr(self, "agent_id", "reviewer"),
+                    "metadata": {"review_kind": kind, "project": project, **provenance},
+                },
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            logger.warning(
+                "review_artifact persistence skipped (store unreachable): %s", exc
+            )
+            return None
+        if not isinstance(resp, dict) or "error" in resp:
+            logger.warning("review_artifact persistence failed: %s", resp)
+            return None
+        return resp.get("id") or (resp.get("artifact") or {}).get("id")
+
     @handler("review_artifact")
     async def handle_review_artifact(self, args: dict[str, Any]) -> dict[str, Any]:
         """Review a planning artifact (FR / spec / milestone) as a full document.
@@ -2241,10 +2325,12 @@ class ReviewerAgent(BaseAgent):
         Sibling to ``review_diff``/``review_pr`` for the artifact-review
         pipeline (fr_reviewer_19c871ab). Validates the artifact ``kind`` +
         ``project``, resolves the body from exactly one ingestion source
-        (raw ``content`` or repo ``path`` at ``base_sha``), threads provenance
-        ids into the request metadata, then forwards to ``review_text`` — which
-        applies the full-document framing + per-kind rubric (prompt assembly)
-        and the spec/milestone→claude / fr→qwen routing (rule table).
+        (raw ``content``, a repo ``path`` at ``base_sha``, or a bus
+        ``artifact_id``), threads provenance ids into the request metadata,
+        forwards to ``review_text`` (full-document framing + per-kind rubric +
+        spec/milestone→claude / fr→qwen routing), then **best-effort persists**
+        the result as a store artifact and returns its id as
+        ``review_artifact_id``. Pass ``persist=false`` to skip persistence.
         """
         try:
             kind = _resolve_artifact_kind(args.get("kind"))
@@ -2255,35 +2341,72 @@ class ReviewerAgent(BaseAgent):
         if not project:
             return {"error": "project is required for review_artifact"}
 
-        content, ingest_error = _resolve_artifact_content(args)
+        # Exactly one ingestion source across content / path / artifact_id.
+        sources = [
+            name
+            for name, val in (
+                ("content", args.get("content")),
+                ("path", args.get("path")),
+                ("artifact_id", args.get("artifact_id")),
+            )
+            if isinstance(val, str) and val.strip()
+        ]
+        if not sources:
+            return {
+                "error": "review_artifact requires exactly one ingestion source: "
+                "content, path, or artifact_id"
+            }
+        if len(sources) > 1:
+            return {
+                "error": "provide exactly one ingestion source "
+                f"(content/path/artifact_id); got {sources}"
+            }
+        if sources[0] == "artifact_id":
+            content, ingest_error = await self._fetch_artifact_body(
+                str(args["artifact_id"]).strip()
+            )
+        else:
+            content, ingest_error = _resolve_artifact_content(args)
         if ingest_error is not None:
             return ingest_error
 
-        # Provenance threaded into metadata so findings (and Phase-B
-        # persistence) can reconstruct which artifact was reviewed.
-        # Caller-supplied metadata is merged under the provenance keys, which
-        # win on conflict.
+        # Provenance threaded into metadata so findings (and the persisted
+        # review record) can reconstruct which artifact was reviewed.
+        provenance: dict[str, str] = {}
+        for key in ("fr_id", "spec_id", "ms_id"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                provenance[key] = val.strip()
         metadata: dict[str, Any] = {}
         caller_meta = args.get("metadata")
         if isinstance(caller_meta, dict):
             metadata.update(caller_meta)
         metadata["project"] = project
-        for key in ("fr_id", "spec_id", "ms_id"):
-            val = args.get(key)
-            if isinstance(val, str) and val.strip():
-                metadata[key] = val.strip()
+        metadata.update(provenance)
 
         # Forward to the review_text core. Strip the artifact-only args so they
         # don't leak into review_text (which would ignore them anyway).
         _artifact_only = {
             "kind", "content", "path", "repo_root", "base_sha", "project",
-            "fr_id", "spec_id", "ms_id", "metadata", "artifact_id",
+            "fr_id", "spec_id", "ms_id", "metadata", "artifact_id", "persist",
         }
         forwarded = {k: v for k, v in args.items() if k not in _artifact_only}
         forwarded["kind"] = kind
         forwarded["content"] = content
         forwarded["metadata"] = metadata
-        return await self.handle_review_text(forwarded)
+        result = await self.handle_review_text(forwarded)
+
+        # Best-effort, append-only persistence (review history). A store
+        # failure never fails the review — the result is the deliverable.
+        if args.get("persist", True) is not False and (
+            isinstance(result, dict) and not result.get("error")
+        ):
+            review_artifact_id = await self._persist_review(
+                result, kind=kind, project=project, provenance=provenance
+            )
+            if review_artifact_id:
+                result["review_artifact_id"] = review_artifact_id
+        return result
 
     @handler("sign_off_trailer")
     async def handle_sign_off_trailer(

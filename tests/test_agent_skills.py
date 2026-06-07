@@ -1330,17 +1330,18 @@ async def test_review_artifact_requires_exactly_one_source():
     # neither
     r1 = await harness.call("review_artifact", {"kind": "fr", "project": "p"})
     assert "error" in r1 and "ingestion source" in r1["error"]
-    # both
+    # two (content + path)
     r2 = await harness.call(
         "review_artifact",
         {"kind": "fr", "project": "p", "content": "x", "path": "specs/a.md"},
     )
     assert "error" in r2 and "exactly one" in r2["error"]
-    # artifact_id not yet supported
+    # two (content + artifact_id) — three-way mutual exclusivity
     r3 = await harness.call(
-        "review_artifact", {"kind": "fr", "project": "p", "artifact_id": "art_x"}
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "x", "artifact_id": "art_x"},
     )
-    assert "error" in r3 and "artifact_id" in r3["error"]
+    assert "error" in r3 and "exactly one" in r3["error"]
 
 
 async def test_review_artifact_path_ingestion_via_git_show(monkeypatch):
@@ -1406,6 +1407,131 @@ async def test_review_artifact_path_missing_repo_context_errors():
     )
     assert "error" in res
     assert "repo_root" in res["error"] and "base_sha" in res["error"]
+
+
+def _fake_store(monkeypatch, harness, *, get_text=None, create_id="art_review_1", error_op=None):
+    """Stub harness.agent.request to fake the store agent; record calls."""
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        calls.append((operation, args))
+        if error_op == operation:
+            return {"result": {"error": "boom"}}
+        if operation == "artifact_create":
+            return {"result": {"id": create_id}}
+        if operation == "artifact_get":
+            return {"result": {"artifact": {"id": args["id"]}, "text": get_text or ""}}
+        return {"result": {"error": f"unexpected op {operation}"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    return calls
+
+
+async def test_review_artifact_persists_and_returns_id(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    calls = _fake_store(monkeypatch, harness, create_id="art_review_xyz")
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "khonliang-reviewer", "content": "# FR\n\nbody",
+         "fr_id": "fr_reviewer_abc"},
+    )
+
+    assert res.get("review_artifact_id") == "art_review_xyz"
+    create_calls = [a for op, a in calls if op == "artifact_create"]
+    assert len(create_calls) == 1
+    ca = create_calls[0]
+    assert ca["content_type"] == "application/json"
+    assert ca["metadata"]["review_kind"] == "fr"
+    assert ca["metadata"]["fr_id"] == "fr_reviewer_abc"
+    # the persisted content is the ReviewResult dict as JSON
+    assert _json.loads(ca["content"])  # parses
+
+
+async def test_review_artifact_persist_false_skips_store(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    calls = _fake_store(monkeypatch, harness)
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# FR", "persist": False},
+    )
+
+    assert "review_artifact_id" not in res
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_review_artifact_persistence_failure_is_non_fatal(monkeypatch):
+    # store errors → review still succeeds, just no review_artifact_id.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    _fake_store(monkeypatch, harness, error_op="artifact_create")
+
+    res = await harness.call(
+        "review_artifact", {"kind": "fr", "project": "p", "content": "# FR"}
+    )
+
+    assert not res.get("error")
+    assert "review_artifact_id" not in res
+
+
+async def test_review_artifact_store_unreachable_is_non_fatal():
+    # No store stub: self.request hits the mock bus and raises → soft-fail.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    res = await harness.call(
+        "review_artifact", {"kind": "fr", "project": "p", "content": "# FR"}
+    )
+
+    assert not res.get("error")
+    assert "review_artifact_id" not in res
+    assert ollama.last_request is not None  # the review itself ran
+
+
+async def test_review_artifact_id_ingestion_fetches_body(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    calls = _fake_store(
+        monkeypatch, harness, get_text="# Milestone draft\n\nbody from store"
+    )
+
+    await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "artifact_id": "art_draft_1", "persist": False},
+    )
+
+    assert ollama.last_request is not None
+    assert ollama.last_request.content == "# Milestone draft\n\nbody from store"
+    assert ("artifact_get", {"id": "art_draft_1", "offset": 0, "max_chars": 200_000}) in [
+        (op, a) for op, a in calls
+    ]
+
+
+async def test_review_artifact_id_not_found_errors(monkeypatch):
+    harness = _make_harness()
+    _fake_store(monkeypatch, harness, error_op="artifact_get")
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "artifact_id": "art_missing"},
+    )
+    assert "error" in res
+    assert "art_missing" in res["error"]
+
+
+async def test_review_artifact_id_empty_body_errors(monkeypatch):
+    harness = _make_harness()
+    _fake_store(monkeypatch, harness, get_text="   ")
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "artifact_id": "art_blank"},
+    )
+    assert "error" in res
+    assert "no text body" in res["error"]
 
 
 async def test_rule_table_routes_large_diff_to_claude():
