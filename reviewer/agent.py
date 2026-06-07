@@ -2255,16 +2255,22 @@ class ReviewerAgent(BaseAgent):
                     _artifact_route_note(path, "could not fetch file", str(exc))
                 )
                 continue
-            sub = await self.handle_review_artifact(
-                {
-                    "kind": "spec",
-                    "project": repo,
-                    "content": content,
-                    "persist": False,
-                    "backend": args.get("backend") or "",
-                    "model": args.get("model"),
-                }
-            )
+            try:
+                sub = await self.handle_review_artifact(
+                    {
+                        "kind": "spec",
+                        "project": repo,
+                        "content": content,
+                        "persist": False,
+                        "backend": args.get("backend") or "",
+                        "model": args.get("model"),
+                    }
+                )
+            except Exception as exc:  # one bad file must not fail the PR review
+                all_findings.append(
+                    _artifact_route_note(path, "artifact review raised", str(exc))
+                )
+                continue
             if not isinstance(sub, dict) or sub.get("error"):
                 detail = sub.get("error") if isinstance(sub, dict) else "bad result"
                 all_findings.append(

@@ -772,3 +772,24 @@ async def test_review_pr_artifact_fetch_error_is_comment_not_fatal():
     assert github.submit_calls, "review still posts"
     body = github.submit_calls[0]["body"]
     assert "[specs/MS-B/spec.md]" in body and "could not fetch" in body
+
+
+async def test_review_pr_artifact_review_raise_is_comment_not_fatal(monkeypatch):
+    # If the per-file artifact review *raises* (not just returns an error dict),
+    # review_pr must still post — one bad file can't fail the whole PR review.
+    github = _FakeGithub(
+        diff="diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n",
+        file_contents={"specs/MS-B/spec.md": "# Spec\n\nbody"},
+    )
+    harness, ollama, claude = _make_artifact_harness(github)
+
+    async def _boom(args):
+        raise RuntimeError("kaboom in review_artifact")
+
+    monkeypatch.setattr(harness.agent, "handle_review_artifact", _boom)
+    res = await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
+
+    assert not res.get("error")
+    assert github.submit_calls, "review still posts"
+    body = github.submit_calls[0]["body"]
+    assert "[specs/MS-B/spec.md]" in body and "raised" in body
