@@ -1,0 +1,23 @@
+# khonliang-reviewer deploy manifest -- TEMPLATE for khonliang-deploy.
+#
+# Copy to deploy.yaml (gitignored, machine-specific) and edit the real values, then:
+#   khonliang-deploy --manifest deploy.yaml
+# The tool lives at tolldog/khonliang-deploy; it replaces the old per-repo
+# scripts/deploy.sh. This committed .example documents the shape with placeholders;
+# the real deploy.yaml is kept on local disk only.
+#
+# Env overrides win for dev installs: SRC, VENV, BUS, REF, DEPLOY_USER, SSH_KEY,
+# SOURCE_MODE (git|local). For a local dev-mirror deploy, set source_mode: local
+# (deploys the working tree as-is -- no fetch, no ssh-agent), point venv at the
+# dev venv, set deploy_user to yourself, and target the dev bus port.
+
+source: /opt/khonliang/src/khonliang-reviewer   # source clone (git repo)
+venv:   /opt/khonliang/agents/reviewer/.venv    # copied, non-editable service venv
+bus:    http://localhost:8788                    # bus base url (restart endpoint)
+deploy_user: khonliang                           # venv-owning service user
+ref: main                                        # git ref to deploy
+source_mode: git                                 # git (prod, pull origin) | local (dev tree as-is)
+agents: [reviewer-primary]                       # bus ids to restart after install
+
+# Post-install smoke: an import that succeeds only when the fresh code is present.
+verify_import: "import reviewer.providers.ollama as o; assert hasattr(o, '_native_base_url')"

@@ -11,3 +11,5 @@ data/*.db
 *.db-wal
 config.yaml
 .mcp.json
+# Real, machine-specific deploy manifest (khonliang-deploy); commit deploy.yaml.example only.
+deploy.yaml
