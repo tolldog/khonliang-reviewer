@@ -29,8 +29,10 @@ import json
 import logging
 import re
 import sys
+import time
 import typing
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -327,6 +329,40 @@ def _resolve_artifact_content(args: dict[str, Any]) -> tuple[str | None, dict | 
 #: The store's ``artifact_get`` is windowed; a larger artifact surfaces
 #: ``truncated: true`` and the reviewer reviews the (large) prefix.
 _ARTIFACT_GET_MAX_CHARS = 200_000
+
+#: Store artifact ``kind`` under which review_artifact results are persisted
+#: (write in :meth:`_persist_review`, read in ``list_reviews``).
+_REVIEW_ARTIFACT_KIND = "reviewer_artifact_review"
+
+#: Page size pulled from the store before client-side metadata filtering in
+#: ``list_reviews``. Generous because filtering is client-side until the
+#: store grows server-side metadata filtering (fr_store_8e5cae37); the store
+#: clamps to its own MAX_LIST_LIMIT.
+_REVIEW_LIST_FETCH_LIMIT = 200
+
+
+def _parse_created_at(created_at: Any) -> float | None:
+    """Epoch seconds for the store's ISO-8601 ``created_at``, or ``None``.
+
+    Handles ``"2026-06-07 22:08:11"`` and the ``T``-separator form. ``None``
+    on missing / unparseable input so callers decide how to treat it.
+    """
+    if not isinstance(created_at, str) or not created_at.strip():
+        return None
+    try:
+        return datetime.fromisoformat(created_at.strip()).timestamp()
+    except ValueError:
+        return None
+
+
+def _created_after(created_at: Any, cutoff_epoch: float) -> bool:
+    """True iff ``created_at`` is at/after ``cutoff_epoch``.
+
+    Unparseable / missing values return ``True`` (include rather than silently
+    drop — the recency filter is best-effort).
+    """
+    ts = _parse_created_at(created_at)
+    return ts is None or ts >= cutoff_epoch
 
 
 class DistillOverrideError(ValueError):
@@ -1339,6 +1375,34 @@ class ReviewerAgent(BaseAgent):
                 since="0.3.0",
             ),
             Skill(
+                "list_reviews",
+                "Enumerate persisted artifact-review records (from review_artifact). "
+                "Filter by object id (`fr_id` / `spec_id` / `ms_id`), `project`, "
+                "and `since_days` recency; newest first, capped by `limit` "
+                "(default 50). Returns `{reviews: [{review_artifact_id, "
+                "created_at, title, size_bytes, metadata}], count}`. Read-only.",
+                {
+                    "fr_id": {"type": "string", "default": ""},
+                    "spec_id": {"type": "string", "default": ""},
+                    "ms_id": {"type": "string", "default": ""},
+                    "project": {"type": "string", "default": ""},
+                    "since_days": {"type": "number", "default": 0},
+                    "limit": {"type": "integer", "default": 50},
+                },
+                since="0.3.0",
+            ),
+            Skill(
+                "get_review",
+                "Fetch a single persisted review by `review_artifact_id` (from "
+                "list_reviews / a review_artifact result). Returns the parsed "
+                "ReviewResult under `review` (or `raw` text if it doesn't parse) "
+                "plus the store `artifact` metadata. Read-only.",
+                {
+                    "review_artifact_id": {"type": "string", "required": True},
+                },
+                since="0.3.0",
+            ),
+            Skill(
                 "sign_off_trailer",
                 "Format an Agent-Reviewed-by trailer line from a "
                 "ReviewResult. Two call shapes: (a) result-only — "
@@ -2300,7 +2364,7 @@ class ReviewerAgent(BaseAgent):
             resp = await self._store_request(
                 "artifact_create",
                 {
-                    "kind": "reviewer_artifact_review",
+                    "kind": _REVIEW_ARTIFACT_KIND,
                     "title": title,
                     "content": json.dumps(result, indent=2, sort_keys=True),
                     "content_type": "application/json",
@@ -2410,6 +2474,123 @@ class ReviewerAgent(BaseAgent):
             if review_artifact_id:
                 result["review_artifact_id"] = review_artifact_id
         return result
+
+    @handler("list_reviews")
+    async def handle_list_reviews(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Enumerate persisted artifact-review records (fr_reviewer_19c871ab B1).
+
+        Filters by object id (``fr_id`` / ``spec_id`` / ``ms_id``), ``project``,
+        and ``since_days`` recency, newest first. Reads
+        ``kind=reviewer_artifact_review`` from the store and filters
+        **client-side** — server-side metadata filtering is tracked in
+        fr_store_8e5cae37; until it lands this can miss matches beyond
+        ``_REVIEW_LIST_FETCH_LIMIT``.
+        """
+        filters: dict[str, str] = {}
+        for key in ("fr_id", "spec_id", "ms_id", "project"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                filters[key] = val.strip()
+        try:
+            limit = int(args.get("limit") or 50)
+        except (TypeError, ValueError):
+            return {"error": "limit must be an integer"}
+        limit = max(1, limit)
+
+        since_cutoff: float | None = None
+        raw_days = args.get("since_days")
+        if raw_days not in (None, "", 0, 0.0):
+            try:
+                days = float(raw_days)
+            except (TypeError, ValueError):
+                return {"error": "since_days must be a number"}
+            if days > 0:
+                since_cutoff = time.time() - days * 86400.0
+
+        try:
+            resp = await self._store_request(
+                "artifact_list",
+                {"kind": _REVIEW_ARTIFACT_KIND, "limit": _REVIEW_LIST_FETCH_LIMIT},
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            return {
+                "error": f"list_reviews: store unreachable: {exc}",
+                "error_category": "store_unreachable",
+            }
+        if not isinstance(resp, dict) or "error" in resp:
+            detail = resp.get("error") if isinstance(resp, dict) else "bad store response"
+            return {"error": f"list_reviews: store error: {detail}"}
+
+        matches: list[dict[str, Any]] = []
+        for item in resp.get("artifacts") or []:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            if any(meta.get(k) != v for k, v in filters.items()):
+                continue
+            if since_cutoff is not None and not _created_after(
+                item.get("created_at"), since_cutoff
+            ):
+                continue
+            matches.append(
+                {
+                    "review_artifact_id": item.get("id"),
+                    "created_at": item.get("created_at"),
+                    "title": item.get("title"),
+                    "size_bytes": item.get("size_bytes"),
+                    "metadata": meta,
+                }
+            )
+        # Guarantee newest-first ourselves (don't rely on store ordering),
+        # then cap to limit — so the top-N is the N most recent matches.
+        matches.sort(
+            key=lambda r: _parse_created_at(r.get("created_at")) or 0.0, reverse=True
+        )
+        reviews = matches[:limit]
+        return {"reviews": reviews, "count": len(reviews)}
+
+    @handler("get_review")
+    async def handle_get_review(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return a single persisted review by ``review_artifact_id``.
+
+        Fetches the stored ReviewResult JSON from the store and parses it back
+        to a dict under ``review``; falls back to ``raw`` text if it doesn't
+        parse. Read-only sibling to ``list_reviews``.
+        """
+        review_artifact_id = str(args.get("review_artifact_id") or "").strip()
+        if not review_artifact_id:
+            return {"error": "review_artifact_id is required"}
+        try:
+            resp = await self._store_request(
+                "artifact_get",
+                {
+                    "id": review_artifact_id,
+                    "offset": 0,
+                    "max_chars": _ARTIFACT_GET_MAX_CHARS,
+                },
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            return {
+                "error": f"get_review: store unreachable: {exc}",
+                "error_category": "store_unreachable",
+            }
+        if not isinstance(resp, dict) or "error" in resp:
+            detail = resp.get("error") if isinstance(resp, dict) else "bad store response"
+            return {"error": f"get_review {review_artifact_id!r}: {detail}"}
+        text = resp.get("text")
+        review: Any = None
+        if isinstance(text, str) and text.strip():
+            try:
+                review = json.loads(text)
+            except json.JSONDecodeError:
+                review = None
+        return {
+            "review_artifact_id": review_artifact_id,
+            "review": review,
+            "raw": None if review is not None else text,
+            "artifact": resp.get("artifact") if isinstance(resp.get("artifact"), dict) else {},
+            "truncated": bool(resp.get("truncated")),
+        }
 
     @handler("sign_off_trailer")
     async def handle_sign_off_trailer(
