@@ -341,20 +341,28 @@ _REVIEW_ARTIFACT_KIND = "reviewer_artifact_review"
 _REVIEW_LIST_FETCH_LIMIT = 200
 
 
-def _created_after(created_at: Any, cutoff_epoch: float) -> bool:
-    """True iff the artifact's ``created_at`` is at/after ``cutoff_epoch``.
+def _parse_created_at(created_at: Any) -> float | None:
+    """Epoch seconds for the store's ISO-8601 ``created_at``, or ``None``.
 
-    ``created_at`` is the store's ISO-8601 string (``"2026-06-07 22:08:11"``
-    or with a ``T`` separator). Unparseable / missing values return ``True``
-    (include rather than silently drop — the recency filter is best-effort).
+    Handles ``"2026-06-07 22:08:11"`` and the ``T``-separator form. ``None``
+    on missing / unparseable input so callers decide how to treat it.
     """
     if not isinstance(created_at, str) or not created_at.strip():
-        return True
+        return None
     try:
-        parsed = datetime.fromisoformat(created_at.strip())
+        return datetime.fromisoformat(created_at.strip()).timestamp()
     except ValueError:
-        return True
-    return parsed.timestamp() >= cutoff_epoch
+        return None
+
+
+def _created_after(created_at: Any, cutoff_epoch: float) -> bool:
+    """True iff ``created_at`` is at/after ``cutoff_epoch``.
+
+    Unparseable / missing values return ``True`` (include rather than silently
+    drop — the recency filter is best-effort).
+    """
+    ts = _parse_created_at(created_at)
+    return ts is None or ts >= cutoff_epoch
 
 
 class DistillOverrideError(ValueError):
@@ -2513,7 +2521,7 @@ class ReviewerAgent(BaseAgent):
             detail = resp.get("error") if isinstance(resp, dict) else "bad store response"
             return {"error": f"list_reviews: store error: {detail}"}
 
-        reviews: list[dict[str, Any]] = []
+        matches: list[dict[str, Any]] = []
         for item in resp.get("artifacts") or []:
             if not isinstance(item, dict):
                 continue
@@ -2524,7 +2532,7 @@ class ReviewerAgent(BaseAgent):
                 item.get("created_at"), since_cutoff
             ):
                 continue
-            reviews.append(
+            matches.append(
                 {
                     "review_artifact_id": item.get("id"),
                     "created_at": item.get("created_at"),
@@ -2533,8 +2541,12 @@ class ReviewerAgent(BaseAgent):
                     "metadata": meta,
                 }
             )
-            if len(reviews) >= limit:
-                break
+        # Guarantee newest-first ourselves (don't rely on store ordering),
+        # then cap to limit — so the top-N is the N most recent matches.
+        matches.sort(
+            key=lambda r: _parse_created_at(r.get("created_at")) or 0.0, reverse=True
+        )
+        reviews = matches[:limit]
         return {"reviews": reviews, "count": len(reviews)}
 
     @handler("get_review")

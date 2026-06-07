@@ -1582,6 +1582,29 @@ async def test_list_reviews_filters_by_fr_id(monkeypatch):
     assert {r["review_artifact_id"] for r in res["reviews"]} == {"art_1", "art_3"}
 
 
+async def test_list_reviews_orders_newest_first(monkeypatch):
+    # Store returns items out of order; list_reviews must sort newest-first
+    # itself (not rely on store ordering), and cap to the most-recent limit.
+    harness = _make_harness()
+    arts = [
+        {"id": "art_mid", "created_at": "2026-06-07 11:00:00", "title": "t",
+         "size_bytes": 1, "metadata": {"project": "p"}},
+        {"id": "art_new", "created_at": "2026-06-07 13:00:00", "title": "t",
+         "size_bytes": 1, "metadata": {"project": "p"}},
+        {"id": "art_old", "created_at": "2026-06-07 09:00:00", "title": "t",
+         "size_bytes": 1, "metadata": {"project": "p"}},
+    ]
+    _fake_store_list(monkeypatch, harness, artifacts=arts)
+
+    res = await harness.call("list_reviews", {"project": "p"})
+    assert [r["review_artifact_id"] for r in res["reviews"]] == [
+        "art_new", "art_mid", "art_old"
+    ]
+    # limit keeps the most-recent N, not the store's first N
+    res2 = await harness.call("list_reviews", {"project": "p", "limit": 1})
+    assert [r["review_artifact_id"] for r in res2["reviews"]] == ["art_new"]
+
+
 async def test_list_reviews_limit_caps_results(monkeypatch):
     harness = _make_harness()
     arts = [
