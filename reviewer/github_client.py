@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote as _urlquote
 
 
 class GithubClientError(RuntimeError):
@@ -191,6 +192,31 @@ class ReviewerGithubClient:
         if body is None:
             raise GithubClientError(
                 f"get_pr_diff({repo}#{pr_number}): no diff content in response"
+            )
+        return body
+
+    async def get_file_content(self, repo: str, path: str, ref: str) -> str:
+        """Return a file's full content at ``ref`` (commit SHA / branch).
+
+        Uses the contents endpoint with the ``raw`` media type — same trick as
+        :meth:`get_pr_diff` — so the body is the file bytes, not a JSON
+        envelope. Needed by ``review_pr`` to pull a spec/artifact file's whole
+        document for the artifact-review pipeline (a diff only carries hunks).
+        """
+        owner, name = _split_repo(repo)
+        encoded = _urlquote(path.strip().lstrip("/"))
+        try:
+            resp = await self._client().arequest(
+                "GET",
+                f"/repos/{owner}/{name}/contents/{encoded}?ref={_urlquote(ref)}",
+                headers={"Accept": "application/vnd.github.raw"},
+            )
+        except Exception as exc:
+            raise _classify(exc, f"get_file_content({repo}:{path}@{ref})") from exc
+        body = _response_text(resp)
+        if body is None:
+            raise GithubClientError(
+                f"get_file_content({repo}:{path}@{ref}): no content in response"
             )
         return body
 

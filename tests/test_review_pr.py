@@ -284,6 +284,8 @@ class _FakeGithub:
         metadata_error: Exception | None = None,
         diff_error: Exception | None = None,
         submit_error: Exception | None = None,
+        file_contents: dict[str, str] | None = None,
+        file_content_error: Exception | None = None,
     ):
         self._metadata = metadata or PRMetadata(
             repo="tolldog/example",
@@ -301,7 +303,18 @@ class _FakeGithub:
         self._metadata_error = metadata_error
         self._diff_error = diff_error
         self._submit_error = submit_error
+        self._file_contents = file_contents or {}
+        self._file_content_error = file_content_error
         self.submit_calls: list[dict[str, Any]] = []
+        self.file_fetches: list[tuple[str, str]] = []
+
+    async def get_file_content(self, repo: str, path: str, ref: str) -> str:
+        self.file_fetches.append((path, ref))
+        if self._file_content_error is not None:
+            raise self._file_content_error
+        if path not in self._file_contents:
+            raise GithubNotFoundError(f"get_file_content({repo}:{path}@{ref}): 404")
+        return self._file_contents[path]
 
     async def get_pr_metadata(self, repo: str, pr_number: int) -> PRMetadata:
         if self._metadata_error is not None:
@@ -665,3 +678,118 @@ def test_review_pr_skill_parameters_match_contract():
     assert skill.parameters["pr_number"]["required"] is True
     for optional in ("instructions", "backend", "model", "dry_run", "event"):
         assert skill.parameters[optional].get("required", False) is False
+
+
+# ---------------------------------------------------------------------------
+# B4: review_pr artifact routing (fr_reviewer_19c871ab)
+# ---------------------------------------------------------------------------
+
+from reviewer.agent import _diff_changed_paths, _is_artifact_pr_file  # noqa: E402
+
+
+def test_diff_changed_paths_and_artifact_classification():
+    diff = (
+        "diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+x\n"
+        "diff --git a/src/app.py b/src/app.py\n@@ -1 +1 @@\n+y\n"
+    )
+    assert _diff_changed_paths(diff) == ["specs/MS-B/spec.md", "src/app.py"]
+    assert _is_artifact_pr_file("specs/MS-B/spec.md")
+    assert _is_artifact_pr_file("a/b/specs/notes.md")
+    assert not _is_artifact_pr_file("src/app.py")
+    assert not _is_artifact_pr_file("README.md")  # not under specs/
+
+
+def _make_artifact_harness(github, *, spec_findings=None):
+    ollama = _RecordingProvider(
+        "ollama", ReviewResult(request_id="r", summary="code", findings=[])
+    )
+    claude = _RecordingProvider(
+        "claude_cli",
+        ReviewResult(request_id="r", summary="spec review", findings=spec_findings or []),
+    )
+    selector = ProviderSelector(
+        {"ollama": ollama, "claude_cli": claude},
+        SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
+    )
+    harness = AgentTestHarness(ReviewerAgent, selector=selector, github_client=github)
+    return harness, ollama, claude
+
+
+async def test_review_pr_docs_only_routes_to_artifact_pipeline():
+    github = _FakeGithub(
+        diff="diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n",
+        file_contents={"specs/MS-B/spec.md": "# MS-B Spec\n\nAcceptance: it works."},
+    )
+    spec_findings = [
+        ReviewFinding(
+            severity="concern", title="Acceptance untestable",
+            body="no observable signal", section="§Acceptance",
+        )
+    ]
+    harness, ollama, claude = _make_artifact_harness(github, spec_findings=spec_findings)
+
+    await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
+
+    # spec routed to the artifact pipeline (claude), full file fetched at head
+    assert claude.last_request is not None
+    assert claude.last_request.kind == "spec"
+    assert ollama.last_request is None  # no code diff
+    assert github.file_fetches == [("specs/MS-B/spec.md", "abc123")]
+    # finding is title-prefixed with the file and posted
+    assert github.submit_calls, "review was not posted"
+    assert "[specs/MS-B/spec.md]" in github.submit_calls[0]["body"]
+    assert "Acceptance untestable" in github.submit_calls[0]["body"]
+
+
+async def test_review_pr_mixed_uses_diff_pipeline():
+    github = _FakeGithub(
+        diff=(
+            "diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n"
+            "diff --git a/src/app.py b/src/app.py\n@@ -1 +1 @@\n+code\n"
+        ),
+    )
+    harness, ollama, claude = _make_artifact_harness(github)
+
+    await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
+
+    # mixed PR keeps the diff pipeline; no per-file artifact fetch
+    assert ollama.last_request is not None
+    assert ollama.last_request.kind == "pr_diff"
+    assert claude.last_request is None
+    assert github.file_fetches == []
+
+
+async def test_review_pr_artifact_fetch_error_is_comment_not_fatal():
+    github = _FakeGithub(
+        diff="diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n",
+        file_content_error=GithubClientError("get_file_content: 500"),
+    )
+    harness, ollama, claude = _make_artifact_harness(github)
+
+    res = await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
+
+    assert not res.get("error")
+    assert github.submit_calls, "review still posts"
+    body = github.submit_calls[0]["body"]
+    assert "[specs/MS-B/spec.md]" in body and "could not fetch" in body
+
+
+async def test_review_pr_artifact_review_raise_is_comment_not_fatal(monkeypatch):
+    # If the per-file artifact review *raises* (not just returns an error dict),
+    # review_pr must still post — one bad file can't fail the whole PR review.
+    github = _FakeGithub(
+        diff="diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n",
+        file_contents={"specs/MS-B/spec.md": "# Spec\n\nbody"},
+    )
+    harness, ollama, claude = _make_artifact_harness(github)
+
+    async def _boom(args):
+        raise RuntimeError("kaboom in review_artifact")
+
+    monkeypatch.setattr(harness.agent, "handle_review_artifact", _boom)
+    res = await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
+
+    assert not res.get("error")
+    assert github.submit_calls, "review still posts"
+    body = github.submit_calls[0]["body"]
+    assert "[specs/MS-B/spec.md]" in body and "raised" in body

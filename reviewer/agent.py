@@ -365,6 +365,42 @@ def _created_after(created_at: Any, cutoff_epoch: float) -> bool:
     return ts is None or ts >= cutoff_epoch
 
 
+#: PR files that ``review_pr`` routes to the artifact-review pipeline: markdown
+#: planning docs under ``specs/`` (e.g. ``specs/MS-B/spec.md``). Code files keep
+#: the diff pipeline; per-file splitting of *mixed* PRs is a follow-on
+#: (fr_reviewer_19c871ab B4).
+_ARTIFACT_PR_FILE_RE = re.compile(r"(?:^|/)specs/.+\.md$")
+
+
+def _is_artifact_pr_file(path: str) -> bool:
+    return bool(_ARTIFACT_PR_FILE_RE.search(path.strip()))
+
+
+def _diff_changed_paths(diff: str) -> list[str]:
+    """Target paths from a unified diff's ``diff --git a/x b/<path>`` headers."""
+    paths: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            marker = line.split(" b/", 1)
+            if len(marker) == 2 and marker[1].strip():
+                paths.append(marker[1].strip())
+    return paths
+
+
+def _artifact_route_note(path: str, title: str, body: str) -> dict[str, Any]:
+    """A holistic ``comment`` finding for a per-file routing problem in review_pr."""
+    return {
+        "severity": "comment",
+        "title": f"[{path}] {title}",
+        "body": body,
+        "category": "artifact-review",
+        "path": None,
+        "line": None,
+        "section": None,
+        "suggestion": None,
+    }
+
+
 class DistillOverrideError(ValueError):
     """Raised when a caller-supplied distill override (``body_mode`` /
     ``dedup`` / ``max_findings``) isn't a valid value.
@@ -2187,6 +2223,76 @@ class ReviewerAgent(BaseAgent):
         forwarded["content"] = diff
         return await self.handle_review_text(forwarded)
 
+    async def _review_pr_artifacts(
+        self,
+        repo: str,
+        pr_number: int,
+        metadata: Any,
+        artifact_paths: list[str],
+        args: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Review each changed artifact/spec file (full doc, spec rubric) and
+        aggregate into one review_result for the shared GitHub post path.
+
+        Each file's full content is fetched at the PR head SHA (a diff carries
+        only hunks) and reviewed via ``review_artifact`` (kind=spec). Findings
+        are title-prefixed with the file path so the aggregated review names
+        which file each came from; they stay holistic and land in the review
+        body. A per-file fetch/review error becomes a ``comment`` finding
+        rather than failing the whole review. Not persisted — the posted
+        GitHub review is the record (per-file persistence is a follow-on).
+        """
+        github = self._ensure_github_client()
+        all_findings: list[dict[str, Any]] = []
+        summaries: list[str] = []
+        for path in artifact_paths:
+            try:
+                content = await github.get_file_content(
+                    repo, path, metadata.head_sha
+                )
+            except GithubClientError as exc:
+                all_findings.append(
+                    _artifact_route_note(path, "could not fetch file", str(exc))
+                )
+                continue
+            try:
+                sub = await self.handle_review_artifact(
+                    {
+                        "kind": "spec",
+                        "project": repo,
+                        "content": content,
+                        "persist": False,
+                        "backend": args.get("backend") or "",
+                        "model": args.get("model"),
+                    }
+                )
+            except Exception as exc:  # one bad file must not fail the PR review
+                all_findings.append(
+                    _artifact_route_note(path, "artifact review raised", str(exc))
+                )
+                continue
+            if not isinstance(sub, dict) or sub.get("error"):
+                detail = sub.get("error") if isinstance(sub, dict) else "bad result"
+                all_findings.append(
+                    _artifact_route_note(path, "artifact review failed", str(detail))
+                )
+                continue
+            for finding in sub.get("findings", []):
+                f = dict(finding)
+                f["title"] = f"[{path}] {f.get('title', '')}".strip()
+                all_findings.append(f)
+            sub_summary = str(sub.get("summary") or "").strip()
+            if sub_summary:
+                summaries.append(f"{path}: {sub_summary}")
+        return {
+            "summary": " | ".join(summaries) if summaries else "Artifact review — no findings.",
+            "findings": all_findings,
+            "disposition": "posted",
+            "error": "",
+            "backend": "",
+            "model": "",
+        }
+
     @handler("review_pr")
     async def handle_review_pr(self, args: dict[str, Any]) -> dict[str, Any]:
         """End-to-end: fetch PR, review via review_text, post back to GitHub.
@@ -2245,32 +2351,44 @@ class ReviewerAgent(BaseAgent):
         except GithubClientError as exc:
             return {"error": f"github fetch failed: {exc}"}
 
-        # Feed the diff into review_text via the shared path so selector,
-        # rule table, severity_floor, and usage recording all run exactly
-        # once per review, regardless of which entry skill was called.
-        review_args: dict[str, Any] = {
-            "kind": "pr_diff",
-            "content": diff,
-            "instructions": str(args.get("instructions") or ""),
-            "context": {
-                "pr": metadata.to_dict(),
-            },
-            "backend": args.get("backend") or "",
-            # Forward ``model`` verbatim so handle_review_text's empty-
-            # string-vs-None distinction reaches the selector. ``None``
-            # (caller omitted) and ``""`` (caller-explicit "use
-            # provider default") have different meanings; ``or ""``
-            # would conflate them.
-            "model": args.get("model"),
-            "metadata": {"repo": repo, "pr_number": pr_number},
-            # review_pr fetches via API (no local clone), so the
-            # ``.reviewer/config.yaml`` layer can't activate here —
-            # callers who want a config-layer floor should call
-            # ``review_text`` directly with repo_root/base_sha in
-            # context. Pass through the skill-arg floor only.
-            "severity_floor": args.get("severity_floor") or "",
-        }
-        review_result = await self.handle_review_text(review_args)
+        # B4 routing (fr_reviewer_19c871ab): a docs-only PR — every changed file
+        # is a spec/artifact markdown under specs/ — goes 100% through the
+        # artifact-review pipeline (each file reviewed as a full document with
+        # the spec rubric). Code-only / mixed PRs keep the diff pipeline;
+        # per-file splitting of *mixed* PRs is a follow-on.
+        changed_paths = _diff_changed_paths(diff)
+        artifact_paths = [p for p in changed_paths if _is_artifact_pr_file(p)]
+        if changed_paths and len(artifact_paths) == len(changed_paths):
+            review_result = await self._review_pr_artifacts(
+                repo, pr_number, metadata, artifact_paths, args
+            )
+        else:
+            # Feed the diff into review_text via the shared path so selector,
+            # rule table, severity_floor, and usage recording all run exactly
+            # once per review, regardless of which entry skill was called.
+            review_args: dict[str, Any] = {
+                "kind": "pr_diff",
+                "content": diff,
+                "instructions": str(args.get("instructions") or ""),
+                "context": {
+                    "pr": metadata.to_dict(),
+                },
+                "backend": args.get("backend") or "",
+                # Forward ``model`` verbatim so handle_review_text's empty-
+                # string-vs-None distinction reaches the selector. ``None``
+                # (caller omitted) and ``""`` (caller-explicit "use
+                # provider default") have different meanings; ``or ""``
+                # would conflate them.
+                "model": args.get("model"),
+                "metadata": {"repo": repo, "pr_number": pr_number},
+                # review_pr fetches via API (no local clone), so the
+                # ``.reviewer/config.yaml`` layer can't activate here —
+                # callers who want a config-layer floor should call
+                # ``review_text`` directly with repo_root/base_sha in
+                # context. Pass through the skill-arg floor only.
+                "severity_floor": args.get("severity_floor") or "",
+            }
+            review_result = await self.handle_review_text(review_args)
         # ReviewResult.to_dict() always carries an ``error`` key (empty
         # string when the review succeeded). Early-return only on a
         # truthy error message.
