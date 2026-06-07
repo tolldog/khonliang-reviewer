@@ -1841,6 +1841,95 @@ async def test_cross_reference_persists_with_review(monkeypatch):
     )
 
 
+async def test_cross_reference_derives_cluster_from_ms_id(monkeypatch):
+    # ms_id but no explicit related_fr_ids → fetch the milestone's cluster and
+    # cross-reference each FR in it.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": {
+                "id": args["milestone_id"], "fr_ids": ["fr_live", "fr_dead"]}}}
+        if operation == "get_fr_local":
+            st = "archived" if args["fr_id"] == "fr_dead" else "open"
+            return {"result": {"id": args["fr_id"], "status": st}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_x"},
+    )
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+    assert "fr_dead" in xref[0]["title"] and "archived" in xref[0]["title"]
+
+
+async def test_cross_reference_ms_cluster_dedupes(monkeypatch):
+    # A milestone cluster with duplicate fr_ids -> one fetch / finding each.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    fr_fetches: list[str] = []
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": {"fr_ids": ["fr_dup", "fr_dup"]}}}
+        if operation == "get_fr_local":
+            fr_fetches.append(args["fr_id"])
+            return {"result": {"id": args["fr_id"], "status": "archived"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_x"},
+    )
+    assert fr_fetches == ["fr_dup"]
+    xref = [f for f in res["findings"] if f.get("category") == "cross-reference"]
+    assert len(xref) == 1
+
+
+async def test_cross_reference_explicit_ids_beat_ms_id(monkeypatch):
+    # Explicit related_fr_ids → milestone is NOT fetched.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    ms_fetched: list[str] = []
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            ms_fetched.append(args["milestone_id"])
+            return {"result": {"milestone": {"fr_ids": ["fr_other"]}}}
+        if operation == "get_fr_local":
+            return {"result": {"id": args["fr_id"], "status": "open"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_x",
+         "related_fr_ids": ["fr_explicit"]},
+    )
+    assert ms_fetched == []
+
+
+async def test_cross_reference_unknown_milestone_no_findings(monkeypatch):
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": None, "reason": "unknown"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_ghost"},
+    )
+    assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
+
+
 async def test_rule_table_routes_large_diff_to_claude():
     """≥2000 lines (or ≥20 files) → claude_cli per rule table."""
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
