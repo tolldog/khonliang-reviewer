@@ -1463,6 +1463,22 @@ async def test_review_artifact_persist_false_skips_store(monkeypatch):
     assert [op for op, _ in calls if op == "artifact_create"] == []
 
 
+async def test_review_artifact_persist_truthy_non_bool_skips_store(monkeypatch):
+    # A non-bool truthy value (e.g. the string "false" from YAML) must NOT
+    # trigger a store write — only a real boolean True persists.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+    calls = _fake_store(monkeypatch, harness)
+
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "content": "# FR", "persist": "false"},
+    )
+
+    assert "review_artifact_id" not in res
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
 async def test_review_artifact_persistence_failure_is_non_fatal(monkeypatch):
     # store errors → review still succeeds, just no review_artifact_id.
     ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))

@@ -279,9 +279,9 @@ def _resolve_artifact_kind(value: Any) -> str:
 def _unwrap(envelope: Any) -> Any:
     """Pull the inner payload from a bus request envelope.
 
-    ``self.request`` returns either ``{"result": <payload>}`` or a flat
-    error/payload dict; both store callers want the payload. Mirrors the
-    researcher's ``repo_docs._unwrap``.
+    ``self.request`` wraps a handler's result as ``{"result": <payload>}``;
+    error/transport envelopes arrive flat. Return the inner ``result`` when
+    present, otherwise the envelope itself, so store callers see one shape.
     """
     if isinstance(envelope, dict):
         return envelope.get("result", envelope)
@@ -2398,7 +2398,10 @@ class ReviewerAgent(BaseAgent):
 
         # Best-effort, append-only persistence (review history). A store
         # failure never fails the review — the result is the deliverable.
-        if args.get("persist", True) is not False and (
+        # Persist ONLY on a real boolean True (default when unset). A truthy
+        # non-bool — e.g. the string "false" from YAML/JSON tooling — must NOT
+        # trigger a store write, so this is `is True`, not a truthiness test.
+        if args.get("persist", True) is True and (
             isinstance(result, dict) and not result.get("error")
         ):
             review_artifact_id = await self._persist_review(
