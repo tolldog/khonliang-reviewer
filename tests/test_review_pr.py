@@ -741,22 +741,63 @@ async def test_review_pr_docs_only_routes_to_artifact_pipeline():
     assert "Acceptance untestable" in github.submit_calls[0]["body"]
 
 
-async def test_review_pr_mixed_uses_diff_pipeline():
+async def test_review_pr_mixed_routes_per_file():
+    # fr_reviewer_f6afdca9: a mixed PR routes per-file — code via the diff
+    # pipeline (spec excluded from that diff), spec via the artifact pipeline.
     github = _FakeGithub(
         diff=(
             "diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n"
             "diff --git a/src/app.py b/src/app.py\n@@ -1 +1 @@\n+code\n"
         ),
+        file_contents={"specs/MS-B/spec.md": "# MS-B Spec\n\nbody"},
     )
     harness, ollama, claude = _make_artifact_harness(github)
 
     await harness.call("review_pr", {"repo": "tolldog/example", "pr_number": 42})
 
-    # mixed PR keeps the diff pipeline; no per-file artifact fetch
+    # code file -> diff pipeline (ollama); the spec section is excluded from it
     assert ollama.last_request is not None
     assert ollama.last_request.kind == "pr_diff"
-    assert claude.last_request is None
-    assert github.file_fetches == []
+    assert "src/app.py" in ollama.last_request.content
+    assert "specs/MS-B/spec.md" not in ollama.last_request.content
+    # spec file -> artifact pipeline (claude), fetched whole at head
+    assert claude.last_request is not None
+    assert claude.last_request.kind == "spec"
+    assert github.file_fetches == [("specs/MS-B/spec.md", "abc123")]
+
+
+def test_split_diff_excluding():
+    from reviewer.agent import _split_diff_excluding
+
+    diff = (
+        "diff --git a/specs/MS-B/spec.md b/specs/MS-B/spec.md\n@@ -1 +1 @@\n+# Spec\n"
+        "diff --git a/src/app.py b/src/app.py\n@@ -1 +1 @@\n+code\n"
+    )
+    code_only = _split_diff_excluding(diff, {"specs/MS-B/spec.md"})
+    assert "src/app.py" in code_only
+    assert "specs/MS-B/spec.md" not in code_only
+    assert code_only.endswith("+code\n")
+    # empty exclude set returns the diff unchanged
+    assert _split_diff_excluding(diff, set()) == diff
+
+
+def test_merge_review_results():
+    from reviewer.agent import _merge_review_results
+
+    a = {
+        "summary": "code", "findings": [{"title": "x"}],
+        "backend": "ollama", "model": "qwen", "usage": {"input_tokens": 5},
+    }
+    b = {"summary": "spec", "findings": [{"title": "y"}, {"title": "z"}],
+         "backend": "", "model": ""}
+    merged = _merge_review_results(a, b)
+    assert merged["summary"] == "code | spec"
+    assert [f["title"] for f in merged["findings"]] == ["x", "y", "z"]
+    assert merged["error"] == ""
+    # provider identity + usage carried from the first result that has them
+    assert merged["backend"] == "ollama"
+    assert merged["model"] == "qwen"
+    assert merged["usage"] == {"input_tokens": 5}
 
 
 async def test_review_pr_artifact_fetch_error_is_comment_not_fatal():
