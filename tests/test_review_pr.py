@@ -784,12 +784,20 @@ def test_split_diff_excluding():
 def test_merge_review_results():
     from reviewer.agent import _merge_review_results
 
-    a = {"summary": "code", "findings": [{"title": "x"}]}
-    b = {"summary": "spec", "findings": [{"title": "y"}, {"title": "z"}]}
+    a = {
+        "summary": "code", "findings": [{"title": "x"}],
+        "backend": "ollama", "model": "qwen", "usage": {"input_tokens": 5},
+    }
+    b = {"summary": "spec", "findings": [{"title": "y"}, {"title": "z"}],
+         "backend": "", "model": ""}
     merged = _merge_review_results(a, b)
     assert merged["summary"] == "code | spec"
     assert [f["title"] for f in merged["findings"]] == ["x", "y", "z"]
     assert merged["error"] == ""
+    # provider identity + usage carried from the first result that has them
+    assert merged["backend"] == "ollama"
+    assert merged["model"] == "qwen"
+    assert merged["usage"] == {"input_tokens": 5}
 
 
 async def test_review_pr_artifact_fetch_error_is_comment_not_fatal():

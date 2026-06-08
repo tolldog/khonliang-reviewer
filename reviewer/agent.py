@@ -437,14 +437,22 @@ def _merge_review_results(*results: dict[str, Any]) -> dict[str, Any]:
         fs = r.get("findings")
         if isinstance(fs, list):
             findings.extend(fs)
-    return {
+    merged: dict[str, Any] = {
         "summary": " | ".join(summaries) if summaries else "Review — no findings.",
         "findings": findings,
         "disposition": "posted",
         "error": "",
-        "backend": "",
-        "model": "",
     }
+    # Carry provider identity + usage from the first result that has it (the
+    # primary code review in the mixed case) rather than hard-coding empties
+    # or dropping it.
+    for key in ("backend", "model", "usage", "error_category"):
+        for r in results:
+            val = r.get(key)
+            if val:
+                merged[key] = val
+                break
+    return merged
 
 
 class DistillOverrideError(ValueError):
