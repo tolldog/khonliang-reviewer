@@ -401,6 +401,52 @@ def _artifact_route_note(path: str, title: str, body: str) -> dict[str, Any]:
     }
 
 
+def _split_diff_excluding(diff: str, exclude_paths: set[str]) -> str:
+    """Return the unified diff with the excluded files' sections removed.
+
+    Splits on ``diff --git `` boundaries and drops any section whose b-side
+    path is in ``exclude_paths``; the remaining sections are rejoined
+    byte-intact. Used by review_pr's mixed-PR routing to build a code-only diff
+    (spec files go to the artifact pipeline instead).
+    """
+    if not exclude_paths:
+        return diff
+    out: list[str] = []
+    keep = True
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            marker = line.split(" b/", 1)
+            path = marker[1].strip() if len(marker) == 2 else ""
+            keep = path not in exclude_paths
+        if keep:
+            out.append(line)
+    return "".join(out)
+
+
+def _merge_review_results(*results: dict[str, Any]) -> dict[str, Any]:
+    """Combine several review_result dicts (summaries + findings) into one.
+
+    Used when review_pr reviews a mixed PR through two pipelines (diff +
+    artifact) and posts a single aggregated GitHub review.
+    """
+    summaries = [
+        s for r in results if (s := str(r.get("summary") or "").strip())
+    ]
+    findings: list[dict[str, Any]] = []
+    for r in results:
+        fs = r.get("findings")
+        if isinstance(fs, list):
+            findings.extend(fs)
+    return {
+        "summary": " | ".join(summaries) if summaries else "Review — no findings.",
+        "findings": findings,
+        "disposition": "posted",
+        "error": "",
+        "backend": "",
+        "model": "",
+    }
+
+
 class DistillOverrideError(ValueError):
     """Raised when a caller-supplied distill override (``body_mode`` /
     ``dedup`` / ``max_findings``) isn't a valid value.
@@ -2351,11 +2397,14 @@ class ReviewerAgent(BaseAgent):
         except GithubClientError as exc:
             return {"error": f"github fetch failed: {exc}"}
 
-        # B4 routing (fr_reviewer_19c871ab): a docs-only PR — every changed file
-        # is a spec/artifact markdown under specs/ — goes 100% through the
-        # artifact-review pipeline (each file reviewed as a full document with
-        # the spec rubric). Code-only / mixed PRs keep the diff pipeline;
-        # per-file splitting of *mixed* PRs is a follow-on.
+        # Per-file routing (fr_reviewer_19c871ab + fr_reviewer_f6afdca9):
+        # artifact/spec files (specs/*.md) go through the artifact-review
+        # pipeline (full document + spec rubric); code files go through the
+        # diff pipeline. Three shapes:
+        #   - docs-only  → every file is artifact → artifact pipeline only
+        #   - code-only  → no artifact files     → diff pipeline only (today)
+        #   - mixed      → both → code-only diff via diff pipeline + each spec
+        #                  via artifact pipeline, results merged
         changed_paths = _diff_changed_paths(diff)
         artifact_paths = [p for p in changed_paths if _is_artifact_pr_file(p)]
         if changed_paths and len(artifact_paths) == len(changed_paths):
@@ -2363,32 +2412,49 @@ class ReviewerAgent(BaseAgent):
                 repo, pr_number, metadata, artifact_paths, args
             )
         else:
-            # Feed the diff into review_text via the shared path so selector,
-            # rule table, severity_floor, and usage recording all run exactly
-            # once per review, regardless of which entry skill was called.
-            review_args: dict[str, Any] = {
-                "kind": "pr_diff",
-                "content": diff,
-                "instructions": str(args.get("instructions") or ""),
-                "context": {
-                    "pr": metadata.to_dict(),
-                },
-                "backend": args.get("backend") or "",
-                # Forward ``model`` verbatim so handle_review_text's empty-
-                # string-vs-None distinction reaches the selector. ``None``
-                # (caller omitted) and ``""`` (caller-explicit "use
-                # provider default") have different meanings; ``or ""``
-                # would conflate them.
-                "model": args.get("model"),
-                "metadata": {"repo": repo, "pr_number": pr_number},
-                # review_pr fetches via API (no local clone), so the
-                # ``.reviewer/config.yaml`` layer can't activate here —
-                # callers who want a config-layer floor should call
-                # ``review_text`` directly with repo_root/base_sha in
-                # context. Pass through the skill-arg floor only.
-                "severity_floor": args.get("severity_floor") or "",
-            }
-            review_result = await self.handle_review_text(review_args)
+            # Code review over the diff — with artifact-file sections removed
+            # in the mixed case so spec hunks aren't double-reviewed (they go
+            # to the artifact pipeline below).
+            code_diff = (
+                _split_diff_excluding(diff, set(artifact_paths))
+                if artifact_paths
+                else diff
+            )
+            code_result: dict[str, Any] | None = None
+            if code_diff.strip():
+                # Feed the diff into review_text via the shared path so
+                # selector, rule table, severity_floor, and usage recording all
+                # run exactly once, regardless of which entry skill was called.
+                review_args: dict[str, Any] = {
+                    "kind": "pr_diff",
+                    "content": code_diff,
+                    "instructions": str(args.get("instructions") or ""),
+                    "context": {"pr": metadata.to_dict()},
+                    "backend": args.get("backend") or "",
+                    # Forward ``model`` verbatim so handle_review_text's empty-
+                    # string-vs-None distinction reaches the selector.
+                    "model": args.get("model"),
+                    "metadata": {"repo": repo, "pr_number": pr_number},
+                    # review_pr fetches via API (no local clone), so the
+                    # ``.reviewer/config.yaml`` layer can't activate here.
+                    "severity_floor": args.get("severity_floor") or "",
+                }
+                code_result = await self.handle_review_text(review_args)
+                if code_result.get("error"):
+                    return code_result
+            if artifact_paths:
+                artifact_result = await self._review_pr_artifacts(
+                    repo, pr_number, metadata, artifact_paths, args
+                )
+                parts = [code_result, artifact_result] if code_result else [artifact_result]
+                review_result = _merge_review_results(*parts)
+            else:
+                review_result = code_result or {
+                    "summary": "No changes to review.",
+                    "findings": [],
+                    "disposition": "posted",
+                    "error": "",
+                }
         # ReviewResult.to_dict() always carries an ``error`` key (empty
         # string when the review succeeded). Early-return only on a
         # truthy error message.
