@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -369,6 +370,157 @@ def _diff_changed_paths(diff: str) -> list[str]:
             if len(marker) == 2 and marker[1].strip():
                 paths.append(marker[1].strip())
     return paths
+
+
+#: khonliang FR id shape: ``fr_<repo>_<hex>`` (e.g. ``fr_reviewer_19c871ab``,
+#: ``fr_store_8e5cae37``, ``fr_khonliang-researcher_f50567f8``). The repo segment
+#: allows lowercase letters, digits, and hyphens; the trailing segment is a hex
+#: suffix of 6+ chars. Matched case-insensitively in free-text spec bodies.
+_FR_ID_RE = re.compile(r"\bfr_[a-z0-9-]+_[0-9a-f]{6,}\b", re.IGNORECASE)
+
+#: SequenceMatcher ratio above which two same-repo FR ids' **hex suffixes** are
+#: treated as a near-miss (likely typo) rather than two distinct FRs. Only the
+#: suffix is compared (after requiring an identical ``fr_<repo>`` segment), so
+#: repo-name length can't inflate the score — a long repo name otherwise pushes
+#: unrelated suffixes over the bar on whole-id matching. A 1-char diff in a 6–8
+#: char hex suffix ratios ~0.83–0.88 (clears); a 2-char diff ~0.67–0.75 (does
+#: not). Tuned to catch single-char fat-fingers without flagging distinct FRs.
+_DRIFT_SUFFIX_CUTOFF = 0.8
+
+
+def _extract_fr_ids(text: str) -> list[str]:
+    """Order-preserving, deduped, lowercased FR ids mentioned in free text."""
+    seen: dict[str, None] = {}
+    for match in _FR_ID_RE.finditer(text or ""):
+        seen.setdefault(match.group(0).lower(), None)
+    return list(seen)
+
+
+def _split_fr_id(fr_id: str) -> tuple[str, str]:
+    """``fr_<repo>_<hex>`` → ``("fr_<repo>", "<hex>")`` (split on the last ``_``)."""
+    prefix, _, suffix = fr_id.rpartition("_")
+    return prefix, suffix
+
+
+def _near_fr_id(fr_id: str, candidates: list[str]) -> str | None:
+    """Closest *same-repo* candidate whose hex suffix is a near-miss, or ``None``.
+
+    Only candidates sharing the exact ``fr_<repo>`` segment are eligible, and only
+    the hex suffix is fuzzy-compared (:data:`_DRIFT_SUFFIX_CUTOFF`) — so a typo is
+    a single mistyped hex char, not an artifact of repo-name length.
+    """
+    prefix, suffix = _split_fr_id(fr_id)
+    # suffix -> full id, restricted to same-repo candidates (excluding self).
+    same_repo: dict[str, str] = {}
+    for cand in candidates:
+        cand_prefix, cand_suffix = _split_fr_id(cand)
+        if cand_prefix == prefix and cand != fr_id:
+            same_repo.setdefault(cand_suffix, cand)
+    if not same_repo:
+        return None
+    near = difflib.get_close_matches(
+        suffix, list(same_repo), n=1, cutoff=_DRIFT_SUFFIX_CUTOFF
+    )
+    return same_repo[near[0]] if near else None
+
+
+def _spec_milestone_drift_findings(
+    spec_body: str, cluster: list[str]
+) -> list[dict[str, Any]]:
+    """Fuzzy spec↔milestone FR-cluster drift findings (pure comparison).
+
+    Compares the FR ids a spec body actually *mentions* against the milestone's
+    ``fr_ids`` cluster (fetched by the caller) and surfaces structural drift the
+    LLM rubric can't see reliably:
+
+    - **typo** (``concern``): a mentioned id that is not in the cluster but is a
+      same-repo near-miss of a cluster id (:func:`_near_fr_id`) — a likely wrong id.
+    - **extra** (``comment``): a mentioned id that is neither in the cluster nor a
+      near-miss of any cluster id — the spec references work outside the milestone
+      (often intentional, so only informational).
+    - **omission** (``concern``): a cluster FR the spec never mentions and that no
+      mentioned typo points at — the spec has drifted from the milestone it was
+      drafted from (or the cluster grew).
+
+    Typos are detected from the spec side against the *whole* cluster (so a typo
+    is caught even when the correct id is also present), and the cluster id a typo
+    explains is not double-reported as an omission. ``§Milestone``-anchored;
+    ``cluster`` empty → ``[]``.
+    """
+    if not cluster:
+        return []
+    # Order-preserving dedup + lowercase so comparisons are case-insensitive.
+    cluster_norm = list(
+        dict.fromkeys(c.lower() for c in cluster if isinstance(c, str) and c.strip())
+    )
+    if not cluster_norm:
+        return []
+    mentioned = _extract_fr_ids(spec_body)
+    cluster_set = set(cluster_norm)
+
+    findings: list[dict[str, Any]] = []
+    typo_targets: set[str] = set()  # cluster ids explained by a mentioned typo
+    for fr in mentioned:
+        if fr in cluster_set:
+            continue
+        near = _near_fr_id(fr, cluster_norm)
+        if near is not None:
+            typo_targets.add(near)
+            findings.append(
+                {
+                    "severity": "concern",
+                    "title": f"Possible FR id typo for {near}",
+                    "body": (
+                        f"The milestone cluster includes {near!r}, but the spec "
+                        f"mentions {fr!r} (same repo, near-miss suffix). Likely a "
+                        "typo — reconcile the id."
+                    ),
+                    "category": "spec-milestone-drift",
+                    "path": None,
+                    "line": None,
+                    "section": "§Milestone",
+                    "suggestion": f"Use {near!r} to match the milestone cluster.",
+                }
+            )
+        else:
+            findings.append(
+                {
+                    "severity": "comment",
+                    "title": f"Spec references FR {fr} outside the milestone",
+                    "body": (
+                        f"The spec mentions {fr!r}, which is not in the milestone's FR "
+                        "cluster. If the spec's scope intentionally exceeds the "
+                        "milestone this is fine; otherwise the cluster may be stale."
+                    ),
+                    "category": "spec-milestone-drift",
+                    "path": None,
+                    "line": None,
+                    "section": "§Milestone",
+                    "suggestion": None,
+                }
+            )
+
+    mentioned_set = set(mentioned)
+    for fr in cluster_norm:
+        if fr in mentioned_set or fr in typo_targets:
+            continue
+        findings.append(
+            {
+                "severity": "concern",
+                "title": f"Spec omits milestone FR {fr}",
+                "body": (
+                    f"{fr!r} is in the milestone's FR cluster but is not "
+                    "mentioned in the spec — the spec has drifted from the "
+                    "milestone (stale spec, or the cluster changed)."
+                ),
+                "category": "spec-milestone-drift",
+                "path": None,
+                "line": None,
+                "section": "§Milestone",
+                "suggestion": None,
+            }
+        )
+    return findings
 
 
 def _artifact_route_note(path: str, title: str, body: str) -> dict[str, Any]:
@@ -1424,7 +1576,10 @@ class ReviewerAgent(BaseAgent):
                 "cross-checked against the developer store — dangling or "
                 "archived references become concern findings; if `ms_id` is "
                 "given without `related_fr_ids`, the milestone's FR cluster is "
-                "fetched and cross-checked. On success the "
+                "fetched and cross-checked. For a `spec` with an `ms_id`, the "
+                "spec body is also fuzzy-checked against that cluster for drift "
+                "(FRs the spec omits, near-miss id typos, or FRs it references "
+                "outside the milestone). On success the "
                 "result is persisted as a store artifact (append-only review "
                 "history) and its id returned as `review_artifact_id`; pass "
                 "`persist=false` to skip.",
@@ -2777,14 +2932,30 @@ class ReviewerAgent(BaseAgent):
             else []
         )
         if isinstance(result, dict) and not result.get("error"):
-            # No explicit related_fr_ids but an ms_id was supplied → derive the
-            # cross-reference set from the milestone's actual FR cluster.
-            if not related_fr_ids and provenance.get("ms_id"):
-                related_fr_ids = await self._milestone_fr_ids(provenance["ms_id"])
+            # Fetch the milestone's FR cluster once and reuse it for both the
+            # cross-reference pass and the drift check. Only fetch when actually
+            # needed: to derive the cross-ref set (no explicit related_fr_ids) or
+            # to drift-check a spec. With explicit ids on a non-spec, the cluster
+            # is never used, so the fetch is skipped (explicit ids beat ms_id).
+            ms_id = provenance.get("ms_id")
+            cluster: list[str] = []
+            if ms_id and (not related_fr_ids or kind == "spec"):
+                cluster = await self._milestone_fr_ids(ms_id)
+            # No explicit related_fr_ids but an ms_id was supplied → cross-ref the
+            # milestone's actual FR cluster.
+            if not related_fr_ids and cluster:
+                related_fr_ids = cluster
             if related_fr_ids:
                 xref = await self._cross_reference_frs(related_fr_ids)
                 if xref:
                     result.setdefault("findings", []).extend(xref)
+            # Fuzzy spec↔milestone drift: does the spec body actually mention the
+            # milestone's FR cluster? Spec-only, since the spec is the document
+            # whose FR list can drift from the milestone it was drafted from.
+            if kind == "spec" and cluster:
+                drift = _spec_milestone_drift_findings(content, cluster)
+                if drift:
+                    result.setdefault("findings", []).extend(drift)
 
         # Best-effort, append-only persistence (review history). A store
         # failure never fails the review — the result is the deliverable.
