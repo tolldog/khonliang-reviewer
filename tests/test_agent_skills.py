@@ -1553,11 +1553,46 @@ async def test_review_artifact_id_empty_body_errors(monkeypatch):
 # -- list_reviews / get_review (fr_reviewer_19c871ab B1) --------------
 
 
-def _fake_store_list(monkeypatch, harness, *, artifacts, get_text=None):
-    """Stub harness.agent.request for artifact_list / artifact_get reads."""
+def _fake_store_list(monkeypatch, harness, *, artifacts, get_text=None, calls=None):
+    """Stub harness.agent.request for artifact_list / artifact_get reads.
+
+    Mimics the store's *server-side* filtering (subset/AND ``metadata`` match,
+    ``since`` created_at cutoff, newest-first, ``limit`` cap — fr_store_8e5cae37)
+    so reviewer tests exercise the delegated-filter path rather than the old
+    client-side loop. When ``calls`` is a list, each ``artifact_list`` args dict
+    is appended to it for delegation assertions.
+    """
+    from datetime import datetime as _dt
+
+    def _epoch(value):
+        try:
+            return _dt.fromisoformat(str(value).strip()).timestamp()
+        except (ValueError, TypeError):
+            return None
+
     async def fake_request(*, agent_type, operation, args, **kw):
         if operation == "artifact_list":
-            return {"result": {"artifacts": artifacts}}
+            if calls is not None:
+                calls.append(args)
+            flt = args.get("metadata") or {}
+            rows = [
+                a
+                for a in artifacts
+                if isinstance(a.get("metadata"), dict)
+                and all(a["metadata"].get(k) == v for k, v in flt.items())
+            ]
+            since = args.get("since")
+            if since not in (None, ""):
+                cutoff = float(since)
+                rows = [
+                    a
+                    for a in rows
+                    if _epoch(a.get("created_at")) is None
+                    or _epoch(a.get("created_at")) >= cutoff
+                ]
+            rows.sort(key=lambda a: _epoch(a.get("created_at")) or 0.0, reverse=True)
+            lim = int(args.get("limit") or len(rows))
+            return {"result": {"artifacts": rows[:lim]}}
         if operation == "artifact_get":
             return {"result": {"artifact": {"id": args["id"]}, "text": get_text or ""}}
         return {"result": {"error": f"unexpected op {operation}"}}
@@ -1635,6 +1670,37 @@ async def test_list_reviews_since_days_filters_old(monkeypatch):
 
     res = await harness.call("list_reviews", {"project": "p", "since_days": 1})
     assert [r["review_artifact_id"] for r in res["reviews"]] == ["art_recent"]
+
+
+async def test_list_reviews_delegates_filter_to_store(monkeypatch):
+    # The reviewer must push filtering server-side (fr_store_8e5cae37): the
+    # artifact_list call carries metadata={fr_id,project}, a numeric `since`
+    # cutoff, and the caller's limit — not a fetch-all-then-client-filter.
+    harness = _make_harness()
+    calls: list[dict] = []
+    _fake_store_list(monkeypatch, harness, artifacts=[], calls=calls)
+
+    await harness.call(
+        "list_reviews",
+        {"fr_id": "fr_a", "project": "p", "since_days": 7, "limit": 5},
+    )
+    assert len(calls) == 1
+    sent = calls[0]
+    assert sent["kind"] == "reviewer_artifact_review"
+    assert sent["metadata"] == {"fr_id": "fr_a", "project": "p"}
+    assert sent["limit"] == 5
+    assert isinstance(sent["since"], (int, float)) and sent["since"] > 0
+
+
+async def test_list_reviews_omits_empty_filters_to_store(monkeypatch):
+    # No id/project/since_days → no metadata/since keys sent (lists everything,
+    # backward-compatible with the store's unfiltered behavior).
+    harness = _make_harness()
+    calls: list[dict] = []
+    _fake_store_list(monkeypatch, harness, artifacts=[], calls=calls)
+
+    await harness.call("list_reviews", {})
+    assert calls and "metadata" not in calls[0] and "since" not in calls[0]
 
 
 async def test_list_reviews_store_unreachable_errors():
