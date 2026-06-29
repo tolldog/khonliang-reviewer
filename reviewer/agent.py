@@ -334,12 +334,6 @@ _ARTIFACT_GET_MAX_CHARS = 200_000
 #: (write in :meth:`_persist_review`, read in ``list_reviews``).
 _REVIEW_ARTIFACT_KIND = "reviewer_artifact_review"
 
-#: Page size pulled from the store before client-side metadata filtering in
-#: ``list_reviews``. Generous because filtering is client-side until the
-#: store grows server-side metadata filtering (fr_store_8e5cae37); the store
-#: clamps to its own MAX_LIST_LIMIT.
-_REVIEW_LIST_FETCH_LIMIT = 200
-
 
 def _parse_created_at(created_at: Any) -> float | None:
     """Epoch seconds for the store's ISO-8601 ``created_at``, or ``None``.
@@ -353,16 +347,6 @@ def _parse_created_at(created_at: Any) -> float | None:
         return datetime.fromisoformat(created_at.strip()).timestamp()
     except ValueError:
         return None
-
-
-def _created_after(created_at: Any, cutoff_epoch: float) -> bool:
-    """True iff ``created_at`` is at/after ``cutoff_epoch``.
-
-    Unparseable / missing values return ``True`` (include rather than silently
-    drop — the recency filter is best-effort).
-    """
-    ts = _parse_created_at(created_at)
-    return ts is None or ts >= cutoff_epoch
 
 
 #: PR files that ``review_pr`` routes to the artifact-review pipeline: markdown
@@ -2822,24 +2806,23 @@ class ReviewerAgent(BaseAgent):
         """Enumerate persisted artifact-review records (fr_reviewer_19c871ab B1).
 
         Filters by object id (``fr_id`` / ``spec_id`` / ``ms_id``), ``project``,
-        and ``since_days`` recency, newest first. Reads
-        ``kind=reviewer_artifact_review`` from the store and filters
-        **client-side** — server-side metadata filtering is tracked in
-        fr_store_8e5cae37; until it lands this can miss matches beyond
-        ``_REVIEW_LIST_FETCH_LIMIT``.
+        and ``since_days`` recency, newest first. Delegates the filter to the
+        store's ``artifact_list`` (``metadata`` subset/AND + ``since`` cutoff,
+        SQL-filtered, capped by ``limit`` over the matched set — fr_store_8e5cae37);
+        the store returns newest-first, and a defensive sort guards display order.
         """
-        filters: dict[str, str] = {}
+        metadata: dict[str, str] = {}
         for key in ("fr_id", "spec_id", "ms_id", "project"):
             val = args.get(key)
             if isinstance(val, str) and val.strip():
-                filters[key] = val.strip()
+                metadata[key] = val.strip()
         try:
             limit = int(args.get("limit") or 50)
         except (TypeError, ValueError):
             return {"error": "limit must be an integer"}
         limit = max(1, limit)
 
-        since_cutoff: float | None = None
+        since_epoch: float | None = None
         raw_days = args.get("since_days")
         if raw_days not in (None, "", 0, 0.0):
             try:
@@ -2847,13 +2830,15 @@ class ReviewerAgent(BaseAgent):
             except (TypeError, ValueError):
                 return {"error": "since_days must be a number"}
             if days > 0:
-                since_cutoff = time.time() - days * 86400.0
+                since_epoch = time.time() - days * 86400.0
 
+        store_args: dict[str, Any] = {"kind": _REVIEW_ARTIFACT_KIND, "limit": limit}
+        if metadata:
+            store_args["metadata"] = metadata
+        if since_epoch is not None:
+            store_args["since"] = since_epoch
         try:
-            resp = await self._store_request(
-                "artifact_list",
-                {"kind": _REVIEW_ARTIFACT_KIND, "limit": _REVIEW_LIST_FETCH_LIMIT},
-            )
+            resp = await self._store_request("artifact_list", store_args)
         except Exception as exc:  # bus unreachable / transport error
             return {
                 "error": f"list_reviews: store unreachable: {exc}",
@@ -2863,18 +2848,12 @@ class ReviewerAgent(BaseAgent):
             detail = resp.get("error") if isinstance(resp, dict) else "bad store response"
             return {"error": f"list_reviews: store error: {detail}"}
 
-        matches: list[dict[str, Any]] = []
+        reviews: list[dict[str, Any]] = []
         for item in resp.get("artifacts") or []:
             if not isinstance(item, dict):
                 continue
             meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            if any(meta.get(k) != v for k, v in filters.items()):
-                continue
-            if since_cutoff is not None and not _created_after(
-                item.get("created_at"), since_cutoff
-            ):
-                continue
-            matches.append(
+            reviews.append(
                 {
                     "review_artifact_id": item.get("id"),
                     "created_at": item.get("created_at"),
@@ -2883,12 +2862,11 @@ class ReviewerAgent(BaseAgent):
                     "metadata": meta,
                 }
             )
-        # Guarantee newest-first ourselves (don't rely on store ordering),
-        # then cap to limit — so the top-N is the N most recent matches.
-        matches.sort(
+        # Store already orders by created_at DESC and caps to limit; keep a
+        # defensive newest-first sort so display order survives any store change.
+        reviews.sort(
             key=lambda r: _parse_created_at(r.get("created_at")) or 0.0, reverse=True
         )
-        reviews = matches[:limit]
         return {"reviews": reviews, "count": len(reviews)}
 
     @handler("get_review")
