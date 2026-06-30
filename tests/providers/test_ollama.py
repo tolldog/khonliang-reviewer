@@ -546,22 +546,68 @@ def test_suggest_num_ctx_returns_none_for_small_prompt():
     """Prompts that fit Ollama's 4096 default should not override num_ctx."""
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 9000 chars = 3000 estimated tokens + 1024 headroom = 4024 → under default.
-    assert _suggest_num_ctx("x" * 9000) is None
+    # Budget = ceil(bytes/2.3) + 1024 headroom + 256 template. 6000 bytes
+    # → ceil(2609) + 1280 = 3889 ≤ 4096 → fits default → None.
+    assert _suggest_num_ctx("x" * 6000) is None
     assert _suggest_num_ctx("hi") is None
 
 
-def test_suggest_num_ctx_steps_up_through_ladder():
-    """Larger prompts should land on standard llama.cpp window sizes."""
+def test_suggest_num_ctx_snug_rounds_up_to_granularity():
+    """Larger prompts get a window snugly above their worst-case token
+    count, rounded up to the 2048 granularity — not a coarse power-of-two
+    leap. Sizing uses the bytes/2.3 worst-case floor + 1024 headroom.
+
+    window = ceil(bytes / 2.3) + 1024 headroom + 256 template, then ceil
+    to 2048. "x" is one UTF-8 byte, so bytes == char count.
+    """
     from reviewer.providers.ollama import _suggest_num_ctx
 
+    # 15_000/2.3=6522 +1024+256=7802 → ceil to 2048 → 8192
     assert _suggest_num_ctx("x" * 15_000) == 8192
-    assert _suggest_num_ctx("x" * 30_000) == 16384
-    assert _suggest_num_ctx("x" * 80_000) == 32768
-    assert _suggest_num_ctx("x" * 150_000) == 65536
+    # 30_000/2.3=13_044 +1280=14_324 → 14_336
+    assert _suggest_num_ctx("x" * 30_000) == 14_336
+    # 80_000/2.3=34_783 +1280=36_063 → 36_864
+    assert _suggest_num_ctx("x" * 80_000) == 36_864
+    # 150_000/2.3=65_218 +1280=66_498 → 67_584
+    assert _suggest_num_ctx("x" * 150_000) == 67_584
 
 
-def test_suggest_num_ctx_caps_at_largest_ladder_step():
+def test_suggest_num_ctx_covers_worst_case_density():
+    """The sized window must hold a real 2.3-bytes/token tokenization of
+    the prompt plus the response headroom — regression guard for codex's
+    P1 (snug rounding eroding the slack the old ladder gave token-dense
+    diffs). Includes codex's concrete 11_777-byte counterexample, which
+    must NOT truncate."""
+    import math
+
+    from reviewer.providers.ollama import (
+        _CHAT_TEMPLATE_TOKEN_OVERHEAD,
+        _RESPONSE_TOKEN_HEADROOM,
+        _suggest_num_ctx,
+    )
+
+    # codex's concrete case: bytes/2.3 needs 5121 + 1024 = 6145 tokens;
+    # the window must be ≥ that (the 1.3x factor returned 6144 → truncate).
+    assert _suggest_num_ctx("x" * 11_777) == 8192
+    # codex's exact-granularity-boundary case: bytes/2.3 + 1024 == 6144
+    # exactly, so without the template allowance the window was 6144 with
+    # zero room for /api/chat's control tokens. Must clear the boundary.
+    assert _suggest_num_ctx("x" * 11_774) == 8192
+
+    # General property: the window holds the worst-case prompt + response
+    # headroom + chat-template overhead across a range of prompt sizes.
+    for n in (10_000, 11_774, 11_777, 20_000, 50_000, 123_456):
+        prompt = "x" * n
+        window = _suggest_num_ctx(prompt)
+        budget = (
+            math.ceil(len(prompt.encode("utf-8")) / 2.3)
+            + _RESPONSE_TOKEN_HEADROOM
+            + _CHAT_TEMPLATE_TOKEN_OVERHEAD
+        )
+        assert window >= budget, (n, window, budget)
+
+
+def test_suggest_num_ctx_caps_at_max():
     from reviewer.providers.ollama import _suggest_num_ctx
 
     assert _suggest_num_ctx("x" * 1_000_000) == 131072
@@ -619,7 +665,8 @@ def test_resolve_num_ctx_falls_through_to_auto_bump():
         kind="pr_diff", content=big_prompt, metadata={}, request_id="req-test"
     )
     cfg = OllamaProviderConfig()
-    assert _resolve_num_ctx(request, cfg, big_prompt) == 16384
+    # 30_000/3=10_000; *1.3=13_000 +1024=14_024 → snug-rounded to 14_336.
+    assert _resolve_num_ctx(request, cfg, big_prompt) == 14_336
 
 
 def test_resolve_num_ctx_falls_through_for_small_prompt():
@@ -814,19 +861,29 @@ async def test_review_passes_num_ctx_for_large_prompt():
     assert "options" in payload
     num_ctx = payload["options"]["num_ctx"]
     assert num_ctx > 4096
-    assert num_ctx in {8192, 16384, 32768, 65536, 131072}
+    assert num_ctx % 2048 == 0
+    assert num_ctx <= 131072
 
 
 def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
+    """The override decision and the sizing share one budget, so the
+    None/override boundary is where that single budget crosses 4096."""
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    assert _suggest_num_ctx("x" * 9216) is None
-    assert _suggest_num_ctx("x" * 9217) == 8192
+    # 6476 bytes → ceil(6476/2.3)=2816 + 1280 = 4096 → fits default → None.
+    assert _suggest_num_ctx("x" * 6476) is None
+    # 6477 bytes → ceil(6477/2.3)=2817 + 1280 = 4097 → override, snug 6144.
+    # Regression for the decision/sizing inconsistency: this prompt used to
+    # return None (typical bytes/3 fit 4096) while its worst-case budget
+    # exceeded the default — a silent-truncation gap.
+    assert _suggest_num_ctx("x" * 6477) == 6144
 
 
 def test_suggest_num_ctx_counts_utf8_bytes_for_non_ascii():
     from reviewer.providers.ollama import _suggest_num_ctx
 
+    # "中" is 3 UTF-8 bytes → 15_000 bytes / 3 = 5000 prompt tokens;
+    # *1.3=6500 +1024=7524 → snug 8192 (same as the 15_000-"x" case).
     cjk_prompt = "中" * 5000
     assert _suggest_num_ctx(cjk_prompt) == 8192
     assert _suggest_num_ctx("x" * 5000) is None

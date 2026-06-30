@@ -437,37 +437,66 @@ _TRUNCATION_INPUT_THRESHOLD = 2000
 _TRUNCATION_OUTPUT_THRESHOLD = 32
 
 
-# Standard ``num_ctx`` step sizes Ollama exposes. We round up the
-# estimated token count to one of these so the model gets a
-# power-of-two-ish window — which is what the underlying llama.cpp
-# implementations expect — rather than an arbitrary number.
-_NUM_CTX_LADDER: tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
+# Round the sizing budget *up* to a multiple of this so the window
+# tracks the prompt at a fine granularity instead of leaping to the next
+# power-of-two. llama.cpp accepts an arbitrary ``n_ctx`` — there is no
+# hard power-of-two requirement — so a granular ceiling is safe. This is
+# sizing *hygiene* (explicit, fine-grained, the window means what the
+# budget says) rather than a VRAM win: once the budget below accounts for
+# worst-case token density + chat-template overhead, the resulting window
+# lands *comparable* to the old coarse ladder — sometimes tighter (mid
+# range), sometimes slightly larger (the ladder's accidental slack
+# happened to under-cover dense diffs there). The real decode-speed /
+# VRAM lever for the timeout this milestone targets is the fast pre-push
+# tier (part 2) and timeout→skip degradation (part 3), not this.
+_NUM_CTX_GRANULARITY = 2048
+
+# Hard ceiling on the auto-bumped window. Beyond this the model can't
+# usefully consume the prompt anyway; cap here so an oversized prompt
+# still goes through (with a truncation warning if output is small)
+# rather than requesting an absurd context.
+_NUM_CTX_MAX = 131072
 
 # Ollama's compiled-in default. We only override above this; below it
 # the override would be a no-op and risks rejection from local models
 # that don't accept smaller-than-default ``num_ctx``.
 _NUM_CTX_DEFAULT = 4096
 
-# Conservative UTF-8 BYTES-per-token ratio for any script. Counting
-# bytes (not characters) keeps the estimator uniform across scripts:
-# ASCII is 1 byte/char and ~3-4 chars/token (so ~3-4 bytes/token);
-# CJK is 3 bytes/char and ~1 char/token (so ~3 bytes/token). Across
-# every script the ratio sits at roughly 3-5 bytes/token. Picking 3
-# as the lower bound biases toward overshooting — overestimating
-# tokens just sizes ``num_ctx`` slightly large; underestimating is
-# the trap this whole helper exists to close.
-#
-# Earlier versions used ``len(prompt)`` (character count) which
-# silently underestimated for CJK / RTL / emoji-heavy content where a
-# single character can be one token. ``len(prompt.encode('utf-8'))``
-# is the canonical fix.
-_BYTES_PER_TOKEN = 3
-
 # Headroom reserved for the model's response so ``num_ctx`` covers
 # both prompt and completion. Real reviews emit summary + N findings;
 # 1024 tokens covers a typical structured response with several
 # medium-bodied findings.
 _RESPONSE_TOKEN_HEADROOM = 1024
+
+# Fixed allowance for the chat-template / control tokens Ollama's
+# ``/api/chat`` injects around the prompt (system + role markers, BOS/EOS,
+# tool framing) *before* enforcing ``options.num_ctx``. These are not in
+# ``prompt`` itself, so without an explicit allowance a window sized to
+# exactly ``worst_case + headroom`` (e.g. landing on a granularity
+# multiple) would leave zero room for them and truncate. 256 is generous
+# for any single system+user+assistant wrapper.
+_CHAT_TEMPLATE_TOKEN_OVERHEAD = 256
+
+# Worst-case UTF-8 bytes-per-token floor — the SINGLE density assumption
+# behind both "do we need to override?" and "how big a window?". Review
+# prompts are code diffs dense with punctuation, short identifiers, and
+# newlines, whose worst hunks tokenize down to ~2.3 bytes/token. Using one
+# floor for both the decision and the sizing keeps them consistent: there
+# is no band where we decline to override yet would have sized a window
+# larger than the default (the silent-truncation gap this helper exists to
+# close). Counting bytes (not characters) keeps the estimate uniform across
+# scripts — ASCII ~3-4 bytes/token, CJK ~3 bytes/token, all ≥ this floor;
+# ``len(prompt.encode('utf-8'))`` is the canonical measure (an earlier
+# character-count version under-counted CJK / RTL / emoji-heavy content).
+# The old coarse ladder (8k/16k/32k/…) absorbed density variance by
+# accident — its next-power-of-two jump left a large cushion. Granular
+# rounding removes that accidental cushion, so we restore a *deliberate,
+# provable* one: round the budget up to the granularity. Because rounding
+# only ever increases the value, the window is guaranteed ≥ the token count
+# a real 2.3-bytes/token tokenization plus its chat wrapper needs — no
+# boundary off-by-one. Net window size lands comparable to the old ladder
+# (the point is correctness + explicit budgeting, not a VRAM reduction).
+_BYTES_PER_TOKEN_FLOOR = 2.3
 
 
 def _resolve_num_ctx(
@@ -583,39 +612,47 @@ def _coerce_format_value(value: Any) -> str | None:
 def _suggest_num_ctx(prompt: str) -> int | None:
     """Suggest a ``num_ctx`` value that fits the prompt + a response.
 
-    Returns the smallest standard window in :data:`_NUM_CTX_LADDER`
-    that holds an estimated prompt-token count plus
-    :data:`_RESPONSE_TOKEN_HEADROOM`. Returns ``None`` when the
-    estimate fits inside Ollama's default 4096-token window — keeping
-    the fast path one-keyword-shorter and avoiding overrides that
-    might confuse smaller local models.
+    Computes a single budget — worst-case token-dense tokenization
+    (``bytes`` / :data:`_BYTES_PER_TOKEN_FLOOR`) plus
+    :data:`_RESPONSE_TOKEN_HEADROOM` plus
+    :data:`_CHAT_TEMPLATE_TOKEN_OVERHEAD` — and uses it for *both* the
+    override decision and the window size. Returns ``None`` when that
+    budget already fits inside Ollama's default 4096-token window (keeping
+    the fast path one-keyword-shorter and avoiding overrides that might
+    confuse smaller local models); otherwise rounds the budget *up* to the
+    next multiple of :data:`_NUM_CTX_GRANULARITY`, capped at
+    :data:`_NUM_CTX_MAX`, and returns that.
 
-    The estimator is deliberately conservative — UTF-8 byte length
-    divided by :data:`_BYTES_PER_TOKEN` (3, the lower bound of the
-    real ~3-5 bytes/token range across scripts), with ``math.ceil``
-    rather than floor division — to bias toward overshooting: a
-    slightly larger ``num_ctx`` costs a small amount of GPU memory,
-    while the bug this closes (``num_ctx`` too small) silently hides
-    review findings. Byte-counting (rather than character counting)
-    keeps the estimator uniform across CJK / RTL / emoji-heavy
-    content where a single character can be one token. Ceiling
-    division prevents borderline prompts from rounding *down* under
-    the threshold and skipping the override.
+    Using one budget for both purposes is deliberate: an earlier version
+    decided on a *typical* bytes/3 estimate but sized on the worst-case
+    floor, which left a band of mid-size prompts that we declined to
+    override yet would have sized above the default — i.e. they were sent
+    at 4096 and could silently truncate, the exact bug this helper exists
+    to close. One budget removes that gap.
+
+    Byte-counting (rather than character counting) keeps the budget uniform
+    across CJK / RTL / emoji-heavy content where a single character can be
+    one token; ``math.ceil`` rather than floor division biases toward
+    overshooting, so a borderline prompt rounds *up* into an override
+    rather than down past the threshold.
     """
-    estimated_tokens = (
-        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+    prompt_bytes = len(prompt.encode("utf-8"))
+    # One budget, used for both the decision and the size. Every consumer
+    # of the window is accounted for — worst-case dense prompt, the
+    # response, and the chat-template / control tokens /api/chat injects —
+    # so a window sized to this budget can never under-provision relative
+    # to the decision that produced it.
+    budget = (
+        math.ceil(prompt_bytes / _BYTES_PER_TOKEN_FLOOR)
         + _RESPONSE_TOKEN_HEADROOM
+        + _CHAT_TEMPLATE_TOKEN_OVERHEAD
     )
-    if estimated_tokens <= _NUM_CTX_DEFAULT:
+    if budget <= _NUM_CTX_DEFAULT:
         return None
-    for ctx in _NUM_CTX_LADDER:
-        if estimated_tokens <= ctx:
-            return ctx
-    # Beyond the largest ladder step the model probably can't usefully
-    # consume the prompt anyway; cap at the largest entry so the
-    # request still goes through with a clear truncation-warning if
-    # the model output is small.
-    return _NUM_CTX_LADDER[-1]
+    # Snug-round up to the granularity; rounding only ever increases the
+    # value, so the window is provably ≥ the budget — no boundary off-by-one.
+    snug = math.ceil(budget / _NUM_CTX_GRANULARITY) * _NUM_CTX_GRANULARITY
+    return min(snug, _NUM_CTX_MAX)
 
 
 def _parse_response(
