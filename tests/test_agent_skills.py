@@ -22,7 +22,11 @@ from khonliang_reviewer import (
     ReviewResult,
     UsageEvent,
 )
-from reviewer.agent import ReviewerAgent
+from reviewer.agent import (
+    ReviewerAgent,
+    _extract_fr_ids,
+    _spec_milestone_drift_findings,
+)
 from reviewer.registry import ProviderRegistry
 from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
@@ -1994,6 +1998,152 @@ async def test_cross_reference_unknown_milestone_no_findings(monkeypatch):
         {"kind": "fr", "project": "p", "content": "# MS", "ms_id": "ms_ghost"},
     )
     assert [f for f in res["findings"] if f.get("category") == "cross-reference"] == []
+
+
+# -- spec<->milestone drift (fuzzy) -----------------------------------------
+
+
+def test_extract_fr_ids_dedups_and_lowercases():
+    text = (
+        "Implements fr_reviewer_19c871ab and FR_STORE_8E5CAE37; see also "
+        "fr_reviewer_19c871ab again. Not an id: fr_foo, frabble_123."
+    )
+    assert _extract_fr_ids(text) == ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]
+
+
+def test_drift_clean_when_spec_mentions_all_cluster_frs():
+    body = "Covers fr_reviewer_19c871ab and fr_store_8e5cae37."
+    cluster = ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]
+    assert _spec_milestone_drift_findings(body, cluster) == []
+
+
+def test_drift_flags_omitted_cluster_fr():
+    body = "Covers fr_reviewer_19c871ab only."
+    cluster = ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    assert len(out) == 1
+    f = out[0]
+    assert f["severity"] == "concern"
+    assert "omits" in f["title"] and "fr_store_8e5cae37" in f["title"]
+    assert f["section"] == "§Milestone"
+    assert f["category"] == "spec-milestone-drift"
+
+
+def test_drift_flags_near_miss_as_typo():
+    # 1-char suffix difference → typo, not omission/extra.
+    body = "Covers fr_reviewer_19c871ab and fr_store_8e5cae38."
+    cluster = ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    assert len(out) == 1
+    f = out[0]
+    assert f["severity"] == "concern"
+    assert "typo" in f["title"].lower()
+    assert "fr_store_8e5cae37" in f["body"] and "fr_store_8e5cae38" in f["body"]
+
+
+def test_drift_distinct_fr_not_treated_as_typo():
+    # Same-repo different suffix → distinct FR: one omission + one extra,
+    # NOT a single typo finding.
+    body = "Covers fr_reviewer_8e5cae37."
+    cluster = ["fr_reviewer_19c871ab"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    titles = sorted(f["title"] for f in out)
+    assert any("omits" in t for t in titles)
+    assert any("outside the milestone" in t for t in titles)
+    assert not any("typo" in t.lower() for t in titles)
+
+
+def test_drift_typo_caught_when_correct_id_also_present():
+    # Regression: spec mentions the correct cluster FR AND a near-miss typo of
+    # it. The typo must still surface (it was silently dropped when typos were
+    # driven from the cluster side and the extra-loop suppressed near-misses).
+    body = "Covers fr_store_8e5cae37 and also fr_store_8e5cae38."
+    cluster = ["fr_store_8e5cae37"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    assert len(out) == 1
+    f = out[0]
+    assert f["severity"] == "concern"
+    assert "typo" in f["title"].lower()
+    assert "fr_store_8e5cae38" in f["body"] and "fr_store_8e5cae37" in f["body"]
+
+
+def test_drift_long_repo_name_distinct_suffix_not_typo():
+    # Suffix-only matching: a very long repo name must not push two unrelated
+    # hex suffixes over the typo bar (whole-id difflib would, per codex review).
+    repo = "fr_extremely-long-repository-name-with-many-characters"
+    body = f"Covers {repo}_abcdefab."
+    cluster = [f"{repo}_12345678"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    # One omission + one extra, NOT a single (false) typo.
+    assert not any("typo" in f["title"].lower() for f in out)
+    assert any("omits" in f["title"] for f in out)
+    assert any("outside the milestone" in f["title"] for f in out)
+
+
+def test_drift_extra_spec_fr_is_comment():
+    body = "Covers fr_reviewer_19c871ab and fr_developer_aaaaaa11."
+    cluster = ["fr_reviewer_19c871ab"]
+    out = _spec_milestone_drift_findings(body, cluster)
+    assert len(out) == 1
+    f = out[0]
+    assert f["severity"] == "comment"
+    assert "fr_developer_aaaaaa11" in f["title"]
+
+
+def test_drift_empty_cluster_no_findings():
+    assert _spec_milestone_drift_findings("fr_reviewer_19c871ab", []) == []
+
+
+async def test_review_artifact_spec_drift_findings_appended(monkeypatch):
+    # A spec review with an ms_id runs the fuzzy drift check against the
+    # milestone's cluster; the spec omits one cluster FR → a drift finding.
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    claude = _RecordingProvider(
+        "claude_cli", _make_result(backend="claude_cli", model="claude")
+    )
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": {
+                "fr_ids": ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]}}}
+        if operation == "get_fr_local":
+            return {"result": {"id": args["fr_id"], "status": "open"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "spec", "project": "p", "ms_id": "ms_x",
+         "content": "# Spec\n\nImplements fr_reviewer_19c871ab."},
+    )
+    drift = [f for f in res["findings"] if f.get("category") == "spec-milestone-drift"]
+    assert len(drift) == 1
+    assert "fr_store_8e5cae37" in drift[0]["title"]
+
+
+async def test_review_artifact_fr_kind_skips_drift(monkeypatch):
+    # Drift is spec-only: a kind="fr" review must NOT run the drift check even
+    # with an ms_id (cross-reference still runs).
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama})
+
+    async def fake_request(*, agent_type, operation, args, **kw):
+        if operation == "get_milestone":
+            return {"result": {"milestone": {
+                "fr_ids": ["fr_reviewer_19c871ab", "fr_store_8e5cae37"]}}}
+        if operation == "get_fr_local":
+            return {"result": {"id": args["fr_id"], "status": "open"}}
+        return {"result": {"id": "art_rev"}}
+
+    monkeypatch.setattr(harness.agent, "request", fake_request)
+    res = await harness.call(
+        "review_artifact",
+        {"kind": "fr", "project": "p", "ms_id": "ms_x",
+         "content": "# FR\n\nMentions nothing."},
+    )
+    assert [f for f in res["findings"]
+            if f.get("category") == "spec-milestone-drift"] == []
 
 
 async def test_rule_table_routes_large_diff_to_claude():
