@@ -172,6 +172,15 @@ _ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
 #: doc-heavy diffs and the artifact instruction only for whole-document
 #: artifacts; both dogfood cases were *code* diffs where neither fired, so
 #: this calibration sits in the base prompt for all kinds.
+#:
+#: The severity-discipline clause deliberately does NOT cap `concern` to
+#: correctness/security — the artifact rubrics (fr/spec/milestone) classify
+#: planning-integrity issues (duplicate_of_existing_fr, missing_fr_dependency,
+#: fr_cluster_incoherent) as blocking concerns, and over-narrowing the rule
+#: would downgrade those and flip artifact verdicts. Instead it forbids
+#: raising *style/calibration* remarks to concern and defers the blocking
+#: bar to "the rubric below" — which the artifact path renders, and which
+#: code diffs don't have (their bar is correctness/security).
 _REVIEW_DISCIPLINE_INSTRUCTION = (
     "REVIEW DISCIPLINE — applies to every finding:\n"
     "1. A finding must assert something the change gets WRONG — a bug, a "
@@ -181,10 +190,12 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
     "2. Before flagging, confirm the change actually exhibits the problem you "
     "describe. Never assert the opposite of what the diff does — e.g. do not "
     "flag 'duplication' on a change that REMOVES or consolidates duplication.\n"
-    "3. Severity discipline: reserve 'concern' for correctness or security "
-    "defects. Naming, style, formatting, and calibration remarks are "
-    "'comment' or 'nit', never 'concern'. If you are unsure a finding is both "
-    "real and blocking, lower its severity or omit it."
+    "3. Severity discipline: do NOT raise naming, style, formatting, or "
+    "subjective-calibration remarks to 'concern' — those are 'comment' or "
+    "'nit'. Reserve 'concern' for a genuinely blocking defect: a correctness "
+    "or security bug, or an issue the rubric below explicitly classifies as a "
+    "blocking concern. If you are unsure a finding is both real and blocking, "
+    "lower its severity or omit it."
 )
 
 

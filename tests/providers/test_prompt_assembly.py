@@ -393,7 +393,10 @@ def test_review_discipline_instruction_present_for_code_diff():
     # Anti-echo, anti-invert, and severity-discipline clauses all present.
     assert "restate, paraphrase, or summarize" in prompt
     assert "opposite of what the diff does" in prompt
-    assert "reserve 'concern' for correctness or security" in prompt
+    # Severity discipline forbids style→concern but defers the blocking bar to
+    # the rubric (so it doesn't downgrade artifact rubrics' blocking concerns).
+    assert "do NOT raise naming, style" in prompt
+    assert "rubric below explicitly classifies" in prompt
 
 
 def test_review_discipline_instruction_present_for_artifact_kind():
@@ -403,6 +406,21 @@ def test_review_discipline_instruction_present_for_artifact_kind():
     assert "REVIEW DISCIPLINE" in prompt
     # The artifact framing instruction is also present (both coexist).
     assert "complete planning artifact" in prompt
+
+
+def test_severity_discipline_defers_to_rubric_not_caps_concern():
+    """Regression guard (codex P1): the severity clause must NOT cap `concern`
+    to correctness/security — the artifact rubrics classify planning-integrity
+    issues (duplicate_of_existing_fr, missing_fr_dependency, ...) as blocking
+    concerns. The instruction defers the blocking bar to the rubric instead,
+    so artifact verdicts aren't silently downgraded."""
+    prompt = build_review_prompt(ReviewRequest(kind="fr", content="# FR\n"))
+    # Defers to the rubric for what blocks ...
+    assert "rubric below explicitly classifies" in prompt
+    # ... and the fr rubric (which marks duplicate_of_existing_fr a concern) is
+    # rendered below the discipline in the same prompt.
+    assert "## Fr Rubric" in prompt
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("## Fr Rubric")
 
 
 def test_review_discipline_precedes_kind_routing():
