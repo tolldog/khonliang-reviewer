@@ -551,17 +551,26 @@ def test_suggest_num_ctx_returns_none_for_small_prompt():
     assert _suggest_num_ctx("hi") is None
 
 
-def test_suggest_num_ctx_steps_up_through_ladder():
-    """Larger prompts should land on standard llama.cpp window sizes."""
+def test_suggest_num_ctx_snug_rounds_up_to_granularity():
+    """Larger prompts get a window snugly above their real token count,
+    rounded up to the 2048 granularity — not a coarse power-of-two leap.
+
+    estimate = ceil(bytes / 3) + 1024 headroom, then ceil to 2048.
+    "x" is one UTF-8 byte, so bytes == char count.
+    """
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    assert _suggest_num_ctx("x" * 15_000) == 8192
-    assert _suggest_num_ctx("x" * 30_000) == 16384
-    assert _suggest_num_ctx("x" * 80_000) == 32768
-    assert _suggest_num_ctx("x" * 150_000) == 65536
+    # 15_000 bytes / 3 = 5000 + 1024 = 6024 → ceil to 2048 → 6144
+    assert _suggest_num_ctx("x" * 15_000) == 6144
+    # 30_000 / 3 = 10_000 + 1024 = 11_024 → 12_288
+    assert _suggest_num_ctx("x" * 30_000) == 12_288
+    # 80_000 / 3 = 26_667 + 1024 = 27_691 → 28_672
+    assert _suggest_num_ctx("x" * 80_000) == 28_672
+    # 150_000 / 3 = 50_000 + 1024 = 51_024 → 51_200
+    assert _suggest_num_ctx("x" * 150_000) == 51_200
 
 
-def test_suggest_num_ctx_caps_at_largest_ladder_step():
+def test_suggest_num_ctx_caps_at_max():
     from reviewer.providers.ollama import _suggest_num_ctx
 
     assert _suggest_num_ctx("x" * 1_000_000) == 131072
@@ -619,7 +628,8 @@ def test_resolve_num_ctx_falls_through_to_auto_bump():
         kind="pr_diff", content=big_prompt, metadata={}, request_id="req-test"
     )
     cfg = OllamaProviderConfig()
-    assert _resolve_num_ctx(request, cfg, big_prompt) == 16384
+    # 30_000 / 3 = 10_000 + 1024 = 11_024 → snug-rounded up to 12_288.
+    assert _resolve_num_ctx(request, cfg, big_prompt) == 12_288
 
 
 def test_resolve_num_ctx_falls_through_for_small_prompt():
@@ -814,21 +824,25 @@ async def test_review_passes_num_ctx_for_large_prompt():
     assert "options" in payload
     num_ctx = payload["options"]["num_ctx"]
     assert num_ctx > 4096
-    assert num_ctx in {8192, 16384, 32768, 65536, 131072}
+    assert num_ctx % 2048 == 0
+    assert num_ctx <= 131072
 
 
 def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
     from reviewer.providers.ollama import _suggest_num_ctx
 
+    # 9216 / 3 = 3072 + 1024 = 4096 → fits default → None.
     assert _suggest_num_ctx("x" * 9216) is None
-    assert _suggest_num_ctx("x" * 9217) == 8192
+    # 9217 / 3 = ceil(3072.33)=3073 + 1024 = 4097 → snug up to 6144.
+    assert _suggest_num_ctx("x" * 9217) == 6144
 
 
 def test_suggest_num_ctx_counts_utf8_bytes_for_non_ascii():
     from reviewer.providers.ollama import _suggest_num_ctx
 
+    # "中" is 3 UTF-8 bytes → 15_000 bytes / 3 = 5000 + 1024 = 6024 → 6144.
     cjk_prompt = "中" * 5000
-    assert _suggest_num_ctx(cjk_prompt) == 8192
+    assert _suggest_num_ctx(cjk_prompt) == 6144
     assert _suggest_num_ctx("x" * 5000) is None
 
 

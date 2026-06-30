@@ -437,11 +437,21 @@ _TRUNCATION_INPUT_THRESHOLD = 2000
 _TRUNCATION_OUTPUT_THRESHOLD = 32
 
 
-# Standard ``num_ctx`` step sizes Ollama exposes. We round up the
-# estimated token count to one of these so the model gets a
-# power-of-two-ish window — which is what the underlying llama.cpp
-# implementations expect — rather than an arbitrary number.
-_NUM_CTX_LADDER: tuple[int, ...] = (8192, 16384, 32768, 65536, 131072)
+# Round the estimated token count *up* to a multiple of this so the
+# window snugly covers the prompt instead of leaping to the next
+# power-of-two. llama.cpp accepts an arbitrary ``n_ctx`` — there is no
+# hard power-of-two requirement — so a snug ceiling is safe and keeps
+# the KV cache (≈190 KB/token on qwen2.5-coder:14b) as small as the
+# prompt allows. The previous coarse ladder (8k/16k/32k/…) routinely
+# ~2× over-allocated (a ~17k-token prompt got a 32k window), inflating
+# the KV cache and aggravating GPU VRAM contention on a busy box.
+_NUM_CTX_GRANULARITY = 2048
+
+# Hard ceiling on the auto-bumped window. Beyond this the model can't
+# usefully consume the prompt anyway; cap here so an oversized prompt
+# still goes through (with a truncation warning if output is small)
+# rather than requesting an absurd context.
+_NUM_CTX_MAX = 131072
 
 # Ollama's compiled-in default. We only override above this; below it
 # the override would be a no-op and risks rejection from local models
@@ -583,12 +593,17 @@ def _coerce_format_value(value: Any) -> str | None:
 def _suggest_num_ctx(prompt: str) -> int | None:
     """Suggest a ``num_ctx`` value that fits the prompt + a response.
 
-    Returns the smallest standard window in :data:`_NUM_CTX_LADDER`
-    that holds an estimated prompt-token count plus
-    :data:`_RESPONSE_TOKEN_HEADROOM`. Returns ``None`` when the
-    estimate fits inside Ollama's default 4096-token window — keeping
-    the fast path one-keyword-shorter and avoiding overrides that
-    might confuse smaller local models.
+    Rounds the estimated prompt-token count plus
+    :data:`_RESPONSE_TOKEN_HEADROOM` *up* to the next multiple of
+    :data:`_NUM_CTX_GRANULARITY`, capped at :data:`_NUM_CTX_MAX`. This
+    snug ceiling keeps the window just above the real token count
+    instead of leaping to a coarse power-of-two step, so the KV cache
+    stays as small as the prompt allows — the decode-speed / VRAM-
+    pressure side of the num_ctx story (the silent-truncation side is
+    closed separately by the native ``/api/chat`` endpoint). Returns
+    ``None`` when the estimate fits inside Ollama's default 4096-token
+    window — keeping the fast path one-keyword-shorter and avoiding
+    overrides that might confuse smaller local models.
 
     The estimator is deliberately conservative — UTF-8 byte length
     divided by :data:`_BYTES_PER_TOKEN` (3, the lower bound of the
@@ -608,14 +623,11 @@ def _suggest_num_ctx(prompt: str) -> int | None:
     )
     if estimated_tokens <= _NUM_CTX_DEFAULT:
         return None
-    for ctx in _NUM_CTX_LADDER:
-        if estimated_tokens <= ctx:
-            return ctx
-    # Beyond the largest ladder step the model probably can't usefully
-    # consume the prompt anyway; cap at the largest entry so the
-    # request still goes through with a clear truncation-warning if
-    # the model output is small.
-    return _NUM_CTX_LADDER[-1]
+    snug = (
+        math.ceil(estimated_tokens / _NUM_CTX_GRANULARITY)
+        * _NUM_CTX_GRANULARITY
+    )
+    return min(snug, _NUM_CTX_MAX)
 
 
 def _parse_response(
