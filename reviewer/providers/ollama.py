@@ -242,7 +242,12 @@ class OllamaProvider(ReviewProvider):
             return _errored(
                 request,
                 error=f"ollama request timed out after {self.config.timeout_seconds}s",
-                error_category="backend_error",
+                # Distinct from the generic ``backend_error`` (HTTP / connection
+                # failures below) so the sign-off path can degrade a *timeout*
+                # to "review-skipped" — a non-blocking pre-push outcome — while
+                # other backend failures stay hard errors. Parallels the
+                # claude_cli provider's ``subprocess_timeout`` category.
+                error_category="backend_timeout",
                 model=model,
                 started_wall=started_wall,
                 duration_ms=_elapsed_ms(started_mono),

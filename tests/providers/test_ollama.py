@@ -273,7 +273,10 @@ async def test_timeout_error_errored():
     )
     result = await provider.review(_make_request())
     assert result.disposition == "errored"
-    assert result.error_category == "backend_error"
+    # Timeouts carry the dedicated ``backend_timeout`` category (distinct from
+    # the generic ``backend_error``) so the sign-off path can degrade them to a
+    # non-blocking "review-skipped" rather than a hard gate failure.
+    assert result.error_category == "backend_timeout"
     assert "timed out" in result.error
 
 

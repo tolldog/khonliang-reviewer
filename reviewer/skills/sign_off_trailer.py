@@ -41,11 +41,16 @@ Errored review results (``disposition == "errored"``) raise
 :func:`build_trailer` rather than producing a trailer — committing
 an ``Agent-Reviewed-by`` line for a review that didn't actually
 run is misleading sign-off provenance. Agent handlers catch the
-exception and surface ``{error: ...}`` to the caller. The
-``claude_cli_escalation`` case is NOT an errored disposition (it's
-a successful cross-vendor escalation result that happens to set
-``error_category`` for routing purposes); it still maps to
-``escalated-approved`` per spec.
+exception and surface ``{error: ...}`` to the caller. The one
+exception is a *timeout* (``error_category`` in
+:data:`_TIMEOUT_SKIP_SIGNALS`): it maps to the ``review-skipped``
+verdict with an **empty** trailer line plus a ``note`` — a timed-out
+hot-tier pass degrades to a non-blocking "skip with a note" so the
+pre-push gate proceeds to the cross-vendor reviewer instead of either
+blocking the commit or faking a sign-off. The ``claude_cli_escalation``
+case is NOT an errored disposition (it's a successful cross-vendor
+escalation result that happens to set ``error_category`` for routing
+purposes); it still maps to ``escalated-approved`` per spec.
 
 All trailer segments (role, backend, model, reason) are sanitized
 against newline characters before interpolation so a malicious or
@@ -73,10 +78,36 @@ Verdict = Literal[
     "approved-with-findings",
     "concerns-raised",
     "escalated-approved",
+    "review-skipped",
 ]
 
 
 _REASON_MAX_CHARS = 80
+
+#: ``(backend, error_category)`` pairs that degrade to a non-blocking
+#: ``review-skipped`` verdict instead of a hard ``ValueError``. A review
+#: that *timed out* never produced output — it's not a failed review with
+#: findings to act on, and it's not a clean approval to sign off. For the
+#: pre-push gate it should "skip with a note" so the workflow proceeds to
+#: the cross-vendor gate, rather than either blocking the commit or
+#: fabricating a sign-off.
+#:
+#: Scoped to the **local hot-tier** providers only: ollama's
+#: ``backend_timeout`` and claude_cli's ``subprocess_timeout`` (the
+#: hot-tier + escalation pass that the cross-vendor gate backstops). It
+#: must NOT match ``codex_cli`` / ``gh_copilot``, which *also* emit
+#: ``subprocess_timeout`` but ARE the cross-vendor gate — silently
+#: skipping a timed-out authoritative review would let an unreviewed
+#: commit through with no fallback. Keying on the (backend, category) pair
+#: (not the shared category alone) keeps that distinction. Other errored
+#: categories (malformed_envelope, auth_not_provisioned, …) stay hard
+#: errors everywhere — real failures, not transient "couldn't run in time".
+_TIMEOUT_SKIP_SIGNALS = frozenset(
+    {
+        ("ollama", "backend_timeout"),
+        ("claude_cli", "subprocess_timeout"),
+    }
+)
 
 
 def compute_verdict(result: ReviewResult) -> Verdict:
@@ -102,17 +133,28 @@ def compute_verdict(result: ReviewResult) -> Verdict:
     never silently downgrades the verdict — only proper ``concern``-severity
     rows are subject to the actionability check.
 
-    Raises :class:`ValueError` when the result's disposition is
-    ``"errored"`` — committing a sign-off trailer for a review
-    that didn't actually run would be misleading provenance. The
-    ``claude_cli_escalation`` case is checked first so a
-    successful escalation result (which sets ``error_category``
+    An errored disposition whose ``error_category`` is a timeout
+    (:data:`_TIMEOUT_SKIP_SIGNALS`) maps to ``review-skipped``
+    rather than raising — a timed-out review never ran to
+    completion, so the pre-push gate should skip with a note (and
+    no trailer) and let the cross-vendor gate carry the sign-off,
+    instead of blocking the commit. Any *other* errored disposition
+    still raises :class:`ValueError` — committing a sign-off trailer
+    for a review that genuinely failed would be misleading
+    provenance. The ``claude_cli_escalation`` case is checked first
+    so a successful escalation result (which sets ``error_category``
     for routing but is NOT disposition=errored) still maps to
     ``escalated-approved``.
     """
     if result.error_category == "claude_cli_escalation":
         return "escalated-approved"
     if result.disposition == "errored":
+        # A *local hot-tier* timeout degrades to a non-blocking skip (the
+        # review never ran to completion); other errored categories — and
+        # timeouts from the cross-vendor gate providers (codex/copilot, which
+        # share the subprocess_timeout category) — stay hard errors.
+        if (result.backend, result.error_category) in _TIMEOUT_SKIP_SIGNALS:
+            return "review-skipped"
         message = result.error or "(no error message)"
         raise ValueError(
             f"cannot format sign-off trailer for errored review: {message}"
@@ -202,8 +244,24 @@ def build_trailer(
     ``escalated-approved`` verdicts is intentional (no reason fits
     the trailer format for those cases). Caller-supplied ``reason``
     overrides the auto-derived one for both shapes.
+
+    The ``review-skipped`` verdict (a timed-out review) is special:
+    it returns ``{verdict, trailer_line: "", note}`` with an **empty**
+    trailer line — committing an ``Agent-Reviewed-by`` line for a
+    review that timed out would falsely claim a sign-off that never
+    happened (CLAUDE.md: "omit rather than fake"). ``note`` carries
+    the truthful skip reason (the caller-supplied ``reason`` if any,
+    else the timeout message) so the caller can record *why* it
+    skipped without minting a trailer.
     """
     verdict = compute_verdict(result)
+    if verdict == "review-skipped":
+        note = reason or _skip_note(result)
+        return {
+            "verdict": verdict,
+            "trailer_line": "",
+            "note": _truncate_reason(_sanitize_segment(note)),
+        }
     # role/backend/model are joined by "/" in the trailer's locked
     # ``role/backend/model`` shape, so a "/" inside any of them would
     # add phantom path segments and break unambiguous parsing.
@@ -249,6 +307,16 @@ def build_trailer(
         trailer_line = f"Agent-Reviewed-by: {role}/{backend}/{model} {verdict}"
 
     return {"verdict": verdict, "trailer_line": trailer_line}
+
+
+def _skip_note(result: ReviewResult) -> str:
+    """Truthful note for a ``review-skipped`` verdict — the timeout message
+    the provider recorded, or a generic fallback when it's empty.
+    """
+    message = result.error if isinstance(result.error, str) and result.error.strip() else ""
+    if message:
+        return f"review skipped — {message}"
+    return "review skipped — hot-tier review timed out"
 
 
 def _severity_counts(result: ReviewResult) -> dict[str, int]:
