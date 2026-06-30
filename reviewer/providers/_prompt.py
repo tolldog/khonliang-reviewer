@@ -161,6 +161,33 @@ _DOC_REVIEW_INSTRUCTION = (
 #: get a full-document framing instruction plus a per-kind rubric.
 _ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
 
+#: Universal review-discipline instruction injected into every review,
+#: regardless of kind. Targets the recurring hot-tier false-positive
+#: patterns (fr_reviewer_ff923ebf): small local models echo the code's own
+#: prose back as "findings" (dog_9902f2f9), invert the change's intent
+#: (dog_3891542a flagged "Code Repetition" as a *concern* on a change that
+#: CONSOLIDATES duplicate literals), and over-use `concern` severity — which,
+#: via the literal sign_off_trailer mapping, flips an otherwise-clean review
+#: to `concerns-raised`. The `_DOC_REVIEW_INSTRUCTION` only fires for
+#: doc-heavy diffs and the artifact instruction only for whole-document
+#: artifacts; both dogfood cases were *code* diffs where neither fired, so
+#: this calibration sits in the base prompt for all kinds.
+_REVIEW_DISCIPLINE_INSTRUCTION = (
+    "REVIEW DISCIPLINE — applies to every finding:\n"
+    "1. A finding must assert something the change gets WRONG — a bug, a "
+    "risk, an omission. Do NOT restate, paraphrase, or summarize the code's "
+    "own comments, docstrings, identifiers, or the diff's stated intent as a "
+    "finding; describing what the change does is not a critique of it.\n"
+    "2. Before flagging, confirm the change actually exhibits the problem you "
+    "describe. Never assert the opposite of what the diff does — e.g. do not "
+    "flag 'duplication' on a change that REMOVES or consolidates duplication.\n"
+    "3. Severity discipline: reserve 'concern' for correctness or security "
+    "defects. Naming, style, formatting, and calibration remarks are "
+    "'comment' or 'nit', never 'concern'. If you are unsure a finding is both "
+    "real and blocking, lower its severity or omit it."
+)
+
+
 #: Prepended for artifact reviews. The reviewer is reading a whole planning
 #: document, not a code change, so findings are holistic and anchor to a named
 #: SECTION (e.g. "§Acceptance Criteria"), not a line number.
@@ -285,6 +312,12 @@ def build_review_prompt(
         f"You are a code reviewer for the khonliang ecosystem. Read the {request.kind!r}",
         "content below and return ONLY a JSON object matching the schema you were",
         "given. No prose outside the JSON.",
+        "",
+        # Universal review-discipline calibration (fr_reviewer_ff923ebf):
+        # curbs the hot-tier false-positive patterns (echo-as-finding,
+        # inverted-claim, concern-severity over-use) for every kind, before
+        # the kind-specific doc/artifact routing below adds its own framing.
+        _REVIEW_DISCIPLINE_INSTRUCTION,
         "",
     ]
 

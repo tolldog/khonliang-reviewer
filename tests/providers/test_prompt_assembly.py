@@ -381,6 +381,37 @@ def test_code_diff_omits_critique_instruction():
     assert "CRITIQUE, do not summarize" not in prompt
 
 
+# -- universal review-discipline calibration (fr_reviewer_ff923ebf) ---
+
+
+def test_review_discipline_instruction_present_for_code_diff():
+    """The discipline calibration must fire on a plain CODE diff — both
+    dogfood false-positive cases (echo, inverted-claim) were code diffs where
+    the doc/artifact instructions don't fire."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "REVIEW DISCIPLINE" in prompt
+    # Anti-echo, anti-invert, and severity-discipline clauses all present.
+    assert "restate, paraphrase, or summarize" in prompt
+    assert "opposite of what the diff does" in prompt
+    assert "reserve 'concern' for correctness or security" in prompt
+
+
+def test_review_discipline_instruction_present_for_artifact_kind():
+    """Calibration is universal — it also lands on whole-document artifact
+    reviews, complementing the artifact framing instruction."""
+    prompt = build_review_prompt(ReviewRequest(kind="spec", content="# MS-X\n"))
+    assert "REVIEW DISCIPLINE" in prompt
+    # The artifact framing instruction is also present (both coexist).
+    assert "complete planning artifact" in prompt
+
+
+def test_review_discipline_precedes_kind_routing():
+    """Discipline calibration is in the base prompt, before the kind-specific
+    doc/artifact routing — so it frames every finding regardless of kind."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MD_DIFF))
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("CRITIQUE, do not summarize")
+
+
 def test_mixed_diff_omits_critique_instruction():
     # Only clearly doc-heavy diffs are routed; mixed is conservative.
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
