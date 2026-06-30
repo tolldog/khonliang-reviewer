@@ -24,6 +24,18 @@ bus_url: http://localhost:8787
 # (RTX 5080, MoE active path). Same VRAM tier (~8.9 GB).
 default_provider: ollama
 default_model: deepseek-coder-v2:16b
+#
+# Fast pre-push gate: small code diffs already land on the fast
+# `default_model` above via the rule-table fallback. For a *large* diff
+# that would otherwise escalate to Claude, pass `fast: true` on a
+# `review_diff` / `review_text` call to force the fast resident local
+# tier (`reviewer.rules.policy.FAST_TIER_MODEL`, aliased to the default
+# above) — a quick local gate that trades review rigor for speed. It is
+# scoped to `kind="pr_diff"` (spec/milestone reviews still reach Claude)
+# and is inert when an explicit `backend`/`model` is supplied. NB: it
+# forces the local tier but does not by itself make a large review fast —
+# a big diff still gets a large context window and can be slow under GPU
+# contention.
 
 # Per-backend default models. Preferred over the legacy single-string
 # `default_model` above: each backend ships its own sensible default so

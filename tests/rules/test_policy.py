@@ -8,6 +8,7 @@ from reviewer.rules import (
     CTX_SMALL,
     DEFAULT_FALLBACK,
     DEFAULT_RULES,
+    FAST_TIER_MODEL,
     PolicyDecision,
     PolicyInput,
     Rule,
@@ -111,6 +112,67 @@ def test_docs_kind_with_huge_diff_still_goes_claude_or_long_context():
     # depending on future rule order. Lock the current behavior: long-context
     # rule evaluates first and matches, so kimi wins.
     assert decision.model == "kimi-k2.5:cloud"
+
+
+# ---------------------------------------------------------------------------
+# Fast pre-push gate (fr_khonliang-reviewer_92d810fa part 2)
+# ---------------------------------------------------------------------------
+
+
+def test_fast_gate_pins_resident_tier_on_large_diff():
+    """The discriminating case: a 2500-line pr_diff that WOULD escalate to
+    Claude routes to the fast resident tier when latency_priority is set.
+    (A small diff already hits the fast fallback, so it can't distinguish
+    the feature.)"""
+    decision = decide(
+        PolicyInput(
+            kind="pr_diff",
+            diff_line_count=2500,
+            diff_file_count=5,
+            latency_priority=True,
+        )
+    )
+    assert decision.backend == "ollama"
+    assert decision.model == FAST_TIER_MODEL
+    assert decision.context_window_floor == CTX_MEDIUM
+    # Same input without the hint still escalates to Claude.
+    baseline = decide(
+        PolicyInput(kind="pr_diff", diff_line_count=2500, diff_file_count=5)
+    )
+    assert baseline.backend == "claude_cli"
+
+
+def test_fast_gate_beats_long_context_escalation():
+    """Even a 6000-line / 15-file diff (long-context → kimi) is pinned to the
+    fast tier under latency_priority — the gate wants speed over rigor."""
+    decision = decide(
+        PolicyInput(
+            kind="pr_diff",
+            diff_line_count=6000,
+            diff_file_count=15,
+            latency_priority=True,
+        )
+    )
+    assert decision.model == FAST_TIER_MODEL
+
+
+def test_fast_gate_is_scoped_to_pr_diff_not_artifacts():
+    """latency_priority must NOT short-circuit spec/milestone design routing —
+    an artifact review still reaches Claude even with the fast hint."""
+    for artifact_kind in ("spec", "milestone"):
+        decision = decide(
+            PolicyInput(kind=artifact_kind, latency_priority=True)
+        )
+        assert decision.backend == "claude_cli", artifact_kind
+        assert decision.model == "claude", artifact_kind
+
+
+def test_fast_gate_inert_when_unset():
+    """Default (latency_priority=False) leaves all existing routing intact."""
+    decision = decide(
+        PolicyInput(kind="pr_diff", diff_line_count=2500, diff_file_count=5)
+    )
+    assert decision.backend == "claude_cli"
 
 
 # ---------------------------------------------------------------------------
