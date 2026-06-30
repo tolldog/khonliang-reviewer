@@ -28,6 +28,7 @@ from reviewer.agent import (
     _spec_milestone_drift_findings,
 )
 from reviewer.registry import ProviderRegistry
+from reviewer.rules import FAST_TIER_MODEL
 from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
 from reviewer.storage import open_usage_store
 
@@ -183,6 +184,56 @@ async def test_review_text_routes_to_rule_table_default_backend():
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
     assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
+
+
+async def test_review_diff_fast_pins_resident_tier_on_large_diff():
+    """`fast=true` on a large diff (which would otherwise escalate to Claude)
+    routes to the fast resident ollama tier — the discriminating case for the
+    pre-push gate knob (a small diff already hits the fast fallback)."""
+    ollama = _RecordingProvider(
+        "ollama", _make_result(backend="ollama", model=FAST_TIER_MODEL)
+    )
+    claude = _RecordingProvider(
+        "claude_cli", _make_result(backend="claude_cli", model="claude")
+    )
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_diff",
+        {
+            "diff": "diff body",
+            "fast": True,
+            # Pin the size explicitly so the large-diff escalation is in play.
+            "context": {"diff_line_count": 2500, "diff_file_count": 5},
+        },
+    )
+
+    assert claude.last_request is None
+    assert ollama.last_request is not None
+    assert ollama.last_request.metadata["model"] == FAST_TIER_MODEL
+
+
+async def test_review_diff_without_fast_escalates_to_claude():
+    """Same large diff WITHOUT the hint escalates to Claude — proving the fast
+    routing is what diverts it, not the diff size."""
+    ollama = _RecordingProvider(
+        "ollama", _make_result(backend="ollama", model=FAST_TIER_MODEL)
+    )
+    claude = _RecordingProvider(
+        "claude_cli", _make_result(backend="claude_cli", model="claude")
+    )
+    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+
+    await harness.call(
+        "review_diff",
+        {
+            "diff": "diff body",
+            "context": {"diff_line_count": 2500, "diff_file_count": 5},
+        },
+    )
+
+    assert ollama.last_request is None
+    assert claude.last_request is not None
 
 
 async def test_review_text_caller_backend_override_picks_specific_provider():

@@ -42,6 +42,14 @@ from typing import Any, Callable
 # finding 1.
 from reviewer.defaults import DEFAULT_REVIEWER_MODEL
 
+#: Model the latency-priority ("fast pre-push gate") rule routes to. Aliased
+#: to :data:`DEFAULT_REVIEWER_MODEL` (the fast MoE default, currently
+#: ``deepseek-coder-v2:16b`` at ~334 tok/s warm vs qwen's ~94) because that
+#: is already the fast, VRAM-resident tier. Named separately so the fast-tier
+#: choice can diverge from the global default later (e.g. a pulled 7b) without
+#: touching the rule.
+FAST_TIER_MODEL = DEFAULT_REVIEWER_MODEL
+
 # One-way dependency: ``policy`` consults the audience-keyed distill table
 # to emit the ``(PolicyDecision, DistillConfig)`` pair from a single call.
 # ``reviewer.rules.distill`` never imports back from ``policy`` (its
@@ -76,6 +84,17 @@ class PolicyInput:
     #: provider rules, which key on diff size. Defaults to the
     #: non-aggressive ``agent_consumption``.
     audience: Audience = "agent_consumption"
+    #: Caller hint: this is a quick pre-push *gate* where speed matters
+    #: more than maximum review rigor. When set (and ``kind == "pr_diff"``)
+    #: the :func:`_fast_tier_gate` rule pins the fast, VRAM-resident local
+    #: tier (:data:`FAST_TIER_MODEL`) even for large diffs that would
+    #: otherwise escalate to Claude. Scoped to ``pr_diff`` so it never
+    #: short-circuits the spec/milestone design-rigor routing. Note this
+    #: forces the *local* tier but does not by itself make a large review
+    #: *fast* — a big diff still gets a large num_ctx window and can be
+    #: slow under GPU contention; the timeout→skip degradation is the
+    #: backstop there.
+    latency_priority: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,6 +125,18 @@ class Rule:
 # ---------------------------------------------------------------------------
 # Default rule table
 # ---------------------------------------------------------------------------
+
+
+def _fast_tier_gate(inp: PolicyInput) -> bool:
+    """Latency-priority pre-push gate over a code diff.
+
+    Gated to ``kind == "pr_diff"`` deliberately: the pre-push gate is
+    always a code diff, and scoping it here keeps ``latency_priority``
+    from short-circuiting the spec/milestone design-rigor routing (an
+    artifact review must still reach Claude even when a caller passes the
+    fast hint).
+    """
+    return inp.latency_priority and inp.kind == "pr_diff"
 
 
 def _large_diff(inp: PolicyInput) -> bool:
@@ -142,6 +173,21 @@ def _artifact_design_kind(inp: PolicyInput) -> bool:
 
 
 DEFAULT_RULES: list[Rule] = [
+    # Latency-priority pre-push gate: the caller wants a quick local pass,
+    # not max rigor, so pin the fast resident tier even for large diffs that
+    # would otherwise escalate to Claude/Kimi. First so it short-circuits the
+    # diff-size escalations below; scoped to pr_diff inside the predicate so
+    # spec/milestone artifact reviews still reach Claude.
+    Rule(
+        name="fast_tier_gate_to_resident",
+        predicate=_fast_tier_gate,
+        decision=PolicyDecision(
+            backend="ollama",
+            model=FAST_TIER_MODEL,
+            context_window_floor=CTX_MEDIUM,
+            reason="latency-priority pre-push gate — fast resident ollama tier",
+        ),
+    ),
     # Very large diffs want a long-context model and careful priors.
     Rule(
         name="long_context_diff_to_kimi",
@@ -265,6 +311,7 @@ __all__ = [
     "CTX_SMALL",
     "DEFAULT_FALLBACK",
     "DEFAULT_RULES",
+    "FAST_TIER_MODEL",
     "PolicyDecision",
     "PolicyInput",
     "Rule",

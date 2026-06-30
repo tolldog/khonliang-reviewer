@@ -1277,6 +1277,7 @@ def _policy_input_for(
     content: str,
     context: dict[str, Any],
     audience: Audience = "agent_consumption",
+    latency_priority: bool = False,
 ) -> PolicyInput:
     """Build a :class:`PolicyInput` from the pieces available in the handler.
 
@@ -1284,7 +1285,9 @@ def _policy_input_for(
     ``diff_file_count`` / ``profile`` in ``context``; otherwise they're
     estimated from ``content`` (for diffs) or left empty. ``audience``
     drives the distill half of :func:`reviewer.rules.evaluate` (the
-    provider half ignores it).
+    provider half ignores it). ``latency_priority`` carries the ``fast``
+    skill hint into the rule table (the fast-tier rule is scoped to
+    ``pr_diff``, so it's inert for other kinds).
     """
     est_lines, est_files = _estimate_diff_size(content, kind)
     return PolicyInput(
@@ -1297,6 +1300,7 @@ def _policy_input_for(
             else None
         ),
         audience=audience,
+        latency_priority=latency_priority,
     )
 
 
@@ -1433,6 +1437,19 @@ class ReviewerAgent(BaseAgent):
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
                     "model": {"type": "string", "default": ""},
+                    # fast: latency-priority pre-push *gate* hint. true =
+                    # pin the fast, VRAM-resident local tier
+                    # (deepseek-coder-v2:16b today) even for large pr_diffs
+                    # that would otherwise escalate to Claude — trading
+                    # review rigor for speed on a quick local pass. Only
+                    # consulted on the rule-table path (no explicit
+                    # backend/model override) and only for kind="pr_diff"
+                    # (artifact reviews still reach Claude). NB: forces the
+                    # local tier but does not by itself make a *large*
+                    # review quick — a big diff still gets a large context
+                    # window and can be slow under GPU contention; the
+                    # timeout→skip degradation is the backstop there.
+                    "fast": {"type": "boolean", "default": False},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     # severity_floor: drop findings below this severity
@@ -1527,6 +1544,10 @@ class ReviewerAgent(BaseAgent):
                     "context": {"type": "object", "default": {}},
                     "backend": {"type": "string", "default": ""},
                     "model": {"type": "string", "default": ""},
+                    # fast: latency-priority pre-push gate hint — pin the
+                    # fast resident local tier even for large diffs. See the
+                    # review_text schema for the full semantics + caveats.
+                    "fast": {"type": "boolean", "default": False},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
@@ -1743,6 +1764,12 @@ class ReviewerAgent(BaseAgent):
         raw_model = args.get("model")
         caller_model = raw_model if isinstance(raw_model, str) else None
         context = _as_dict(args.get("context"))
+        # ``fast``: latency-priority pre-push gate hint. Only a real ``True``
+        # enables it — the bus delivers a bool for a boolean-typed field, and
+        # any non-bool (string, int, absent) defensively reads as "off". Only
+        # consulted on the rule-table path (no caller backend/model override),
+        # where it pins the fast resident tier for pr_diff reviews.
+        latency_priority = args.get("fast") is True
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the
         # severity_floor resolver and the example_format resolver
@@ -1807,6 +1834,7 @@ class ReviewerAgent(BaseAgent):
                         content=content,
                         context=context,
                         audience=effective_audience,
+                        latency_priority=latency_priority,
                     )
                 )
                 provider, chosen_model = selector.select(
