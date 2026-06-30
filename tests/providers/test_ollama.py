@@ -546,8 +546,9 @@ def test_suggest_num_ctx_returns_none_for_small_prompt():
     """Prompts that fit Ollama's 4096 default should not override num_ctx."""
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 9000 chars = 3000 estimated tokens + 1024 headroom = 4024 → under default.
-    assert _suggest_num_ctx("x" * 9000) is None
+    # Budget = ceil(bytes/2.3) + 1024 headroom + 256 template. 6000 bytes
+    # → ceil(2609) + 1280 = 3889 ≤ 4096 → fits default → None.
+    assert _suggest_num_ctx("x" * 6000) is None
     assert _suggest_num_ctx("hi") is None
 
 
@@ -865,12 +866,17 @@ async def test_review_passes_num_ctx_for_large_prompt():
 
 
 def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
+    """The override decision and the sizing share one budget, so the
+    None/override boundary is where that single budget crosses 4096."""
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 9216 / 3 = 3072 + 1024 = 4096 → fits default → None.
-    assert _suggest_num_ctx("x" * 9216) is None
-    # 9217 / 3 = ceil(3072.33)=3073 + 1024 = 4097 → snug up to 6144.
-    assert _suggest_num_ctx("x" * 9217) == 6144
+    # 6476 bytes → ceil(6476/2.3)=2816 + 1280 = 4096 → fits default → None.
+    assert _suggest_num_ctx("x" * 6476) is None
+    # 6477 bytes → ceil(6477/2.3)=2817 + 1280 = 4097 → override, snug 6144.
+    # Regression for the decision/sizing inconsistency: this prompt used to
+    # return None (typical bytes/3 fit 4096) while its worst-case budget
+    # exceeded the default — a silent-truncation gap.
+    assert _suggest_num_ctx("x" * 6477) == 6144
 
 
 def test_suggest_num_ctx_counts_utf8_bytes_for_non_ascii():
