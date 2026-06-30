@@ -192,8 +192,11 @@ async def test_prompt_carries_instructions_and_context(monkeypatch):
     assert "Review for correctness." in prompt
     assert "python async bus service" in prompt
     assert "diff --git" in prompt
-    # Schema JSON is passed via --json-schema flag, not embedded in the prompt
-    assert '"severity"' not in prompt
+    # Schema JSON is passed via --json-schema flag, not embedded in the prompt.
+    # Assert the schema *block* is absent (not the bare word "severity", which
+    # legitimately appears in the built-in anti-examples calibration).
+    assert "## Response Schema" not in prompt
+    assert '"properties"' not in prompt
 
 
 async def test_large_prompt_survives_via_stdin(monkeypatch):

@@ -459,6 +459,47 @@ def test_review_discipline_precedes_kind_routing():
     assert prompt.index("REVIEW DISCIPLINE") < prompt.index("CRITIQUE, do not summarize")
 
 
+# -- built-in anti-examples (fr_reviewer_ff923ebf b) ------------------
+
+
+def test_builtin_anti_examples_loads_from_package():
+    """The packaged anti_examples.md is loadable (wheel package-data covers
+    reviewer/data/prompts/*.md)."""
+    from reviewer.providers._prompt import _builtin_anti_examples
+
+    text = _builtin_anti_examples()
+    assert text is not None
+    assert "echo-as-finding" in text
+    assert "inverted claim" in text.lower()
+
+
+def test_anti_examples_present_for_code_diff_after_discipline():
+    """Concrete anti-examples render on the rubric-less hot-tier path, after the
+    prose discipline they reinforce."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "Anti-Examples" in prompt
+    # The two dogfood patterns are present.
+    assert "echo-as-finding" in prompt
+    assert "inverted claim" in prompt.lower()
+    # Ordering: prose discipline first, then the concrete anti-examples.
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("Anti-Examples")
+
+
+def test_anti_examples_present_for_non_artifact_non_diff_kind():
+    prompt = build_review_prompt(ReviewRequest(kind="doc", content="some text"))
+    assert "Anti-Examples" in prompt
+
+
+def test_anti_examples_absent_for_artifact_kinds():
+    """Anti-examples are scoped like the discipline — excluded from artifact
+    reviews, which carry their own rubric and whole-document framing."""
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n")
+        )
+        assert "Anti-Examples" not in prompt, artifact_kind
+
+
 def test_mixed_diff_omits_critique_instruction():
     # Only clearly doc-heavy diffs are routed; mixed is conservative.
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
