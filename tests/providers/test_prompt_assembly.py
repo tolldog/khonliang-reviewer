@@ -437,6 +437,21 @@ def test_severity_discipline_does_not_cap_blocking_categories():
     assert "for correctness or security" not in code_prompt
 
 
+def test_severity_discipline_yields_to_repo_severity_rubric():
+    """Regression guard (codex round 4): the built-in discipline must defer to a
+    repo-provided severity_rubric (the operator's calibration feature) rather
+    than silently contradicting it. The instruction states the precedence, and
+    the repo rubric renders below it in the same prompt."""
+    rp = RepoPrompts(severity_rubric="treat naming nits as concern here")
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), repo_prompts=rp
+    )
+    assert "follow ITS calibration wherever it differs" in prompt
+    assert "## Severity Rubric" in prompt
+    # Precedence reads correctly: discipline first, repo rubric after.
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("## Severity Rubric")
+
+
 def test_review_discipline_precedes_kind_routing():
     """Discipline calibration is in the base prompt, before the kind-specific
     doc routing — so it frames every finding on the non-artifact path."""

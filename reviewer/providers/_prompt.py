@@ -185,7 +185,11 @@ _ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
 #: performance/resource regression on a plain code diff) would get silently
 #: downgraded, flipping the verdict away from `concerns-raised`. "Genuinely
 #: blocking defect" keeps all of those eligible while still curbing the
-#: style-as-concern false positive.
+#: style-as-concern false positive. The clause also explicitly yields to a
+#: repo-provided `.reviewer/prompts/severity_rubric.md` (rendered below via
+#: `_render_repo_prompts`): that file IS the operator's severity-calibration
+#: feature, so it must win where it differs from this built-in default rather
+#: than the two contradicting each other.
 _REVIEW_DISCIPLINE_INSTRUCTION = (
     "REVIEW DISCIPLINE — applies to every finding:\n"
     "1. A finding must assert something the change gets WRONG — a bug, a "
@@ -200,7 +204,8 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
     "stop the change. Do NOT raise subjective naming, style, formatting, or "
     "calibration preferences to 'concern'; those are 'comment' or 'nit'. If "
     "you are unsure a finding is both real and blocking, lower its severity or "
-    "omit it."
+    "omit it. If a severity rubric is provided below, follow ITS calibration "
+    "wherever it differs from this default."
 )
 
 
