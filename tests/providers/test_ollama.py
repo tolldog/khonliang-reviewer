@@ -552,46 +552,51 @@ def test_suggest_num_ctx_returns_none_for_small_prompt():
 
 
 def test_suggest_num_ctx_snug_rounds_up_to_granularity():
-    """Larger prompts get a window snugly above their real token count,
-    rounded up to the 2048 granularity — not a coarse power-of-two leap —
-    with a 1.3x density safety margin on the prompt estimate.
+    """Larger prompts get a window snugly above their worst-case token
+    count, rounded up to the 2048 granularity — not a coarse power-of-two
+    leap. Sizing uses the bytes/2.3 worst-case floor + 1024 headroom.
 
-    prompt_tokens = ceil(bytes / 3); window = ceil(prompt_tokens * 1.3) +
-    1024 headroom, then ceil to 2048. "x" is one UTF-8 byte, so bytes ==
-    char count.
+    window = ceil(bytes / 2.3) + 1024, then ceil to 2048. "x" is one
+    UTF-8 byte, so bytes == char count.
     """
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 15_000/3=5000; *1.3=6500 +1024=7524 → ceil to 2048 → 8192
+    # 15_000/2.3=6522 +1024=7546 → ceil to 2048 → 8192
     assert _suggest_num_ctx("x" * 15_000) == 8192
-    # 30_000/3=10_000; *1.3=13_000 +1024=14_024 → 14_336
+    # 30_000/2.3=13_044 +1024=14_068 → 14_336
     assert _suggest_num_ctx("x" * 30_000) == 14_336
-    # 80_000/3=26_667; *1.3=34_668 +1024=35_692 → 36_864
+    # 80_000/2.3=34_783 +1024=35_807 → 36_864
     assert _suggest_num_ctx("x" * 80_000) == 36_864
-    # 150_000/3=50_000; *1.3=65_000 +1024=66_024 → 67_584
+    # 150_000/2.3=65_218 +1024=66_242 → 67_584
     assert _suggest_num_ctx("x" * 150_000) == 67_584
 
 
-def test_suggest_num_ctx_density_margin_exceeds_unpadded_estimate():
-    """The sized window must clear the prompt+headroom estimate with a
-    real margin — this is the regression guard for codex's P1 (snug
-    rounding eroding the slack the old ladder gave token-dense diffs)."""
+def test_suggest_num_ctx_covers_worst_case_density():
+    """The sized window must hold a real 2.3-bytes/token tokenization of
+    the prompt plus the response headroom — regression guard for codex's
+    P1 (snug rounding eroding the slack the old ladder gave token-dense
+    diffs). Includes codex's concrete 11_777-byte counterexample, which
+    must NOT truncate."""
     import math
 
     from reviewer.providers.ollama import (
-        _BYTES_PER_TOKEN,
         _RESPONSE_TOKEN_HEADROOM,
         _suggest_num_ctx,
     )
 
-    prompt = "x" * 30_000
-    window = _suggest_num_ctx(prompt)
-    unpadded = (
-        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
-        + _RESPONSE_TOKEN_HEADROOM
-    )
-    # At least ~25% headroom over the lower-bound estimate.
-    assert window >= unpadded * 1.25
+    # codex's concrete case: bytes/2.3 needs 5121 + 1024 = 6145 tokens;
+    # the window must be ≥ that (the 1.3x factor returned 6144 → truncate).
+    assert _suggest_num_ctx("x" * 11_777) == 8192
+
+    # General property across a range of prompt sizes.
+    for n in (10_000, 11_777, 20_000, 50_000, 123_456):
+        prompt = "x" * n
+        window = _suggest_num_ctx(prompt)
+        worst_case = (
+            math.ceil(len(prompt.encode("utf-8")) / 2.3)
+            + _RESPONSE_TOKEN_HEADROOM
+        )
+        assert window >= worst_case, (n, window, worst_case)
 
 
 def test_suggest_num_ctx_caps_at_max():
