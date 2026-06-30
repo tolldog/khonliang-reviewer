@@ -222,6 +222,34 @@ _ARTIFACT_REVIEW_INSTRUCTION = (
 )
 
 
+#: Header for the packaged negative-example block (fr_reviewer_ff923ebf b).
+#: Rendered on the same rubric-less hot-tier path as
+#: :data:`_REVIEW_DISCIPLINE_INSTRUCTION` — concrete anti-examples reinforce
+#: the prose discipline by showing the exact false-positive shapes (drawn from
+#: dog_9902f2f9 echo-as-finding and dog_3891542a inverted-claim) the model
+#: must not emit. This is the built-in/packaged path (parallel to the built-in
+#: rubrics); a repo-level override of anti-examples is a possible follow-on.
+_ANTI_EXAMPLES_HEADER = "## Anti-Examples — findings you must NOT produce"
+
+
+@functools.lru_cache(maxsize=None)
+def _builtin_anti_examples() -> str | None:
+    """Return the packaged ``anti_examples.md`` text, or ``None`` if absent.
+
+    Kind-agnostic: the patterns (echo-as-finding, inverted-claim,
+    style-as-concern) apply across every rubric-less hot-tier review kind, so a
+    single packaged file serves them all. Cached — the file doesn't change
+    within a process. Same resource-loading pattern as
+    :func:`_builtin_kind_rubric`.
+    """
+    try:
+        res = importlib.resources.files("reviewer.data.prompts") / "anti_examples.md"
+        text = res.read_text(encoding="utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        return None
+    return text if text.strip() else None
+
+
 @functools.lru_cache(maxsize=None)
 def _builtin_kind_rubric(kind: str) -> str | None:
     """Return the packaged ``{kind}_rubric.md`` text, or ``None`` if absent.
@@ -350,6 +378,14 @@ def build_review_prompt(
     # tier too, but it is rubric-governed, so the rubric is its calibration.
     if request.kind not in _ARTIFACT_KINDS:
         lines += [_REVIEW_DISCIPLINE_INSTRUCTION, ""]
+        # Concrete anti-examples (fr_reviewer_ff923ebf b) reinforce the prose
+        # discipline above by showing the exact false-positive shapes to avoid.
+        # Same scope as the discipline (rubric-less hot-tier kinds); artifacts
+        # are excluded — their code-diff-shaped echo/invert examples don't fit a
+        # whole-document review, which has its own rubric.
+        anti_examples = _builtin_anti_examples()
+        if anti_examples:
+            lines += [_ANTI_EXAMPLES_HEADER, "", anti_examples.rstrip(), ""]
 
     # Doc-hunk routing (fr_reviewer_1262ce18): a predominantly-prose change
     # gets a critique-not-summarize instruction so the model doesn't echo the
