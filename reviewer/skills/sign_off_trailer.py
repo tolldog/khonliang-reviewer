@@ -43,7 +43,7 @@ an ``Agent-Reviewed-by`` line for a review that didn't actually
 run is misleading sign-off provenance. Agent handlers catch the
 exception and surface ``{error: ...}`` to the caller. The one
 exception is a *timeout* (``error_category`` in
-:data:`_TIMEOUT_SKIP_CATEGORIES`): it maps to the ``review-skipped``
+:data:`_TIMEOUT_SKIP_SIGNALS`): it maps to the ``review-skipped``
 verdict with an **empty** trailer line plus a ``note`` — a timed-out
 hot-tier pass degrades to a non-blocking "skip with a note" so the
 pre-push gate proceeds to the cross-vendor reviewer instead of either
@@ -84,18 +84,30 @@ Verdict = Literal[
 
 _REASON_MAX_CHARS = 80
 
-#: Errored ``error_category`` values that degrade to a non-blocking
+#: ``(backend, error_category)`` pairs that degrade to a non-blocking
 #: ``review-skipped`` verdict instead of a hard ``ValueError``. A review
 #: that *timed out* never produced output — it's not a failed review with
 #: findings to act on, and it's not a clean approval to sign off. For the
 #: pre-push gate it should "skip with a note" so the workflow proceeds to
 #: the cross-vendor gate, rather than either blocking the commit or
-#: fabricating a sign-off. Covers both provider timeout categories:
-#: ollama's ``backend_timeout`` and claude_cli's ``subprocess_timeout``.
-#: Other errored categories (malformed_envelope, auth_not_provisioned, …)
-#: stay hard errors — those are real failures to surface, not transient
-#: "couldn't run in time" conditions.
-_TIMEOUT_SKIP_CATEGORIES = frozenset({"backend_timeout", "subprocess_timeout"})
+#: fabricating a sign-off.
+#:
+#: Scoped to the **local hot-tier** providers only: ollama's
+#: ``backend_timeout`` and claude_cli's ``subprocess_timeout`` (the
+#: hot-tier + escalation pass that the cross-vendor gate backstops). It
+#: must NOT match ``codex_cli`` / ``gh_copilot``, which *also* emit
+#: ``subprocess_timeout`` but ARE the cross-vendor gate — silently
+#: skipping a timed-out authoritative review would let an unreviewed
+#: commit through with no fallback. Keying on the (backend, category) pair
+#: (not the shared category alone) keeps that distinction. Other errored
+#: categories (malformed_envelope, auth_not_provisioned, …) stay hard
+#: errors everywhere — real failures, not transient "couldn't run in time".
+_TIMEOUT_SKIP_SIGNALS = frozenset(
+    {
+        ("ollama", "backend_timeout"),
+        ("claude_cli", "subprocess_timeout"),
+    }
+)
 
 
 def compute_verdict(result: ReviewResult) -> Verdict:
@@ -122,7 +134,7 @@ def compute_verdict(result: ReviewResult) -> Verdict:
     rows are subject to the actionability check.
 
     An errored disposition whose ``error_category`` is a timeout
-    (:data:`_TIMEOUT_SKIP_CATEGORIES`) maps to ``review-skipped``
+    (:data:`_TIMEOUT_SKIP_SIGNALS`) maps to ``review-skipped``
     rather than raising — a timed-out review never ran to
     completion, so the pre-push gate should skip with a note (and
     no trailer) and let the cross-vendor gate carry the sign-off,
@@ -137,9 +149,11 @@ def compute_verdict(result: ReviewResult) -> Verdict:
     if result.error_category == "claude_cli_escalation":
         return "escalated-approved"
     if result.disposition == "errored":
-        # A timeout degrades to a non-blocking skip (the review never ran to
-        # completion); other errored categories stay hard errors.
-        if result.error_category in _TIMEOUT_SKIP_CATEGORIES:
+        # A *local hot-tier* timeout degrades to a non-blocking skip (the
+        # review never ran to completion); other errored categories — and
+        # timeouts from the cross-vendor gate providers (codex/copilot, which
+        # share the subprocess_timeout category) — stay hard errors.
+        if (result.backend, result.error_category) in _TIMEOUT_SKIP_SIGNALS:
             return "review-skipped"
         message = result.error or "(no error message)"
         raise ValueError(

@@ -428,12 +428,14 @@ def test_errored_disposition_raises():
         build_trailer(r)
 
 
-def _timeout_result(error_category: str, error: str) -> ReviewResult:
+def _timeout_result(
+    error_category: str, error: str, *, backend: str = "ollama"
+) -> ReviewResult:
     return ReviewResult(
         request_id="req-test",
         summary="",
         findings=[],
-        backend="ollama",
+        backend=backend,
         model="deepseek-coder-v2:16b",
         disposition="errored",
         error=error,
@@ -441,13 +443,33 @@ def _timeout_result(error_category: str, error: str) -> ReviewResult:
     )
 
 
-def test_timeout_maps_to_review_skipped_not_raise():
-    """A timed-out review degrades to a non-blocking ``review-skipped``
-    verdict instead of raising — the pre-push gate skips with a note and
-    proceeds to the cross-vendor reviewer rather than blocking the commit."""
-    for category in ("backend_timeout", "subprocess_timeout"):
-        r = _timeout_result(category, "ollama request timed out after 540.0s")
-        assert compute_verdict(r) == "review-skipped", category
+def test_local_hot_tier_timeout_maps_to_review_skipped_not_raise():
+    """A timed-out LOCAL hot-tier review degrades to a non-blocking
+    ``review-skipped`` verdict instead of raising — the pre-push gate skips
+    with a note and proceeds to the cross-vendor reviewer rather than
+    blocking the commit. Scoped to (backend, category) pairs."""
+    cases = [
+        ("ollama", "backend_timeout", "ollama request timed out after 540.0s"),
+        ("claude_cli", "subprocess_timeout", "claude -p timed out after 300.0s"),
+    ]
+    for backend, category, msg in cases:
+        r = _timeout_result(category, msg, backend=backend)
+        assert compute_verdict(r) == "review-skipped", (backend, category)
+
+
+def test_cross_vendor_gate_timeout_still_raises():
+    """codex_cli / gh_copilot ARE the authoritative cross-vendor gate and
+    *also* emit ``subprocess_timeout``. Their timeout must NOT silently skip
+    (that would let an unreviewed commit through with no fallback) — keying on
+    the (backend, category) pair, not the shared category, preserves this."""
+    import pytest
+
+    for backend in ("codex_cli", "gh_copilot"):
+        r = _timeout_result(
+            "subprocess_timeout", "codex exec timed out after 300.0s", backend=backend
+        )
+        with pytest.raises(ValueError, match="errored"):
+            build_trailer(r)
 
 
 def test_review_skipped_emits_empty_trailer_with_note():
@@ -464,7 +486,9 @@ def test_review_skipped_emits_empty_trailer_with_note():
 
 
 def test_review_skipped_honors_caller_reason():
-    r = _timeout_result("subprocess_timeout", "claude -p timed out after 300.0s")
+    r = _timeout_result(
+        "subprocess_timeout", "claude -p timed out after 300.0s", backend="claude_cli"
+    )
     out = build_trailer(r, reason="gpu busy, deferring to codex")
     assert out["verdict"] == "review-skipped"
     assert out["trailer_line"] == ""
@@ -480,6 +504,17 @@ def test_non_timeout_errored_still_raises():
         r = _timeout_result(category, "connection refused")
         with pytest.raises(ValueError, match="errored"):
             build_trailer(r)
+
+
+def test_ollama_subprocess_timeout_category_mismatch_raises():
+    """Defensive: ollama doesn't emit subprocess_timeout, but if a malformed
+    (backend, category) pairing arrives it must NOT skip — only the exact
+    registered local hot-tier pairs do."""
+    import pytest
+
+    r = _timeout_result("subprocess_timeout", "weird", backend="ollama")
+    with pytest.raises(ValueError, match="errored"):
+        build_trailer(r)
 
 
 def test_escalated_approved_not_blocked_by_disposition_check():
