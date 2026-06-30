@@ -437,14 +437,18 @@ _TRUNCATION_INPUT_THRESHOLD = 2000
 _TRUNCATION_OUTPUT_THRESHOLD = 32
 
 
-# Round the estimated token count *up* to a multiple of this so the
-# window snugly covers the prompt instead of leaping to the next
+# Round the sizing budget *up* to a multiple of this so the window
+# tracks the prompt at a fine granularity instead of leaping to the next
 # power-of-two. llama.cpp accepts an arbitrary ``n_ctx`` — there is no
-# hard power-of-two requirement — so a snug ceiling is safe and keeps
-# the KV cache (≈190 KB/token on qwen2.5-coder:14b) as small as the
-# prompt allows. The previous coarse ladder (8k/16k/32k/…) routinely
-# ~2× over-allocated (a ~17k-token prompt got a 32k window), inflating
-# the KV cache and aggravating GPU VRAM contention on a busy box.
+# hard power-of-two requirement — so a granular ceiling is safe. This is
+# sizing *hygiene* (explicit, fine-grained, the window means what the
+# budget says) rather than a VRAM win: once the budget below accounts for
+# worst-case token density + chat-template overhead, the resulting window
+# lands *comparable* to the old coarse ladder — sometimes tighter (mid
+# range), sometimes slightly larger (the ladder's accidental slack
+# happened to under-cover dense diffs there). The real decode-speed /
+# VRAM lever for the timeout this milestone targets is the fast pre-push
+# tier (part 2) and timeout→skip degradation (part 3), not this.
 _NUM_CTX_GRANULARITY = 2048
 
 # Hard ceiling on the auto-bumped window. Beyond this the model can't
@@ -479,19 +483,29 @@ _BYTES_PER_TOKEN = 3
 # medium-bodied findings.
 _RESPONSE_TOKEN_HEADROOM = 1024
 
+# Fixed allowance for the chat-template / control tokens Ollama's
+# ``/api/chat`` injects around the prompt (system + role markers, BOS/EOS,
+# tool framing) *before* enforcing ``options.num_ctx``. These are not in
+# ``prompt`` itself, so without an explicit allowance a window sized to
+# exactly ``worst_case + headroom`` (e.g. landing on a granularity
+# multiple) would leave zero room for them and truncate. 256 is generous
+# for any single system+user+assistant wrapper.
+_CHAT_TEMPLATE_TOKEN_OVERHEAD = 256
+
 # Worst-case bytes-per-token floor used to *size* the override window.
 # _BYTES_PER_TOKEN (3) is the typical lower bound and is right for the
 # "do we need to override at all?" decision; but review prompts are code
 # diffs dense with punctuation, short identifiers, and newlines, whose
 # worst hunks tokenize down to ~2.3 bytes/token. The old coarse ladder
 # (8k/16k/32k/…) absorbed that variance by accident — its next-power-of-
-# two jump left a large cushion. Snug-rounding removes that accidental
+# two jump left a large cushion. Granular rounding removes that accidental
 # cushion, so we restore a *deliberate, provable* one: size the window on
-# bytes / 2.3 (plus the fixed response headroom) and round up to the
-# granularity. Because snug-rounding only ever increases the value, the
-# resulting window is guaranteed ≥ the token count a real 2.3-bytes/token
-# tokenization needs — no boundary off-by-one. Still ~2× tighter than the
-# ladder on large prompts, so the VRAM-pressure win is preserved.
+# bytes / 2.3 (plus the fixed response headroom + chat-template overhead)
+# and round up to the granularity. Because rounding only ever increases
+# the value, the resulting window is guaranteed ≥ the token count a real
+# 2.3-bytes/token tokenization plus its chat wrapper needs — no boundary
+# off-by-one. Net window size lands comparable to the old ladder (the
+# point is correctness + explicit budgeting, not a VRAM reduction).
 _BYTES_PER_TOKEN_FLOOR = 2.3
 
 
@@ -610,8 +624,10 @@ def _suggest_num_ctx(prompt: str) -> int | None:
 
     Sizes the window on the worst-case token-dense tokenization
     (``bytes`` / :data:`_BYTES_PER_TOKEN_FLOOR`) plus
-    :data:`_RESPONSE_TOKEN_HEADROOM`, rounded *up* to the next multiple
-    of :data:`_NUM_CTX_GRANULARITY`, capped at :data:`_NUM_CTX_MAX`. This
+    :data:`_RESPONSE_TOKEN_HEADROOM` plus
+    :data:`_CHAT_TEMPLATE_TOKEN_OVERHEAD`, rounded *up* to the next
+    multiple of :data:`_NUM_CTX_GRANULARITY`, capped at
+    :data:`_NUM_CTX_MAX`. This
     snug ceiling keeps the window just above the real token count instead
     of leaping to a coarse power-of-two step, so the KV cache stays as
     small as the prompt allows — the decode-speed / VRAM-pressure side of
@@ -644,12 +660,19 @@ def _suggest_num_ctx(prompt: str) -> int | None:
     typical_tokens = math.ceil(prompt_bytes / _BYTES_PER_TOKEN)
     if typical_tokens + _RESPONSE_TOKEN_HEADROOM <= _NUM_CTX_DEFAULT:
         return None
-    # Sizing: cover the worst-case token-dense tokenization (bytes /
-    # 2.3) plus the fixed response headroom, then snug-round up to the
-    # granularity. Snug-rounding only increases the value, so the window
-    # is provably ≥ what a 2.3-bytes/token prompt needs.
+    # Sizing budget = worst-case token-dense tokenization (bytes / 2.3)
+    # + response headroom + chat-template overhead, then snug-rounded up
+    # to the granularity. Every consumer of the window is budgeted, so
+    # even when the budget lands on a granularity multiple (zero further
+    # rounding slack) the window still holds prompt + template + response.
+    # Snug-rounding only increases the value, so the window is provably ≥
+    # what a 2.3-bytes/token prompt plus its chat wrapper needs.
     worst_case_tokens = math.ceil(prompt_bytes / _BYTES_PER_TOKEN_FLOOR)
-    sized = worst_case_tokens + _RESPONSE_TOKEN_HEADROOM
+    sized = (
+        worst_case_tokens
+        + _RESPONSE_TOKEN_HEADROOM
+        + _CHAT_TEMPLATE_TOKEN_OVERHEAD
+    )
     snug = math.ceil(sized / _NUM_CTX_GRANULARITY) * _NUM_CTX_GRANULARITY
     return min(snug, _NUM_CTX_MAX)
 

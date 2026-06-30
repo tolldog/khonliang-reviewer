@@ -556,18 +556,18 @@ def test_suggest_num_ctx_snug_rounds_up_to_granularity():
     count, rounded up to the 2048 granularity — not a coarse power-of-two
     leap. Sizing uses the bytes/2.3 worst-case floor + 1024 headroom.
 
-    window = ceil(bytes / 2.3) + 1024, then ceil to 2048. "x" is one
-    UTF-8 byte, so bytes == char count.
+    window = ceil(bytes / 2.3) + 1024 headroom + 256 template, then ceil
+    to 2048. "x" is one UTF-8 byte, so bytes == char count.
     """
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 15_000/2.3=6522 +1024=7546 → ceil to 2048 → 8192
+    # 15_000/2.3=6522 +1024+256=7802 → ceil to 2048 → 8192
     assert _suggest_num_ctx("x" * 15_000) == 8192
-    # 30_000/2.3=13_044 +1024=14_068 → 14_336
+    # 30_000/2.3=13_044 +1280=14_324 → 14_336
     assert _suggest_num_ctx("x" * 30_000) == 14_336
-    # 80_000/2.3=34_783 +1024=35_807 → 36_864
+    # 80_000/2.3=34_783 +1280=36_063 → 36_864
     assert _suggest_num_ctx("x" * 80_000) == 36_864
-    # 150_000/2.3=65_218 +1024=66_242 → 67_584
+    # 150_000/2.3=65_218 +1280=66_498 → 67_584
     assert _suggest_num_ctx("x" * 150_000) == 67_584
 
 
@@ -580,6 +580,7 @@ def test_suggest_num_ctx_covers_worst_case_density():
     import math
 
     from reviewer.providers.ollama import (
+        _CHAT_TEMPLATE_TOKEN_OVERHEAD,
         _RESPONSE_TOKEN_HEADROOM,
         _suggest_num_ctx,
     )
@@ -587,16 +588,22 @@ def test_suggest_num_ctx_covers_worst_case_density():
     # codex's concrete case: bytes/2.3 needs 5121 + 1024 = 6145 tokens;
     # the window must be ≥ that (the 1.3x factor returned 6144 → truncate).
     assert _suggest_num_ctx("x" * 11_777) == 8192
+    # codex's exact-granularity-boundary case: bytes/2.3 + 1024 == 6144
+    # exactly, so without the template allowance the window was 6144 with
+    # zero room for /api/chat's control tokens. Must clear the boundary.
+    assert _suggest_num_ctx("x" * 11_774) == 8192
 
-    # General property across a range of prompt sizes.
-    for n in (10_000, 11_777, 20_000, 50_000, 123_456):
+    # General property: the window holds the worst-case prompt + response
+    # headroom + chat-template overhead across a range of prompt sizes.
+    for n in (10_000, 11_774, 11_777, 20_000, 50_000, 123_456):
         prompt = "x" * n
         window = _suggest_num_ctx(prompt)
-        worst_case = (
+        budget = (
             math.ceil(len(prompt.encode("utf-8")) / 2.3)
             + _RESPONSE_TOKEN_HEADROOM
+            + _CHAT_TEMPLATE_TOKEN_OVERHEAD
         )
-        assert window >= worst_case, (n, window, worst_case)
+        assert window >= budget, (n, window, budget)
 
 
 def test_suggest_num_ctx_caps_at_max():
