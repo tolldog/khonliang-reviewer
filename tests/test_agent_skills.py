@@ -1114,6 +1114,26 @@ async def test_sign_off_trailer_errored_result_returns_error_envelope():
     assert "errored" in out["error"]
 
 
+async def test_sign_off_trailer_timeout_result_returns_skip_envelope():
+    """A timed-out review must NOT error the sign-off skill — it returns a
+    non-blocking review-skipped envelope (empty trailer + note) so the
+    pre-push gate proceeds to the cross-vendor reviewer."""
+    harness = _make_harness()
+    timed_out = _make_result(backend="ollama", model="deepseek-coder-v2:16b")
+    timed_out.disposition = "errored"
+    timed_out.error = "ollama request timed out after 540.0s"
+    timed_out.error_category = "backend_timeout"
+    timed_out.findings = []
+
+    out = await harness.call(
+        "sign_off_trailer", {"result": timed_out.to_dict()}
+    )
+    assert "error" not in out
+    assert out["verdict"] == "review-skipped"
+    assert out["trailer_line"] == ""
+    assert "timed out" in out["note"]
+
+
 async def test_sign_off_trailer_passthrough_errored_review_returns_error():
     """Pass-through path: review_text returns a ReviewResult with
     disposition='errored' (e.g. backend unreachable). build_trailer
