@@ -553,21 +553,45 @@ def test_suggest_num_ctx_returns_none_for_small_prompt():
 
 def test_suggest_num_ctx_snug_rounds_up_to_granularity():
     """Larger prompts get a window snugly above their real token count,
-    rounded up to the 2048 granularity — not a coarse power-of-two leap.
+    rounded up to the 2048 granularity — not a coarse power-of-two leap —
+    with a 1.3x density safety margin on the prompt estimate.
 
-    estimate = ceil(bytes / 3) + 1024 headroom, then ceil to 2048.
-    "x" is one UTF-8 byte, so bytes == char count.
+    prompt_tokens = ceil(bytes / 3); window = ceil(prompt_tokens * 1.3) +
+    1024 headroom, then ceil to 2048. "x" is one UTF-8 byte, so bytes ==
+    char count.
     """
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # 15_000 bytes / 3 = 5000 + 1024 = 6024 → ceil to 2048 → 6144
-    assert _suggest_num_ctx("x" * 15_000) == 6144
-    # 30_000 / 3 = 10_000 + 1024 = 11_024 → 12_288
-    assert _suggest_num_ctx("x" * 30_000) == 12_288
-    # 80_000 / 3 = 26_667 + 1024 = 27_691 → 28_672
-    assert _suggest_num_ctx("x" * 80_000) == 28_672
-    # 150_000 / 3 = 50_000 + 1024 = 51_024 → 51_200
-    assert _suggest_num_ctx("x" * 150_000) == 51_200
+    # 15_000/3=5000; *1.3=6500 +1024=7524 → ceil to 2048 → 8192
+    assert _suggest_num_ctx("x" * 15_000) == 8192
+    # 30_000/3=10_000; *1.3=13_000 +1024=14_024 → 14_336
+    assert _suggest_num_ctx("x" * 30_000) == 14_336
+    # 80_000/3=26_667; *1.3=34_668 +1024=35_692 → 36_864
+    assert _suggest_num_ctx("x" * 80_000) == 36_864
+    # 150_000/3=50_000; *1.3=65_000 +1024=66_024 → 67_584
+    assert _suggest_num_ctx("x" * 150_000) == 67_584
+
+
+def test_suggest_num_ctx_density_margin_exceeds_unpadded_estimate():
+    """The sized window must clear the prompt+headroom estimate with a
+    real margin — this is the regression guard for codex's P1 (snug
+    rounding eroding the slack the old ladder gave token-dense diffs)."""
+    import math
+
+    from reviewer.providers.ollama import (
+        _BYTES_PER_TOKEN,
+        _RESPONSE_TOKEN_HEADROOM,
+        _suggest_num_ctx,
+    )
+
+    prompt = "x" * 30_000
+    window = _suggest_num_ctx(prompt)
+    unpadded = (
+        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+        + _RESPONSE_TOKEN_HEADROOM
+    )
+    # At least ~25% headroom over the lower-bound estimate.
+    assert window >= unpadded * 1.25
 
 
 def test_suggest_num_ctx_caps_at_max():
@@ -628,8 +652,8 @@ def test_resolve_num_ctx_falls_through_to_auto_bump():
         kind="pr_diff", content=big_prompt, metadata={}, request_id="req-test"
     )
     cfg = OllamaProviderConfig()
-    # 30_000 / 3 = 10_000 + 1024 = 11_024 → snug-rounded up to 12_288.
-    assert _resolve_num_ctx(request, cfg, big_prompt) == 12_288
+    # 30_000/3=10_000; *1.3=13_000 +1024=14_024 → snug-rounded to 14_336.
+    assert _resolve_num_ctx(request, cfg, big_prompt) == 14_336
 
 
 def test_resolve_num_ctx_falls_through_for_small_prompt():
@@ -840,9 +864,10 @@ def test_suggest_num_ctx_uses_ceiling_division_at_boundary():
 def test_suggest_num_ctx_counts_utf8_bytes_for_non_ascii():
     from reviewer.providers.ollama import _suggest_num_ctx
 
-    # "中" is 3 UTF-8 bytes → 15_000 bytes / 3 = 5000 + 1024 = 6024 → 6144.
+    # "中" is 3 UTF-8 bytes → 15_000 bytes / 3 = 5000 prompt tokens;
+    # *1.3=6500 +1024=7524 → snug 8192 (same as the 15_000-"x" case).
     cjk_prompt = "中" * 5000
-    assert _suggest_num_ctx(cjk_prompt) == 6144
+    assert _suggest_num_ctx(cjk_prompt) == 8192
     assert _suggest_num_ctx("x" * 5000) is None
 
 

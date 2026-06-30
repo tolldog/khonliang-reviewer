@@ -479,6 +479,20 @@ _BYTES_PER_TOKEN = 3
 # medium-bodied findings.
 _RESPONSE_TOKEN_HEADROOM = 1024
 
+# Multiplicative safety margin on the *prompt* token estimate, applied
+# only once we've decided to override (past _NUM_CTX_DEFAULT). The
+# bytes/3 estimator is a lower-bound approximation: review prompts are
+# code diffs dense with punctuation, short identifiers, and newlines,
+# which can tokenize denser than 3 bytes/token (down to ~2.3 on the
+# worst hunks). The old coarse ladder (8k/16k/32k/…) absorbed that
+# variance by accident — its next-power-of-two jump left a large
+# cushion. Snug-rounding removes that accidental cushion, so we restore
+# a *deliberate, bounded* one here: 1.3× covers densities down to
+# ~3/1.3 ≈ 2.3 bytes/token before the prompt eats into the response
+# headroom and silently truncates. Still ~2× tighter than the ladder on
+# large prompts, so the VRAM-pressure win is preserved.
+_PROMPT_DENSITY_SAFETY = 1.3
+
 
 def _resolve_num_ctx(
     request: ReviewRequest,
@@ -593,17 +607,20 @@ def _coerce_format_value(value: Any) -> str | None:
 def _suggest_num_ctx(prompt: str) -> int | None:
     """Suggest a ``num_ctx`` value that fits the prompt + a response.
 
-    Rounds the estimated prompt-token count plus
-    :data:`_RESPONSE_TOKEN_HEADROOM` *up* to the next multiple of
-    :data:`_NUM_CTX_GRANULARITY`, capped at :data:`_NUM_CTX_MAX`. This
-    snug ceiling keeps the window just above the real token count
-    instead of leaping to a coarse power-of-two step, so the KV cache
-    stays as small as the prompt allows — the decode-speed / VRAM-
-    pressure side of the num_ctx story (the silent-truncation side is
-    closed separately by the native ``/api/chat`` endpoint). Returns
-    ``None`` when the estimate fits inside Ollama's default 4096-token
-    window — keeping the fast path one-keyword-shorter and avoiding
-    overrides that might confuse smaller local models.
+    Pads the estimated prompt-token count by
+    :data:`_PROMPT_DENSITY_SAFETY`, adds :data:`_RESPONSE_TOKEN_HEADROOM`,
+    and rounds *up* to the next multiple of :data:`_NUM_CTX_GRANULARITY`,
+    capped at :data:`_NUM_CTX_MAX`. This snug ceiling keeps the window
+    just above the real token count instead of leaping to a coarse
+    power-of-two step, so the KV cache stays as small as the prompt
+    allows — the decode-speed / VRAM-pressure side of the num_ctx story
+    (the silent-truncation side is closed separately by the native
+    ``/api/chat`` endpoint). The density factor restores a *deliberate*
+    safety margin for token-dense code diffs, replacing the *accidental*
+    slack the old coarse ladder used to provide. Returns ``None`` when
+    the unpadded estimate fits inside Ollama's default 4096-token window
+    — keeping the fast path one-keyword-shorter and avoiding overrides
+    that might confuse smaller local models.
 
     The estimator is deliberately conservative — UTF-8 byte length
     divided by :data:`_BYTES_PER_TOKEN` (3, the lower bound of the
@@ -617,16 +634,20 @@ def _suggest_num_ctx(prompt: str) -> int | None:
     division prevents borderline prompts from rounding *down* under
     the threshold and skipping the override.
     """
-    estimated_tokens = (
-        math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+    prompt_tokens = math.ceil(len(prompt.encode("utf-8")) / _BYTES_PER_TOKEN)
+    estimated_tokens = prompt_tokens + _RESPONSE_TOKEN_HEADROOM
+    if estimated_tokens <= _NUM_CTX_DEFAULT:
+        # The unpadded estimate already fits the default window; let
+        # Ollama apply it. The density margin below only matters once
+        # we're sizing a real override.
+        return None
+    # Pad the prompt estimate (not the fixed response headroom) for
+    # tokenizer-density variance, then snug-round up to the granularity.
+    padded = (
+        math.ceil(prompt_tokens * _PROMPT_DENSITY_SAFETY)
         + _RESPONSE_TOKEN_HEADROOM
     )
-    if estimated_tokens <= _NUM_CTX_DEFAULT:
-        return None
-    snug = (
-        math.ceil(estimated_tokens / _NUM_CTX_GRANULARITY)
-        * _NUM_CTX_GRANULARITY
-    )
+    snug = math.ceil(padded / _NUM_CTX_GRANULARITY) * _NUM_CTX_GRANULARITY
     return min(snug, _NUM_CTX_MAX)
 
 
