@@ -381,6 +381,84 @@ def test_code_diff_omits_critique_instruction():
     assert "CRITIQUE, do not summarize" not in prompt
 
 
+# -- universal review-discipline calibration (fr_reviewer_ff923ebf) ---
+
+
+def test_review_discipline_instruction_present_for_code_diff():
+    """The discipline calibration must fire on a plain CODE diff — both
+    dogfood false-positive cases (echo, inverted-claim) were code diffs where
+    the doc/artifact instructions don't fire."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "REVIEW DISCIPLINE" in prompt
+    # Anti-echo, anti-invert, and severity-discipline clauses all present.
+    assert "restate, paraphrase, or summarize" in prompt
+    assert "opposite of what the diff does" in prompt
+    # Severity discipline forbids style→concern but does NOT cap what counts as
+    # blocking (so it doesn't downgrade perf regressions or rubric concerns).
+    assert "genuinely blocking defect" in prompt
+    assert "Do NOT raise subjective naming, style" in prompt
+
+
+def test_review_discipline_absent_for_artifact_kinds():
+    """Scoping regression guard (codex round 3): the code-change-framed
+    discipline must NOT apply to artifact reviews (fr/spec/milestone) — those
+    carry their own _ARTIFACT_REVIEW_INSTRUCTION + rubric, which own their
+    severity. Applying the code-diff wording biases the model against the
+    rubrics' legitimate planning-integrity concerns."""
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n")
+        )
+        assert "REVIEW DISCIPLINE" not in prompt, artifact_kind
+        # The artifact framing instruction IS still present.
+        assert "complete planning artifact" in prompt, artifact_kind
+
+
+def test_review_discipline_present_for_non_artifact_non_diff_kind():
+    """The discipline covers the rubric-less hot-tier kinds, not just pr_diff —
+    e.g. a `doc` / `pr_description` review (no rubric of its own)."""
+    prompt = build_review_prompt(ReviewRequest(kind="doc", content="some text"))
+    assert "REVIEW DISCIPLINE" in prompt
+
+
+def test_severity_discipline_does_not_cap_blocking_categories():
+    """Regression guard (codex P1, round 2): on the code-diff path the severity
+    clause must NOT enumerate/cap what counts as blocking — a code diff's
+    perf/resource regression is blocking too, so the clause is framed negatively
+    (forbid style→concern only) keeping 'genuinely blocking defect' open.
+    (Round 1, artifact rubric concerns, is now handled by scoping the
+    instruction out of artifacts entirely — see
+    test_review_discipline_absent_for_artifact_kinds.)"""
+    code_prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF)
+    )
+    assert "genuinely blocking defect" in code_prompt
+    # Must NOT cap concern to correctness/security (the round-2 regression).
+    assert "for correctness or security" not in code_prompt
+
+
+def test_severity_discipline_yields_to_repo_severity_rubric():
+    """Regression guard (codex round 4): the built-in discipline must defer to a
+    repo-provided severity_rubric (the operator's calibration feature) rather
+    than silently contradicting it. The instruction states the precedence, and
+    the repo rubric renders below it in the same prompt."""
+    rp = RepoPrompts(severity_rubric="treat naming nits as concern here")
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), repo_prompts=rp
+    )
+    assert "follow ITS calibration wherever it differs" in prompt
+    assert "## Severity Rubric" in prompt
+    # Precedence reads correctly: discipline first, repo rubric after.
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("## Severity Rubric")
+
+
+def test_review_discipline_precedes_kind_routing():
+    """Discipline calibration is in the base prompt, before the kind-specific
+    doc routing — so it frames every finding on the non-artifact path."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MD_DIFF))
+    assert prompt.index("REVIEW DISCIPLINE") < prompt.index("CRITIQUE, do not summarize")
+
+
 def test_mixed_diff_omits_critique_instruction():
     # Only clearly doc-heavy diffs are routed; mixed is conservative.
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MIXED_DIFF))
