@@ -399,38 +399,47 @@ def test_review_discipline_instruction_present_for_code_diff():
     assert "Do NOT raise subjective naming, style" in prompt
 
 
-def test_review_discipline_instruction_present_for_artifact_kind():
-    """Calibration is universal — it also lands on whole-document artifact
-    reviews, complementing the artifact framing instruction."""
-    prompt = build_review_prompt(ReviewRequest(kind="spec", content="# MS-X\n"))
+def test_review_discipline_absent_for_artifact_kinds():
+    """Scoping regression guard (codex round 3): the code-change-framed
+    discipline must NOT apply to artifact reviews (fr/spec/milestone) — those
+    carry their own _ARTIFACT_REVIEW_INSTRUCTION + rubric, which own their
+    severity. Applying the code-diff wording biases the model against the
+    rubrics' legitimate planning-integrity concerns."""
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n")
+        )
+        assert "REVIEW DISCIPLINE" not in prompt, artifact_kind
+        # The artifact framing instruction IS still present.
+        assert "complete planning artifact" in prompt, artifact_kind
+
+
+def test_review_discipline_present_for_non_artifact_non_diff_kind():
+    """The discipline covers the rubric-less hot-tier kinds, not just pr_diff —
+    e.g. a `doc` / `pr_description` review (no rubric of its own)."""
+    prompt = build_review_prompt(ReviewRequest(kind="doc", content="some text"))
     assert "REVIEW DISCIPLINE" in prompt
-    # The artifact framing instruction is also present (both coexist).
-    assert "complete planning artifact" in prompt
 
 
 def test_severity_discipline_does_not_cap_blocking_categories():
-    """Regression guard (codex P1, both rounds): the severity clause must NOT
-    enumerate/cap what counts as blocking. Round 1 — artifact rubrics classify
-    planning-integrity issues (duplicate_of_existing_fr, ...) as blocking
-    concerns; round 2 — a code diff's perf/resource regression is blocking too.
-    The clause is framed negatively (forbid style→concern only), keeping
-    'genuinely blocking defect' open so neither category is downgraded."""
-    # Negative framing present; no narrow positive enumeration.
+    """Regression guard (codex P1, round 2): on the code-diff path the severity
+    clause must NOT enumerate/cap what counts as blocking — a code diff's
+    perf/resource regression is blocking too, so the clause is framed negatively
+    (forbid style→concern only) keeping 'genuinely blocking defect' open.
+    (Round 1, artifact rubric concerns, is now handled by scoping the
+    instruction out of artifacts entirely — see
+    test_review_discipline_absent_for_artifact_kinds.)"""
     code_prompt = build_review_prompt(
         ReviewRequest(kind="pr_diff", content=_CODE_DIFF)
     )
     assert "genuinely blocking defect" in code_prompt
-    # Must NOT cap concern to correctness/security (the round-1/2 regression).
+    # Must NOT cap concern to correctness/security (the round-2 regression).
     assert "for correctness or security" not in code_prompt
-    # Artifact path still renders its rubric below the (rubric-agnostic) clause.
-    fr_prompt = build_review_prompt(ReviewRequest(kind="fr", content="# FR\n"))
-    assert "## Fr Rubric" in fr_prompt
-    assert fr_prompt.index("REVIEW DISCIPLINE") < fr_prompt.index("## Fr Rubric")
 
 
 def test_review_discipline_precedes_kind_routing():
     """Discipline calibration is in the base prompt, before the kind-specific
-    doc/artifact routing — so it frames every finding regardless of kind."""
+    doc routing — so it frames every finding on the non-artifact path."""
     prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_MD_DIFF))
     assert prompt.index("REVIEW DISCIPLINE") < prompt.index("CRITIQUE, do not summarize")
 

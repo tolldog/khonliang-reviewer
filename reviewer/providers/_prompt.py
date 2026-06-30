@@ -170,8 +170,11 @@ _ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
 #: via the literal sign_off_trailer mapping, flips an otherwise-clean review
 #: to `concerns-raised`. The `_DOC_REVIEW_INSTRUCTION` only fires for
 #: doc-heavy diffs and the artifact instruction only for whole-document
-#: artifacts; both dogfood cases were *code* diffs where neither fired, so
-#: this calibration sits in the base prompt for all kinds.
+#: artifacts; both dogfood cases were *code* diffs where neither fired. This
+#: calibration is injected for the rubric-less hot-tier kinds (pr_diff, doc,
+#: pr_description) and EXCLUDED for the artifact kinds (fr/spec/milestone),
+#: which carry their own framing + rubric — see the gate in
+#: :func:`build_review_prompt`.
 #:
 #: The severity-discipline clause is framed *negatively* on purpose: it forbids
 #: raising subjective style/naming/formatting/calibration remarks to `concern`
@@ -326,13 +329,22 @@ def build_review_prompt(
         "content below and return ONLY a JSON object matching the schema you were",
         "given. No prose outside the JSON.",
         "",
-        # Universal review-discipline calibration (fr_reviewer_ff923ebf):
-        # curbs the hot-tier false-positive patterns (echo-as-finding,
-        # inverted-claim, concern-severity over-use) for every kind, before
-        # the kind-specific doc/artifact routing below adds its own framing.
-        _REVIEW_DISCIPLINE_INSTRUCTION,
-        "",
     ]
+
+    # Review-discipline calibration (fr_reviewer_ff923ebf): curbs the hot-tier
+    # false-positive patterns (echo-as-finding, inverted-claim, style-as-
+    # concern). Scoped to kinds that have NO rubric/framing of their own —
+    # pr_diff, doc, pr_description — i.e. the rubric-less hot-tier path where
+    # the dogfood false positives were observed. The artifact kinds
+    # (fr/spec/milestone) are EXCLUDED on purpose: they already carry the
+    # _ARTIFACT_REVIEW_INSTRUCTION ("critique, don't summarize") plus a per-kind
+    # rubric, and that rubric — not this code-change-framed calibration — owns
+    # their severity (its planning-integrity categories like
+    # duplicate_of_existing_fr are legitimately blocking concerns this code-diff
+    # wording would otherwise bias the model against). NB: `fr` runs on the hot
+    # tier too, but it is rubric-governed, so the rubric is its calibration.
+    if request.kind not in _ARTIFACT_KINDS:
+        lines += [_REVIEW_DISCIPLINE_INSTRUCTION, ""]
 
     # Doc-hunk routing (fr_reviewer_1262ce18): a predominantly-prose change
     # gets a critique-not-summarize instruction so the model doesn't echo the
