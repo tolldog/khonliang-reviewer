@@ -116,13 +116,23 @@ class _FakeResponse:
 
 
 class _FakeHttpClient:
-    """Async httpx-shaped fake recording the last POST and GET."""
+    """Async httpx-shaped fake recording the last POST and GET.
+
+    ``post_side_effects`` lets a test script a *sequence* of per-call
+    outcomes (each item is either a ``_FakeResponse`` to return or a
+    ``BaseException`` to raise), consumed by call index — the shape the
+    cold-start-retry tests need (first call times out, second succeeds).
+    ``post_calls`` counts POST invocations so a test can assert the retry
+    actually fired (or didn't). The scalar ``post_response`` /
+    ``post_raises`` forms remain for the single-outcome tests.
+    """
 
     def __init__(
         self,
         *,
         post_response: _FakeResponse | None = None,
         post_raises: BaseException | None = None,
+        post_side_effects: list[Any] | None = None,
         get_response: _FakeResponse | None = None,
         get_raises: BaseException | None = None,
     ):
@@ -132,6 +142,7 @@ class _FakeHttpClient:
             else _FakeResponse(json_data=NATIVE_SUCCESS)
         )
         self._post_raises = post_raises
+        self._post_side_effects = post_side_effects
         self._get_response = (
             get_response
             if get_response is not None
@@ -141,9 +152,19 @@ class _FakeHttpClient:
         self.last_post: dict[str, Any] | None = None
         self.last_get_url: str | None = None
         self.get_calls = 0
+        self.post_calls = 0
 
     async def post(self, url: str, *, json: Any = None, timeout: Any = None) -> Any:
         self.last_post = {"url": url, "json": json, "timeout": timeout}
+        self.post_calls += 1
+        if self._post_side_effects is not None:
+            # Consume the scripted outcome for this call index; the last
+            # entry repeats if the provider makes more calls than scripted.
+            idx = min(self.post_calls - 1, len(self._post_side_effects) - 1)
+            outcome = self._post_side_effects[idx]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
         if self._post_raises is not None:
             raise self._post_raises
         return self._post_response
@@ -278,6 +299,87 @@ async def test_timeout_error_errored():
     # non-blocking "review-skipped" rather than a hard gate failure.
     assert result.error_category == "backend_timeout"
     assert "timed out" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Cold-start timeout retry (fr_khonliang-reviewer_26734e09)
+# ---------------------------------------------------------------------------
+
+
+async def test_first_call_timeout_then_retry_succeeds():
+    """A cold-start timeout on the FIRST call is retried once; the warm
+    second attempt succeeds and produces a posted review. This is the
+    dog_833295f0 "recovered on retry" path the FR closes."""
+    http = _make_http(
+        post_side_effects=[
+            httpx.ReadTimeout("cold-start load"),
+            _FakeResponse(json_data=NATIVE_SUCCESS),
+        ]
+    )
+    result = await OllamaProvider(http_client=http).review(_make_request())
+
+    assert http.post_calls == 2, "the timeout must trigger exactly one retry"
+    assert result.disposition == "posted"
+    assert result.summary == "Ollama review summary."
+
+
+async def test_persistent_timeout_errors_after_one_retry():
+    """When BOTH attempts time out, the result is still the errored
+    ``backend_timeout`` outcome (so the sign-off path can degrade it to a
+    non-blocking skip) — and the retry is capped at one (two attempts)."""
+    http = _make_http(
+        post_side_effects=[
+            httpx.ReadTimeout("slow"),
+            httpx.ReadTimeout("still slow"),
+        ]
+    )
+    result = await OllamaProvider(http_client=http).review(_make_request())
+
+    assert http.post_calls == 2, "retry is capped at one (two attempts total)"
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_timeout"
+    assert "timed out" in result.error
+
+
+async def test_non_timeout_error_is_not_retried():
+    """Non-timeout failures (connection / HTTP / parse) must NOT retry —
+    a second attempt wouldn't help and would just double the latency."""
+    http = _make_http(post_raises=httpx.ConnectError("no route"))
+    result = await OllamaProvider(http_client=http).review(_make_request())
+
+    assert http.post_calls == 1, "connection errors must not be retried"
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
+
+
+async def test_http_status_error_is_not_retried():
+    """A 5xx is a hard backend error, not a cold-start blip — no retry."""
+    http = _make_http(post_response=_FakeResponse(status_code=500))
+    result = await OllamaProvider(http_client=http).review(_make_request())
+
+    assert http.post_calls == 1
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
+
+
+async def test_retry_disabled_fails_fast_on_first_timeout():
+    """With ``retry_on_timeout=False`` the provider fails fast on the first
+    timeout (pre-FR behavior) — one attempt, errored ``backend_timeout``."""
+    http = _make_http(
+        post_side_effects=[
+            httpx.ReadTimeout("slow"),
+            _FakeResponse(json_data=NATIVE_SUCCESS),
+        ]
+    )
+    provider = OllamaProvider(
+        OllamaProviderConfig(retry_on_timeout=False),
+        http_client=http,
+    )
+    result = await provider.review(_make_request())
+
+    assert http.post_calls == 1, "retry disabled → no second attempt"
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_timeout"
 
 
 async def test_auth_rejection_errored_auth_category():

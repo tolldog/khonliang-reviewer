@@ -88,6 +88,21 @@ class OllamaProviderConfig:
     api_key: str = "ollama"
     default_model: str = "qwen2.5-coder:14b"
     timeout_seconds: float = 300.0
+    #: Retry a single time when the FIRST ``/api/chat`` call times out.
+    #: The pre-push hot-tier reviewer intermittently times out on the
+    #: *first* call after the model has been evicted from VRAM: Ollama
+    #: cold-loads the model (seconds to tens of seconds) inside the same
+    #: request, blowing ``timeout_seconds`` — but the model is then
+    #: resident, so a warm second attempt succeeds first-try (the
+    #: "recovered on retry" tell in dog_833295f0). Retrying once turns
+    #: that cold-start blip into a completed review instead of a
+    #: degraded-to-skipped one (fr_khonliang-reviewer_26734e09). Only the
+    #: TIMEOUT path retries — HTTP/auth/transport/parse errors return
+    #: immediately (a retry wouldn't help and would just double the
+    #: latency of a hard failure). Capped at one retry (two attempts
+    #: total). Set ``False`` to disable and fail fast on the first
+    #: timeout, matching the pre-FR behavior.
+    retry_on_timeout: bool = True
     #: Operator-pinned ``num_ctx`` for every Ollama review unless the
     #: caller overrides via ``request.metadata["num_ctx"]``. ``None``
     #: (default) falls through to the auto-bump heuristic
@@ -230,67 +245,94 @@ class OllamaProvider(ReviewProvider):
         if num_ctx_override is not None:
             payload["options"] = {"num_ctx": num_ctx_override}
 
-        try:
-            http_response = await self._http.post(
-                f"{self._native_url}/api/chat",
-                json=payload,
-                timeout=self.config.timeout_seconds,
-            )
-            http_response.raise_for_status()
-            native = http_response.json()
-        except httpx.TimeoutException:
-            return _errored(
-                request,
-                error=f"ollama request timed out after {self.config.timeout_seconds}s",
-                # Distinct from the generic ``backend_error`` (HTTP / connection
-                # failures below) so the sign-off path can degrade a *timeout*
-                # to "review-skipped" — a non-blocking pre-push outcome — while
-                # other backend failures stay hard errors. Parallels the
-                # claude_cli provider's ``subprocess_timeout`` category.
-                error_category="backend_timeout",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
-            )
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code
-            if status in (401, 403):
+        # Cold-start timeout resilience (fr_khonliang-reviewer_26734e09):
+        # the first ``/api/chat`` call after a model eviction cold-loads
+        # the model inside the request and can blow ``timeout_seconds``; a
+        # warm second attempt then succeeds first-try (dog_833295f0). Retry
+        # ONLY on the timeout path, capped at one retry. Every non-timeout
+        # error returns immediately from inside the loop — a retry wouldn't
+        # help and would just double the latency of a hard failure.
+        # ``started_wall`` / ``started_mono`` stay fixed before the loop so
+        # a persistent-timeout ``duration_ms`` spans both attempts.
+        max_attempts = 2 if self.config.retry_on_timeout else 1
+        native: Any = None
+        for attempt in range(max_attempts):
+            try:
+                http_response = await self._http.post(
+                    f"{self._native_url}/api/chat",
+                    json=payload,
+                    timeout=self.config.timeout_seconds,
+                )
+                http_response.raise_for_status()
+                native = http_response.json()
+                break
+            except httpx.TimeoutException:
+                if attempt + 1 < max_attempts:
+                    # Warm-up retry. This log line is the visible signal in
+                    # real pre-push cycles that a cold-start timeout was
+                    # recovered rather than degraded to a skip.
+                    logger.warning(
+                        "ollama request timed out after %ss (attempt %s/%s); "
+                        "retrying once — likely cold-start model load, warm "
+                        "retry usually succeeds (model=%s)",
+                        self.config.timeout_seconds,
+                        attempt + 1,
+                        max_attempts,
+                        model,
+                    )
+                    continue
                 return _errored(
                     request,
-                    error=f"ollama rejected credentials (HTTP {status}): {exc}",
-                    error_category="auth_not_provisioned",
+                    error=f"ollama request timed out after {self.config.timeout_seconds}s",
+                    # Distinct from the generic ``backend_error`` (HTTP / connection
+                    # failures below) so the sign-off path can degrade a *timeout*
+                    # to "review-skipped" — a non-blocking pre-push outcome — while
+                    # other backend failures stay hard errors. Parallels the
+                    # claude_cli provider's ``subprocess_timeout`` category.
+                    error_category="backend_timeout",
                     model=model,
                     started_wall=started_wall,
                     duration_ms=_elapsed_ms(started_mono),
                 )
-            return _errored(
-                request,
-                error=f"ollama returned HTTP {status}: {exc}",
-                error_category="backend_error",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
-            )
-        except httpx.HTTPError as exc:
-            # ConnectError / transport / protocol failure — the native
-            # endpoint couldn't be reached or spoke badly.
-            return _errored(
-                request,
-                error=f"ollama endpoint unreachable: {exc}",
-                error_category="backend_error",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
-            )
-        except (json.JSONDecodeError, ValueError) as exc:
-            return _errored(
-                request,
-                error=f"ollama response body was not valid JSON: {exc}",
-                error_category="malformed_envelope",
-                model=model,
-                started_wall=started_wall,
-                duration_ms=_elapsed_ms(started_mono),
-            )
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status in (401, 403):
+                    return _errored(
+                        request,
+                        error=f"ollama rejected credentials (HTTP {status}): {exc}",
+                        error_category="auth_not_provisioned",
+                        model=model,
+                        started_wall=started_wall,
+                        duration_ms=_elapsed_ms(started_mono),
+                    )
+                return _errored(
+                    request,
+                    error=f"ollama returned HTTP {status}: {exc}",
+                    error_category="backend_error",
+                    model=model,
+                    started_wall=started_wall,
+                    duration_ms=_elapsed_ms(started_mono),
+                )
+            except httpx.HTTPError as exc:
+                # ConnectError / transport / protocol failure — the native
+                # endpoint couldn't be reached or spoke badly.
+                return _errored(
+                    request,
+                    error=f"ollama endpoint unreachable: {exc}",
+                    error_category="backend_error",
+                    model=model,
+                    started_wall=started_wall,
+                    duration_ms=_elapsed_ms(started_mono),
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                return _errored(
+                    request,
+                    error=f"ollama response body was not valid JSON: {exc}",
+                    error_category="malformed_envelope",
+                    model=model,
+                    started_wall=started_wall,
+                    duration_ms=_elapsed_ms(started_mono),
+                )
 
         duration_ms = _elapsed_ms(started_mono)
         result = _parse_response(
