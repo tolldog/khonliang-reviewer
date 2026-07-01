@@ -1078,3 +1078,55 @@ async def test_review_no_warning_on_clean_small_review(caplog):
     assert truncation_warnings == [], (
         "small-input clean review should not fire the truncation heuristic"
     )
+
+
+# ---------------------------------------------------------------------------
+# binary-questions verdict-coverage enforcement (codex PR B R5)
+# ---------------------------------------------------------------------------
+
+
+def _binary_request(**overrides: Any) -> ReviewRequest:
+    return _make_request(
+        metadata={"_khonliang_binary_questions": True},
+        **overrides,
+    )
+
+
+async def test_binary_mode_missing_verdicts_is_malformed_envelope():
+    """Ollama enforces the schema only as prompt text — a model that omits
+    ``verdicts`` in binary mode must yield an errored result, not a silent
+    holistic-shaped success (codex PR B R5 P1)."""
+    http = _make_http()  # NATIVE_SUCCESS carries findings but no verdicts
+    result = await OllamaProvider(http_client=http).review(_binary_request())
+    assert result.disposition == "errored"
+    assert result.error_category == "malformed_envelope"
+    assert "binary_questions verdicts incomplete" in result.error
+    assert result.verdicts == []
+
+
+async def test_binary_mode_complete_verdicts_posted():
+    from reviewer.providers._prompt import BINARY_QUESTION_DIMENSIONS
+
+    content = json.dumps(
+        {
+            "summary": "ok",
+            "findings": [],
+            "verdicts": [
+                {"dimension": d, "question": q, "answer": True, "explanation": "e"}
+                for d, q in BINARY_QUESTION_DIMENSIONS
+            ],
+        }
+    )
+    http = _make_http(post_response=_FakeResponse(json_data=_native_response(content)))
+    result = await OllamaProvider(http_client=http).review(_binary_request())
+    assert result.disposition == "posted"
+    assert len(result.verdicts) == len(BINARY_QUESTION_DIMENSIONS)
+
+
+async def test_holistic_mode_without_verdicts_unchanged():
+    """No binary flag → the coverage gate must not fire; the pre-FR shape
+    (posted, verdicts empty) is preserved."""
+    http = _make_http()
+    result = await OllamaProvider(http_client=http).review(_make_request())
+    assert result.disposition == "posted"
+    assert result.verdicts == []

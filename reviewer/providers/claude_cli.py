@@ -36,9 +36,11 @@ from khonliang_reviewer import (
 
 from reviewer.providers._prompt import (
     REVIEW_RESPONSE_SCHEMA,
+    binary_questions_active,
     build_review_prompt,
     parse_verdicts,
     review_response_schema,
+    validate_verdict_coverage,
 )
 
 
@@ -415,6 +417,24 @@ def _parse_envelope(
         if isinstance(item, dict)
     ]
 
+    verdicts = parse_verdicts(payload)
+    # The --json-schema variant already pins the item count + dimension enum,
+    # but JSON Schema can't express "each dimension exactly once" — six copies
+    # of one dimension still validate. Enforce full coverage at parse time
+    # (codex PR B R5): incomplete coverage is a response-contract failure,
+    # same class as unparseable JSON.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"claude -p response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                envelope=envelope,
+            )
+
     usage = _build_usage(
         envelope,
         request=request,
@@ -428,7 +448,7 @@ def _parse_envelope(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
-        verdicts=parse_verdicts(payload),
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=ClaudeCliProvider.name,

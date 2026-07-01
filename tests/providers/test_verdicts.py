@@ -122,3 +122,70 @@ def test_score_verdicts_all_true_is_one():
     scores = score_verdicts(verdicts)
     assert scores["overall"] == 1.0
     assert scores["correctness"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# validate_verdict_coverage + binary_questions_active (codex PR B R5)
+# ---------------------------------------------------------------------------
+
+from khonliang_reviewer import ReviewRequest
+
+from reviewer.providers._prompt import (
+    BINARY_QUESTION_DIMENSIONS,
+    binary_questions_active,
+    validate_verdict_coverage,
+)
+
+
+def _full_set():
+    return [
+        Verdict(dimension=d, question=q, answer=True, explanation="e")
+        for d, q in BINARY_QUESTION_DIMENSIONS
+    ]
+
+
+def test_coverage_complete_set_is_none():
+    assert validate_verdict_coverage(_full_set()) is None
+
+
+def test_coverage_empty_names_all_missing():
+    msg = validate_verdict_coverage([])
+    assert msg is not None and "missing dimensions" in msg
+    for d, _ in BINARY_QUESTION_DIMENSIONS:
+        assert d in msg
+
+
+def test_coverage_duplicates_within_count_rejected():
+    # Six items but six copies of one dimension — passes the schema's
+    # count+enum constraints, must fail parse-time coverage (R5 P2).
+    verdicts = [
+        Verdict(dimension="correctness", question="q", answer=True, explanation="")
+        for _ in range(len(BINARY_QUESTION_DIMENSIONS))
+    ]
+    msg = validate_verdict_coverage(verdicts)
+    assert msg is not None
+    assert "duplicated dimensions ['correctness']" in msg
+    assert "missing dimensions" in msg
+
+
+def test_coverage_unknown_dimension_rejected():
+    verdicts = _full_set()[:-1] + [
+        Verdict(dimension="vibes", question="q", answer=True, explanation="")
+    ]
+    msg = validate_verdict_coverage(verdicts)
+    assert msg is not None and "unknown dimensions ['vibes']" in msg
+
+
+def test_binary_questions_active_requires_flag_and_pr_diff():
+    flag = {"_khonliang_binary_questions": True}
+    assert binary_questions_active(
+        ReviewRequest(kind="pr_diff", content="x", metadata=dict(flag))
+    )
+    # Non-diff kinds never emit verdicts — gate must be off.
+    assert not binary_questions_active(
+        ReviewRequest(kind="doc", content="x", metadata=dict(flag))
+    )
+    # No flag (holistic) — off regardless of kind.
+    assert not binary_questions_active(
+        ReviewRequest(kind="pr_diff", content="x", metadata={})
+    )

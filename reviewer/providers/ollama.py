@@ -42,7 +42,12 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import build_review_prompt, parse_verdicts
+from reviewer.providers._prompt import (
+    binary_questions_active,
+    build_review_prompt,
+    parse_verdicts,
+    validate_verdict_coverage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -775,6 +780,26 @@ def _parse_response(
         if isinstance(item, dict)
     ]
 
+    verdicts = parse_verdicts(payload)
+    # Ollama has no transport-level schema enforcement — the schema is prompt
+    # text — so in binary-questions mode the model can omit or underfill
+    # ``verdicts`` and the review would silently degrade to a holistic shape
+    # (codex PR B R5). Enforce the fixed-dimensions contract here: incomplete
+    # coverage is the same class as unparseable JSON — the model failed the
+    # response contract.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"ollama response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                response=response,
+            )
+
     usage = _build_usage(
         response,
         request=request,
@@ -788,7 +813,7 @@ def _parse_response(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
-        verdicts=parse_verdicts(payload),
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=OllamaProvider.name,

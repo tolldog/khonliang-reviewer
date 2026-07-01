@@ -75,6 +75,7 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
+from reviewer.providers._prompt import _METADATA_BINARY_QUESTIONS_KEY
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyInput, decide_distill, evaluate
@@ -154,12 +155,11 @@ _METADATA_EXAMPLE_FORMAT_KEY = "_khonliang_example_format"
 #: :func:`build_review_prompt` with the same flag without changing the
 #: ReviewRequest dataclass shape.
 _METADATA_REGION_SWEEP_KEY = "_khonliang_region_sweep"
-#: Binary-questions scoring-mode passthrough (fr_khonliang-reviewer_a585ea3d).
-#: The ``scoring_mode`` skill arg resolves to a bool that is threaded to
-#: build_review_prompt + the schema emission via this reserved in-process
-#: metadata key, mirroring ``_khonliang_region_sweep``. Providers read it as
-#: ``request.metadata.get("_khonliang_binary_questions") is True``.
-_METADATA_BINARY_QUESTIONS_KEY = "_khonliang_binary_questions"
+#: Binary-questions scoring-mode passthrough (fr_khonliang-reviewer_a585ea3d):
+#: ``_METADATA_BINARY_QUESTIONS_KEY``, canonically defined in
+#: ``reviewer.providers._prompt`` (imported at the top of this module) —
+#: the providers gate verdict-coverage enforcement on the same key via
+#: ``binary_questions_active``, so the agent and providers can't drift.
 
 #: Reserved prefix for internal-only passthrough keys on
 #: :attr:`ReviewRequest.metadata`. Every key carrying values the agent

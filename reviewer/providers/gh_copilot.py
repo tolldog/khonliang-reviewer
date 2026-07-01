@@ -52,7 +52,12 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import build_review_prompt, parse_verdicts
+from reviewer.providers._prompt import (
+    binary_questions_active,
+    build_review_prompt,
+    parse_verdicts,
+    validate_verdict_coverage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -472,6 +477,24 @@ def _parse_payload(
         if isinstance(item, dict)
     ]
 
+    verdicts = parse_verdicts(payload)
+    # copilot -p has no transport-level schema enforcement — the schema is
+    # prompt text — so in binary-questions mode the model can omit or
+    # underfill ``verdicts`` and the review would silently degrade to a
+    # holistic shape (codex PR B R5). Enforce the fixed-dimensions contract
+    # here — a response-contract failure, same class as unparseable JSON.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"copilot response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+            )
+
     usage = _build_usage(
         request=request,
         model=model,
@@ -485,7 +508,7 @@ def _parse_payload(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
-        verdicts=parse_verdicts(payload),
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=GhCopilotProvider.name,

@@ -37,9 +37,11 @@ from khonliang_reviewer import (
 )
 
 from reviewer.providers._prompt import (
+    binary_questions_active,
     build_review_prompt,
     parse_verdicts,
     review_response_schema,
+    validate_verdict_coverage,
 )
 
 
@@ -470,6 +472,23 @@ def _parse_payload(
         if isinstance(item, dict)
     ]
 
+    verdicts = parse_verdicts(payload)
+    # --output-schema pins count + dimension enum, but JSON Schema can't
+    # express "each dimension exactly once" (duplicates within the count still
+    # validate). Enforce full coverage at parse time (codex PR B R5) — a
+    # response-contract failure, same class as unparseable JSON.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"codex exec response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+            )
+
     usage = _build_usage(
         request=request,
         model=model,
@@ -482,7 +501,7 @@ def _parse_payload(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
-        verdicts=parse_verdicts(payload),
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=CodexCliProvider.name,

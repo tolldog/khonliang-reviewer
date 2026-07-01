@@ -40,6 +40,7 @@ import importlib.resources
 import json
 import logging
 import re
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from khonliang_reviewer import ReviewRequest, Verdict
@@ -94,6 +95,11 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
 #: fraction-of-True directly as a quality score without per-question polarity
 #: bookkeeping. Ordered ``(dimension, question)`` pairs; the order is the order
 #: the prompt lists them and is stable for tests.
+#: Reserved metadata key the agent sets when the caller requests
+#: ``scoring_mode="binary_questions"``. Canonical definition — the agent and
+#: the providers both import it from here so the gate can't drift.
+_METADATA_BINARY_QUESTIONS_KEY = "_khonliang_binary_questions"
+
 BINARY_QUESTION_DIMENSIONS: tuple[tuple[str, str], ...] = (
     (
         "correctness",
@@ -254,6 +260,58 @@ def parse_verdicts(payload: dict) -> list[Verdict]:
             )
         )
     return verdicts
+
+
+def binary_questions_active(request: "ReviewRequest") -> bool:
+    """True when this request actually runs in binary-questions mode.
+
+    The single source of truth for the gate every surface shares: the
+    reserved metadata flag AND ``kind == "pr_diff"`` (the only kind that
+    receives the binary-questions instruction + schema). Providers use it to
+    decide whether to enforce verdict coverage; keeping it here prevents the
+    flag-vs-kind gate from drifting apart across the four providers.
+    """
+    return (
+        request.metadata.get(_METADATA_BINARY_QUESTIONS_KEY) is True
+        and request.kind == "pr_diff"
+    )
+
+
+def validate_verdict_coverage(verdicts: list[Verdict]) -> str | None:
+    """Check verdicts cover each fixed dimension exactly once.
+
+    Returns ``None`` when complete, else a message naming what's wrong
+    (missing / duplicated / unknown dimensions). This is the ALL-backends
+    completeness contract (codex PR B R5): the schema variant enforces count
+    + dimension enum only on schema-enforced backends (claude_cli /
+    codex_cli) and can't express "each exactly once" at all, while ollama /
+    gh_copilot only ever see the schema as prompt text — so a model there can
+    omit ``verdicts`` entirely and the review would silently degrade to a
+    holistic shape the caller can't distinguish from a clean run. Providers
+    call this when :func:`binary_questions_active` and turn a non-``None``
+    result into a ``malformed_envelope`` error — the same class as
+    unparseable JSON: the model failed the response contract.
+    """
+    expected = Counter(d for d, _ in BINARY_QUESTION_DIMENSIONS)
+    got = Counter(v.dimension for v in verdicts)
+    if got == expected:
+        return None
+    missing = sorted(set(expected) - set(got))
+    duplicated = sorted(d for d, n in got.items() if d in expected and n > 1)
+    unknown = sorted(set(got) - set(expected))
+    parts = []
+    if missing:
+        parts.append(f"missing dimensions {missing}")
+    if duplicated:
+        parts.append(f"duplicated dimensions {duplicated}")
+    if unknown:
+        parts.append(f"unknown dimensions {unknown}")
+    detail = "; ".join(parts) or "no verdicts returned"
+    return (
+        "binary_questions verdicts incomplete — "
+        f"{detail} (expected each of "
+        f"{[d for d, _ in BINARY_QUESTION_DIMENSIONS]} exactly once)"
+    )
 
 
 def score_verdicts(verdicts: list[Verdict]) -> dict:
@@ -873,9 +931,11 @@ def _wrap_example(severity: str, text: str, *, fmt: str) -> list[str]:
 __all__ = [
     "BINARY_QUESTION_DIMENSIONS",
     "REVIEW_RESPONSE_SCHEMA",
+    "binary_questions_active",
     "build_review_prompt",
     "classify_diff_content",
     "parse_verdicts",
     "review_response_schema",
     "score_verdicts",
+    "validate_verdict_coverage",
 ]
