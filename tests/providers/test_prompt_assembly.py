@@ -576,3 +576,51 @@ def test_pr_diff_has_no_artifact_instruction():
         ReviewRequest(kind="pr_diff", content="+++ b/a.py\n@@ -1 +1 @@\n+x = 1\n")
     )
     assert "complete planning artifact" not in prompt
+
+
+# -- region-sweep mode (fr_khonliang-reviewer_8fb20f1f) ---------------
+
+
+def test_region_sweep_instruction_present_when_on():
+    """region_sweep=True injects the anti-cascade sweep instruction on a
+    non-artifact (code-diff) review."""
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), region_sweep=True
+    )
+    assert "REGION-SWEEP MODE" in prompt
+    assert "EVERY" in prompt
+    assert "single pass" in prompt
+
+
+def test_region_sweep_instruction_absent_when_off():
+    """Default (region_sweep=False) leaves the sweep instruction out — and the
+    prompt bytes are byte-identical to omitting the arg entirely."""
+    default_prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    off_prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), region_sweep=False
+    )
+    assert "REGION-SWEEP MODE" not in default_prompt
+    assert "REGION-SWEEP MODE" not in off_prompt
+    # region_sweep=False must reproduce the exact pre-FR bytes.
+    assert default_prompt == off_prompt
+
+
+def test_region_sweep_absent_for_artifact_kinds_even_when_on():
+    """Scoping guard: region_sweep is gated to non-artifact kinds — a whole-
+    document planning artifact has no 'new predicate across call sites' shape to
+    sweep, so the instruction must NOT appear even when the mode is on."""
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n"),
+            region_sweep=True,
+        )
+        assert "REGION-SWEEP MODE" not in prompt, artifact_kind
+
+
+def test_region_sweep_present_for_non_artifact_non_diff_kind():
+    """region_sweep also fires for the other rubric-less hot-tier kinds
+    (e.g. doc / pr_description), not just pr_diff."""
+    prompt = build_review_prompt(
+        ReviewRequest(kind="doc", content="some text"), region_sweep=True
+    )
+    assert "REGION-SWEEP MODE" in prompt

@@ -5706,3 +5706,79 @@ async def test_skill_arg_negative_max_findings_errors():
         "review_text", {"kind": "pr_diff", "content": "x", "max_findings": -3}
     )
     assert "error" in out and "max_findings=" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# region_sweep mode (fr_khonliang-reviewer_8fb20f1f)
+# ---------------------------------------------------------------------------
+
+
+def test_region_sweep_declared_on_review_text_and_diff_schemas():
+    """The opt-in ``region_sweep`` boolean is declared (optional, default
+    False) on both review_text and review_diff so bus schema discovery
+    surfaces it."""
+    harness = _make_harness()
+    for skill_name in ("review_text", "review_diff"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "region_sweep" in s.parameters, skill_name
+        assert s.parameters["region_sweep"]["type"] == "boolean", skill_name
+        assert s.parameters["region_sweep"].get("default") is False, skill_name
+        assert s.parameters["region_sweep"].get("required", False) is False
+
+
+async def test_review_text_region_sweep_threads_reserved_metadata():
+    """``region_sweep=True`` lands on the request's reserved passthrough
+    metadata key so providers reach build_review_prompt with the flag."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "region_sweep": True},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_region_sweep") is True
+
+
+async def test_review_text_without_region_sweep_omits_reserved_metadata():
+    """Absent / False ``region_sweep`` leaves the reserved key off the request
+    entirely — matching the conditional-forward pattern so the off-path is
+    byte-identical to today."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert fake.last_request is not None
+    assert "_khonliang_region_sweep" not in fake.last_request.metadata
+
+
+async def test_review_diff_region_sweep_threads_through_forward():
+    """review_diff forwards ``region_sweep`` to handle_review_text, so the
+    reserved metadata key lands on the request from the diff shortcut too."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"diff": "diff body", "region_sweep": True},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_region_sweep") is True
+
+
+async def test_region_sweep_non_bool_reads_as_off():
+    """Defensive: a non-bool ``region_sweep`` (e.g. a truthy string) reads as
+    off — only a real ``True`` enables the mode, mirroring the ``fast`` knob."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "region_sweep": "yes"},
+    )
+
+    assert fake.last_request is not None
+    assert "_khonliang_region_sweep" not in fake.last_request.metadata
