@@ -170,8 +170,15 @@ _ARTIFACT_KINDS: frozenset[str] = frozenset({"fr", "spec", "milestone"})
 #: via the literal sign_off_trailer mapping, flips an otherwise-clean review
 #: to `concerns-raised`. The `_DOC_REVIEW_INSTRUCTION` only fires for
 #: doc-heavy diffs and the artifact instruction only for whole-document
-#: artifacts; both dogfood cases were *code* diffs where neither fired. This
-#: calibration is injected for the rubric-less hot-tier kinds (pr_diff, doc,
+#: artifacts; both dogfood cases were *code* diffs where neither fired. Clause 4
+#: (fr_reviewer_8d261d32) targets a distinct survivor of the ff923ebf
+#: calibration: the model reviews a diff against an IMAGINED PRE-STATE and flags
+#: an added guard/check as the missing requirement or the bug itself
+#: (dog_0a178955; clearest dog_a29646ac flagged the exact line a diff ADDS a
+#: cold-start guard on as "cold-start path should not be taken"). Clause 2
+#: covers "assert the opposite" but not "evaluate against the pre-diff state" —
+#: a separate anti-pattern. This calibration is injected for the rubric-less
+#: hot-tier kinds (pr_diff, doc,
 #: pr_description) and EXCLUDED for the artifact kinds (fr/spec/milestone),
 #: which carry their own framing + rubric — see the gate in
 #: :func:`build_review_prompt`.
@@ -205,7 +212,11 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
     "calibration preferences to 'concern'; those are 'comment' or 'nit'. If "
     "you are unsure a finding is both real and blocking, lower its severity or "
     "omit it. If a severity rubric is provided below, follow ITS calibration "
-    "wherever it differs from this default."
+    "wherever it differs from this default.\n"
+    "4. Evaluate the diff AS APPLIED. An added guard/check/validation/early-"
+    "return IS the fix — do NOT flag it as a missing/unmet requirement or as "
+    "the defect. Judge the post-diff code, not an imagined version without the "
+    "change."
 )
 
 
