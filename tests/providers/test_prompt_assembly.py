@@ -15,7 +15,13 @@ import logging
 from khonliang_reviewer import ReviewRequest
 
 from reviewer.config.prompts import RepoPrompts
-from reviewer.providers._prompt import build_review_prompt, classify_diff_content
+from reviewer.providers._prompt import (
+    BINARY_QUESTION_DIMENSIONS,
+    REVIEW_RESPONSE_SCHEMA,
+    build_review_prompt,
+    classify_diff_content,
+    review_response_schema,
+)
 
 
 # -- no repo prompts = pre-FR bytes -----------------------------------
@@ -617,3 +623,91 @@ def test_region_sweep_absent_for_non_pr_diff_kinds_even_when_on():
             region_sweep=True,
         )
         assert "REGION-SWEEP MODE" not in prompt, kind
+
+
+# -- binary-questions mode (fr_khonliang-reviewer_a585ea3d) ----------
+
+
+def test_binary_questions_section_present_when_on():
+    """binary_questions=True injects the BinEval section and every one of the
+    fixed dimensions on a pr_diff review."""
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), binary_questions=True
+    )
+    assert "BINARY-QUESTIONS MODE" in prompt
+    assert '"verdicts"' in prompt or "verdicts" in prompt
+    # All six fixed dimensions must be listed.
+    for dimension, question in BINARY_QUESTION_DIMENSIONS:
+        assert dimension in prompt, dimension
+        assert question in prompt, dimension
+    # The confirmed dimension set is exactly these six.
+    assert [d for d, _ in BINARY_QUESTION_DIMENSIONS] == [
+        "correctness",
+        "security",
+        "error_handling",
+        "tests",
+        "performance",
+        "clarity",
+    ]
+
+
+def test_binary_questions_section_absent_when_off_byte_identical():
+    """Default (binary_questions=False) leaves the section out — and the prompt
+    bytes are byte-identical to omitting the arg entirely."""
+    default_prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF)
+    )
+    off_prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), binary_questions=False
+    )
+    assert "BINARY-QUESTIONS MODE" not in default_prompt
+    assert "BINARY-QUESTIONS MODE" not in off_prompt
+    assert default_prompt == off_prompt
+
+
+def test_binary_questions_absent_for_non_pr_diff_kinds_even_when_on():
+    """Scoped to pr_diff (the questions evaluate a diff). Must NOT appear on
+    artifact kinds or the other non-diff hot-tier kinds, even when on."""
+    for kind in ("fr", "spec", "milestone", "doc", "pr_description"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=kind, content="# doc\n"),
+            binary_questions=True,
+        )
+        assert "BINARY-QUESTIONS MODE" not in prompt, kind
+
+
+def test_binary_questions_schema_appears_inline_when_included():
+    """When include_schema is set (ollama/copilot path), the emitted schema
+    carries the verdicts array in binary-questions mode."""
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF),
+        include_schema=True,
+        binary_questions=True,
+    )
+    assert '"verdicts"' in prompt
+    # Holistic include_schema path has no verdicts key.
+    holistic = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF),
+        include_schema=True,
+        binary_questions=False,
+    )
+    assert '"verdicts"' not in holistic
+
+
+def test_review_response_schema_holistic_is_the_constant():
+    """review_response_schema(False) IS the unchanged holistic constant."""
+    assert review_response_schema(False) == REVIEW_RESPONSE_SCHEMA
+    # Same object identity — nothing copies/mutates the holistic schema.
+    assert review_response_schema(False) is REVIEW_RESPONSE_SCHEMA
+
+
+def test_review_response_schema_binary_has_verdicts_without_mutating_constant():
+    """review_response_schema(True) adds a verdicts array and does NOT mutate
+    the shared holistic constant."""
+    binary = review_response_schema(True)
+    assert "verdicts" in binary["properties"]
+    item = binary["properties"]["verdicts"]["items"]
+    assert item["required"] == ["dimension", "question", "answer", "explanation"]
+    assert item["properties"]["answer"]["type"] == "boolean"
+    # The holistic constant must be untouched by building the variant.
+    assert "verdicts" not in REVIEW_RESPONSE_SCHEMA["properties"]

@@ -5782,3 +5782,147 @@ async def test_region_sweep_non_bool_reads_as_off():
 
     assert fake.last_request is not None
     assert "_khonliang_region_sweep" not in fake.last_request.metadata
+
+
+# ---------------------------------------------------------------------------
+# scoring_mode / binary_questions (fr_khonliang-reviewer_a585ea3d)
+# ---------------------------------------------------------------------------
+
+
+def test_scoring_mode_declared_on_review_text_and_diff_schemas():
+    """The opt-in ``scoring_mode`` string is declared (optional, default
+    'holistic') on both review_text and review_diff so bus schema discovery
+    surfaces it."""
+    harness = _make_harness()
+    for skill_name in ("review_text", "review_diff"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "scoring_mode" in s.parameters, skill_name
+        assert s.parameters["scoring_mode"]["type"] == "string", skill_name
+        assert s.parameters["scoring_mode"].get("default") == "holistic", skill_name
+        assert s.parameters["scoring_mode"].get("required", False) is False
+
+
+async def test_review_text_binary_questions_threads_reserved_metadata():
+    """``scoring_mode='binary_questions'`` lands on the request's reserved
+    passthrough metadata key so providers reach build_review_prompt +
+    review_response_schema with the flag on."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_binary_questions") is True
+
+
+async def test_review_text_holistic_omits_reserved_metadata():
+    """Default (holistic) leaves the reserved key off entirely — conditional-
+    forward, so the holistic path is byte-identical to today."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert fake.last_request is not None
+    assert "_khonliang_binary_questions" not in fake.last_request.metadata
+
+
+async def test_review_diff_binary_questions_threads_through_forward():
+    """review_diff forwards ``scoring_mode`` to handle_review_text, so the
+    reserved metadata key lands on the request from the diff shortcut too."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"diff": "diff body", "scoring_mode": "binary_questions"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_binary_questions") is True
+
+
+async def test_unknown_scoring_mode_returns_error_before_provider_call():
+    """An unknown ``scoring_mode`` surfaces a structured error and never
+    reaches the provider (mirrors audience validation)."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "bogus"},
+    )
+
+    assert "error" in result
+    assert "scoring_mode" in result["error"]
+    assert fake.last_request is None
+
+
+async def test_binary_questions_end_to_end_verdicts_and_score():
+    """Integration: a provider returning a verdicts-bearing result surfaces
+    those verdicts through the distill pipeline into the skill response, and
+    an overall score is derivable via score_verdicts."""
+    from khonliang_reviewer import Verdict
+
+    from reviewer.providers._prompt import (
+        BINARY_QUESTION_DIMENSIONS,
+        parse_verdicts,
+        score_verdicts,
+    )
+
+    # Model-shaped payload the provider would parse: one verdict per active
+    # dimension. Round-trip through parse_verdicts so the fake mirrors real
+    # provider construction.
+    payload = {
+        "summary": "reviewed",
+        "verdicts": [
+            {
+                "dimension": dimension,
+                "question": question,
+                "answer": i % 2 == 0,  # alternate true/false for a mixed score
+                "explanation": f"because {dimension}",
+            }
+            for i, (dimension, question) in enumerate(BINARY_QUESTION_DIMENSIONS)
+        ],
+    }
+    verdicts = parse_verdicts(payload)
+    assert len(verdicts) == len(BINARY_QUESTION_DIMENSIONS)
+
+    result = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    result.verdicts = verdicts
+    result.summary = "reviewed"
+    fake = _RecordingProvider("ollama", result)
+    harness = _make_harness({"ollama": fake})
+
+    response = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+
+    # The skill response dict (post-distill, post-serialize) carries verdicts.
+    assert "verdicts" in response
+    assert len(response["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    first = response["verdicts"][0]
+    assert set(first) >= {"dimension", "question", "answer", "explanation"}
+    assert isinstance(first["answer"], bool)
+
+    # At least one verdict per active dimension.
+    dims = {v["dimension"] for v in response["verdicts"]}
+    assert dims == {d for d, _ in BINARY_QUESTION_DIMENSIONS}
+
+    # Overall score is derivable from the returned verdicts.
+    rebuilt = [
+        Verdict(
+            dimension=v["dimension"],
+            question=v["question"],
+            answer=v["answer"],
+            explanation=v["explanation"],
+        )
+        for v in response["verdicts"]
+    ]
+    scores = score_verdicts(rebuilt)
+    assert "overall" in scores
+    assert 0.0 <= scores["overall"] <= 1.0

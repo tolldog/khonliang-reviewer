@@ -154,6 +154,12 @@ _METADATA_EXAMPLE_FORMAT_KEY = "_khonliang_example_format"
 #: :func:`build_review_prompt` with the same flag without changing the
 #: ReviewRequest dataclass shape.
 _METADATA_REGION_SWEEP_KEY = "_khonliang_region_sweep"
+#: Binary-questions scoring-mode passthrough (fr_khonliang-reviewer_a585ea3d).
+#: The ``scoring_mode`` skill arg resolves to a bool that is threaded to
+#: build_review_prompt + the schema emission via this reserved in-process
+#: metadata key, mirroring ``_khonliang_region_sweep``. Providers read it as
+#: ``request.metadata.get("_khonliang_binary_questions") is True``.
+_METADATA_BINARY_QUESTIONS_KEY = "_khonliang_binary_questions"
 
 #: Reserved prefix for internal-only passthrough keys on
 #: :attr:`ReviewRequest.metadata`. Every key carrying values the agent
@@ -248,6 +254,41 @@ def _resolve_audience(value: Any) -> Audience:
             f"{sorted(_VALID_AUDIENCES)}"
         )
     return value  # type: ignore[return-value]
+
+
+class ScoringModeError(ValueError):
+    """Raised when caller-supplied ``scoring_mode`` isn't a known value.
+
+    The skill-arg layer accepts the empty string / unset as the
+    ``holistic`` default; any non-empty value must be one of
+    :data:`_VALID_SCORING_MODES` or this error fires and the handler
+    returns a structured error response.
+    """
+
+
+#: Supported ``scoring_mode`` skill-arg values (fr_khonliang-reviewer_a585ea3d).
+#: ``holistic`` = the pre-FR single-summary+findings review; ``binary_questions``
+#: = BinEval-style decomposition into per-dimension yes/no verdicts (a
+#: ``verdicts`` array on the result, scoped to ``pr_diff`` in prompt assembly).
+_VALID_SCORING_MODES: frozenset[str] = frozenset({"holistic", "binary_questions"})
+_DEFAULT_SCORING_MODE = "holistic"
+
+
+def _resolve_scoring_mode(value: Any) -> str:
+    """Resolve the caller's ``scoring_mode`` arg to a validated value.
+
+    Empty / non-string / unset → ``holistic`` (the safe default that keeps
+    the review byte-identical to the pre-FR path). Non-empty strings that
+    don't match a known mode raise :class:`ScoringModeError`.
+    """
+    if not isinstance(value, str) or not value:
+        return _DEFAULT_SCORING_MODE
+    if value not in _VALID_SCORING_MODES:
+        raise ScoringModeError(
+            f"scoring_mode={value!r} is not valid; expected one of "
+            f"{sorted(_VALID_SCORING_MODES)}"
+        )
+    return value
 
 
 class ArtifactKindError(ValueError):
@@ -1470,6 +1511,18 @@ class ReviewerAgent(BaseAgent):
                     # PARTIAL: the review-loop driver side (dog_8f702fdc) is
                     # separate.
                     "region_sweep": {"type": "boolean", "default": False},
+                    # scoring_mode: review output shape
+                    # (fr_khonliang-reviewer_a585ea3d). "holistic" (default) =
+                    # the current single summary + findings review.
+                    # "binary_questions" = ALSO decompose the review into a
+                    # fixed set of per-dimension yes/no verdicts (correctness,
+                    # security, error_handling, tests, performance, clarity),
+                    # returned as a `verdicts` array from which a per-dimension
+                    # and overall score is derivable (BinEval, arxiv:2606.27226).
+                    # Only affects kind="pr_diff" (the questions evaluate a
+                    # diff); one structured model call, not N. Unknown value =>
+                    # structured error.
+                    "scoring_mode": {"type": "string", "default": "holistic"},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     # severity_floor: drop findings below this severity
@@ -1572,6 +1625,10 @@ class ReviewerAgent(BaseAgent):
                     # review_text schema for full semantics
                     # (fr_khonliang-reviewer_8fb20f1f).
                     "region_sweep": {"type": "boolean", "default": False},
+                    # scoring_mode: see the review_text schema for full
+                    # semantics (fr_khonliang-reviewer_a585ea3d).
+                    # "holistic" (default) | "binary_questions".
+                    "scoring_mode": {"type": "string", "default": "holistic"},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
@@ -1803,6 +1860,17 @@ class ReviewerAgent(BaseAgent):
         # build_review_prompt to kind="pr_diff" (the instruction is
         # diff-shaped).
         region_sweep = args.get("region_sweep") is True
+        # ``scoring_mode`` (fr_khonliang-reviewer_a585ea3d): resolve + validate
+        # up-front so an unknown value surfaces a structured error before we
+        # spend a provider call (mirrors the audience / severity_floor eager
+        # validation). ``binary_questions`` is a pure prompt+schema concern —
+        # like region_sweep it does NOT enter the rule table / provider
+        # selection, and build_review_prompt further gates it to kind="pr_diff".
+        try:
+            scoring_mode = _resolve_scoring_mode(args.get("scoring_mode"))
+        except ScoringModeError as exc:
+            return {"error": str(exc)}
+        binary_questions = scoring_mode == "binary_questions"
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the
         # severity_floor resolver and the example_format resolver
@@ -1965,6 +2033,12 @@ class ReviewerAgent(BaseAgent):
         # path byte-identical to today's prompt.
         if region_sweep:
             metadata[_METADATA_REGION_SWEEP_KEY] = True
+        # Binary-questions passthrough (fr_khonliang-reviewer_a585ea3d). Set the
+        # reserved key only when the mode is on — the conditional-forward
+        # pattern (mirroring region_sweep above) keeps the holistic path
+        # byte-identical to today's prompt + schema.
+        if binary_questions:
+            metadata[_METADATA_BINARY_QUESTIONS_KEY] = True
 
         request = ReviewRequest(
             kind=kind,

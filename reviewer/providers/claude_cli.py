@@ -34,7 +34,12 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
+from reviewer.providers._prompt import (
+    REVIEW_RESPONSE_SCHEMA,
+    build_review_prompt,
+    parse_verdicts,
+    review_response_schema,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,12 +148,16 @@ class ClaudeCliProvider(ReviewProvider):
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
         region_sweep = request.metadata.get("_khonliang_region_sweep") is True
+        binary_questions = (
+            request.metadata.get("_khonliang_binary_questions") is True
+        )
         prompt = build_review_prompt(
             request,
             include_schema=False,
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
             region_sweep=region_sweep,
+            binary_questions=binary_questions,
         )
         started_wall = time.time()
         started_mono = time.monotonic()
@@ -179,7 +188,7 @@ class ClaudeCliProvider(ReviewProvider):
             "-p",
             "--output-format=json",
             "--json-schema",
-            json.dumps(REVIEW_RESPONSE_SCHEMA),
+            json.dumps(review_response_schema(binary_questions)),
             "--permission-mode",
             "dontAsk",
         ]
@@ -411,6 +420,7 @@ def _parse_envelope(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
+        verdicts=parse_verdicts(payload),
         disposition="posted",
         usage=usage,
         backend=ClaudeCliProvider.name,

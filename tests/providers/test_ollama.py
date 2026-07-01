@@ -491,6 +491,48 @@ async def test_findings_filters_non_dict_items():
     assert [f.title for f in result.findings] == ["keep", "also keep"]
 
 
+async def test_verdicts_populated_from_payload():
+    """Real provider wiring: a payload carrying a ``verdicts`` array surfaces
+    parsed Verdict objects on the result (fr_khonliang-reviewer_a585ea3d).
+    Guards the ``verdicts=parse_verdicts(payload)`` wiring for the populated
+    case — the holistic tests only cover the empty (no-key) path."""
+    content = json.dumps(
+        {
+            "summary": "reviewed",
+            "findings": [],
+            "verdicts": [
+                {
+                    "dimension": "correctness",
+                    "question": "Is it correct?",
+                    "answer": True,
+                    "explanation": "yes",
+                },
+                # non-bool answer is dropped at the boundary
+                {
+                    "dimension": "tests",
+                    "question": "Covered?",
+                    "answer": "false",
+                    "explanation": "x",
+                },
+            ],
+        }
+    )
+    http = _make_http(post_response=_FakeResponse(json_data=_native_response(content)))
+    result = await OllamaProvider(http_client=http).review(_make_request())
+    assert result.disposition == "posted"
+    assert len(result.verdicts) == 1
+    assert result.verdicts[0].dimension == "correctness"
+    assert result.verdicts[0].answer is True
+
+
+async def test_verdicts_empty_when_no_key():
+    """Holistic payload (no verdicts key) yields an empty verdicts list — safe
+    on every path so providers call parse_verdicts unconditionally."""
+    http = _make_http(post_response=_FakeResponse(json_data=_native_response(SUCCESS_CONTENT)))
+    result = await OllamaProvider(http_client=http).review(_make_request())
+    assert result.verdicts == []
+
+
 async def test_missing_usage_tokens_zero():
     http = _make_http(
         post_response=_FakeResponse(

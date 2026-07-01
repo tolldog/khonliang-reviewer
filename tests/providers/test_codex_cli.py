@@ -22,6 +22,7 @@ from reviewer.providers.codex_cli import (
     CodexCliProvider,
     CodexCliProviderConfig,
 )
+from reviewer.providers._prompt import review_response_schema
 
 
 SUCCESS_PAYLOAD: dict[str, Any] = {
@@ -496,7 +497,7 @@ def test_schema_file_lazy_init_writes_on_first_use():
     """Schema path is None at construction; first access materializes the file."""
     provider = CodexCliProvider()
     # Eager-init regression guard: __init__ must NOT touch the disk.
-    assert provider._schema_path is None
+    assert provider._schema_paths == {}
     path = provider._get_schema_path()
     try:
         assert os.path.isfile(path)
@@ -504,7 +505,8 @@ def test_schema_file_lazy_init_writes_on_first_use():
         assert provider._get_schema_path() == path
         with open(path) as f:
             loaded = json.load(f)
-        assert loaded == codex_cli.REVIEW_RESPONSE_SCHEMA
+        # Holistic (default) mode materializes the pre-FR schema.
+        assert loaded == review_response_schema(False)
         finding_props = loaded["properties"]["findings"]["items"]["properties"]
         assert finding_props["severity"]["enum"] == ["nit", "comment", "concern"]
     finally:
@@ -539,7 +541,7 @@ async def test_schema_materialization_oserror_yields_errored_result(monkeypatch)
     """A tempfile/disk failure during lazy schema init should not crash review()."""
     provider = CodexCliProvider()
 
-    def fail_materialize() -> str:
+    def fail_materialize(binary_questions: bool = False) -> str:
         raise OSError("No space left on device")
 
     monkeypatch.setattr(provider, "_get_schema_path", fail_materialize)

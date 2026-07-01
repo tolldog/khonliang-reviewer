@@ -34,6 +34,7 @@ everything else falls back to markdown fences.
 
 from __future__ import annotations
 
+import copy
 import functools
 import importlib.resources
 import json
@@ -41,7 +42,7 @@ import logging
 import re
 from typing import TYPE_CHECKING, Any
 
-from khonliang_reviewer import ReviewRequest
+from khonliang_reviewer import ReviewRequest, Verdict
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,187 @@ REVIEW_RESPONSE_SCHEMA: dict[str, Any] = {
         },
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Binary-questions scoring mode (fr_khonliang-reviewer_a585ea3d, BinEval pattern)
+# ---------------------------------------------------------------------------
+#: Fixed dimension set for the binary-questions MVP. NOT derived from the rule
+#: table and NOT configurable — decomposing the review into a small, static set
+#: of atomic yes/no questions (one per dimension) is what BinEval
+#: (arxiv:2606.27226) shows produces more interpretable, discriminative scores
+#: than a holistic rubric. Each question is phrased so that ``True = good`` (the
+#: change is correct / covered / secure / …); ``score_verdicts`` can then treat
+#: fraction-of-True directly as a quality score without per-question polarity
+#: bookkeeping. Ordered ``(dimension, question)`` pairs; the order is the order
+#: the prompt lists them and is stable for tests.
+BINARY_QUESTION_DIMENSIONS: tuple[tuple[str, str], ...] = (
+    (
+        "correctness",
+        "Is the change correct — does it do what it intends without "
+        "introducing a bug?",
+    ),
+    (
+        "security",
+        "Is the change free of introduced security issues (injection, "
+        "unsafe deserialization, secret leakage)?",
+    ),
+    (
+        "error_handling",
+        "Are new error and edge cases handled?",
+    ),
+    (
+        "tests",
+        "Are the new or changed code paths covered by tests in this diff?",
+    ),
+    (
+        "performance",
+        "Is the change free of obvious performance or resource regressions?",
+    ),
+    (
+        "clarity",
+        "Is the change readable and clearly named?",
+    ),
+)
+
+
+#: Injected into the prompt when ``binary_questions`` is on (scoped to
+#: ``kind == "pr_diff"``, like the other diff-mode instructions). Lists the
+#: templated questions and instructs the model to answer EACH in a ``verdicts``
+#: array — in ADDITION to the normal ``findings`` — evaluating the diff AS
+#: APPLIED. ``True`` always means "good / present" so the downstream score is a
+#: plain fraction-of-True. Built lazily by :func:`_binary_questions_instruction`
+#: so the dimension list stays the single source of truth.
+def _binary_questions_instruction() -> str:
+    q_lines = "\n".join(
+        f"- {dimension}: {question}"
+        for dimension, question in BINARY_QUESTION_DIMENSIONS
+    )
+    return (
+        "BINARY-QUESTIONS MODE: in addition to the normal 'findings', answer "
+        "each of the following yes/no questions about the change AS APPLIED. "
+        "Each question is phrased so that 'true' means good/present and "
+        "'false' means the change falls short on that dimension.\n"
+        f"{q_lines}\n"
+        "Return your answers as a 'verdicts' array in the JSON response, one "
+        "object per question: [{\"dimension\": <the dimension label above>, "
+        "\"question\": <the question text>, \"answer\": true|false, "
+        "\"explanation\": <one short sentence grounding the answer in the "
+        "diff>}]. Answer every dimension exactly once. The 'answer' must be a "
+        "JSON boolean, not a string."
+    )
+
+
+#: Schema fragment describing one ``verdicts`` item. Kept separate so
+#: :func:`review_response_schema` can splice it in without duplicating the
+#: property shape.
+_VERDICT_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["dimension", "question", "answer", "explanation"],
+    "properties": {
+        "dimension": {"type": "string"},
+        "question": {"type": "string"},
+        "answer": {"type": "boolean"},
+        "explanation": {"type": "string"},
+    },
+}
+
+
+def review_response_schema(binary_questions: bool) -> dict[str, Any]:
+    """Return the JSON response schema for the requested scoring mode.
+
+    Holistic (``binary_questions=False``) returns
+    :data:`REVIEW_RESPONSE_SCHEMA` **unchanged** — the same object, byte-
+    identical to callers that dump it — so the holistic path is provably
+    untouched. Binary-questions returns a fresh deep copy that ALSO carries a
+    ``verdicts`` array (one entry per templated question). The copy is deep so
+    adding the ``verdicts`` key never mutates the shared holistic constant.
+    """
+    if not binary_questions:
+        return REVIEW_RESPONSE_SCHEMA
+    schema = copy.deepcopy(REVIEW_RESPONSE_SCHEMA)
+    schema["properties"]["verdicts"] = {
+        "type": "array",
+        "items": copy.deepcopy(_VERDICT_ITEM_SCHEMA),
+    }
+    return schema
+
+
+def parse_verdicts(payload: dict) -> list[Verdict]:
+    """Build a validated :class:`Verdict` list from a model response payload.
+
+    Bus/model-boundary validation (per the repo's boundary-validation rule):
+    the ``verdicts`` array is model-produced, so every item is checked before a
+    :class:`Verdict` is constructed. Rules:
+
+    - No ``verdicts`` key (holistic mode, or the model omitted it) → ``[]``.
+      This is why every provider can call ``parse_verdicts`` unconditionally.
+    - ``verdicts`` not a list → ``[]``.
+    - Each item must be a dict with a string ``dimension``, a string
+      ``question``, and a genuine JSON-boolean ``answer``. ``answer`` is
+      required to be an actual :class:`bool` (``isinstance(x, bool)``) — a
+      string ``"false"`` is dropped rather than silently coerced to ``True``.
+      ``explanation`` is coerced to ``str`` (defaults to ``""``).
+    - Malformed items are skipped, not raised on — one bad verdict must not
+      sink an otherwise-usable review.
+    """
+    raw = payload.get("verdicts")
+    if not isinstance(raw, list):
+        return []
+    verdicts: list[Verdict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        dimension = item.get("dimension")
+        question = item.get("question")
+        answer = item.get("answer")
+        if not isinstance(dimension, str) or not dimension:
+            continue
+        if not isinstance(question, str) or not question:
+            continue
+        # A JSON boolean arrives as a Python ``bool``; reject anything else
+        # (string "false", int, None) rather than coercing — ``bool("false")``
+        # is ``True``, the classic footgun this guard closes.
+        if not isinstance(answer, bool):
+            continue
+        explanation = item.get("explanation")
+        verdicts.append(
+            Verdict(
+                dimension=dimension,
+                question=question,
+                answer=answer,
+                explanation=str(explanation) if explanation is not None else "",
+            )
+        )
+    return verdicts
+
+
+def score_verdicts(verdicts: list[Verdict]) -> dict:
+    """Aggregate verdicts into per-dimension and overall fraction-of-True.
+
+    Returns a dict mapping each present dimension to its fraction of ``True``
+    answers, plus an ``"overall"`` key = total ``True`` / total verdicts.
+    Empty input → ``{"overall": 0.0}`` (nothing to score; avoids a divide-by-
+    zero and gives callers a stable shape). Because every templated question is
+    phrased ``True = good``, the fractions are directly usable as quality
+    scores.
+    """
+    if not verdicts:
+        return {"overall": 0.0}
+    per_dim_true: dict[str, int] = {}
+    per_dim_total: dict[str, int] = {}
+    total_true = 0
+    for v in verdicts:
+        per_dim_total[v.dimension] = per_dim_total.get(v.dimension, 0) + 1
+        if v.answer:
+            per_dim_true[v.dimension] = per_dim_true.get(v.dimension, 0) + 1
+            total_true += 1
+    scores: dict[str, float] = {
+        dimension: per_dim_true.get(dimension, 0) / total
+        for dimension, total in per_dim_total.items()
+    }
+    scores["overall"] = total_true / len(verdicts)
+    return scores
 
 
 #: Supported values for ``example_format`` in model config. Anything
@@ -366,6 +548,7 @@ def build_review_prompt(
     repo_prompts: "RepoPrompts | None" = None,
     example_format: str | None = None,
     region_sweep: bool = False,
+    binary_questions: bool = False,
 ) -> str:
     """Assemble the review prompt text from a :class:`ReviewRequest`.
 
@@ -399,6 +582,16 @@ def build_review_prompt(
     one per round. Scoped to ``pr_diff`` because the instruction is
     diff-shaped (paths/lines/hunks). Off (default) leaves the prompt
     bytes byte-identical to the pre-FR shape.
+
+    ``binary_questions`` (fr_khonliang-reviewer_a585ea3d) opt-in per-call:
+    when ``True`` and ``kind == "pr_diff"``, a BinEval-style section is
+    injected listing the fixed :data:`BINARY_QUESTION_DIMENSIONS` yes/no
+    questions and instructing the model to answer each in a ``verdicts`` array
+    (alongside the normal findings). Scoped to ``pr_diff`` for the same reason
+    as ``region_sweep`` — the questions evaluate a diff. When ``include_schema``
+    is set the emitted schema also carries the ``verdicts`` array (via
+    :func:`review_response_schema`). Off (default) leaves both the prompt bytes
+    and the emitted schema byte-identical to the pre-FR shape.
     """
     lines: list[str] = []
 
@@ -465,6 +658,13 @@ def build_review_prompt(
         # classification gate is needed here.
         if region_sweep:
             lines += [_REGION_SWEEP_INSTRUCTION, ""]
+        # Binary-questions mode (fr_khonliang-reviewer_a585ea3d): opt-in per-call
+        # BinEval-style decomposition into atomic yes/no verdicts. Scoped to
+        # ``pr_diff`` (same diff-only gate) — the templated questions evaluate a
+        # code change. Off by default, so the binary_questions=False prompt
+        # stays byte-identical to the pre-FR bytes.
+        if binary_questions:
+            lines += [_binary_questions_instruction(), ""]
     elif request.kind in _ARTIFACT_KINDS:
         # Full-document framing + per-kind rubric. A repo override
         # (.reviewer/prompts/<kind>_rubric.md, surfaced via RepoPrompts)
@@ -493,7 +693,11 @@ def build_review_prompt(
             "## Response Schema",
             "",
             "```json",
-            json.dumps(REVIEW_RESPONSE_SCHEMA, indent=2, sort_keys=True),
+            json.dumps(
+                review_response_schema(binary_questions),
+                indent=2,
+                sort_keys=True,
+            ),
             "```",
             "",
         ]
@@ -639,4 +843,12 @@ def _wrap_example(severity: str, text: str, *, fmt: str) -> list[str]:
     ]
 
 
-__all__ = ["REVIEW_RESPONSE_SCHEMA", "build_review_prompt", "classify_diff_content"]
+__all__ = [
+    "BINARY_QUESTION_DIMENSIONS",
+    "REVIEW_RESPONSE_SCHEMA",
+    "build_review_prompt",
+    "classify_diff_content",
+    "parse_verdicts",
+    "review_response_schema",
+    "score_verdicts",
+]
