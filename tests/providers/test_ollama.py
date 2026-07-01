@@ -492,36 +492,33 @@ async def test_findings_filters_non_dict_items():
 
 
 async def test_verdicts_populated_from_payload():
-    """Real provider wiring: a payload carrying a ``verdicts`` array surfaces
-    parsed Verdict objects on the result (fr_khonliang-reviewer_a585ea3d).
-    Guards the ``verdicts=parse_verdicts(payload)`` wiring for the populated
-    case — the holistic tests only cover the empty (no-key) path."""
-    content = json.dumps(
-        {
-            "summary": "reviewed",
-            "findings": [],
-            "verdicts": [
-                {
-                    "dimension": "correctness",
-                    "question": "Is it correct?",
-                    "answer": True,
-                    "explanation": "yes",
-                },
-                # non-bool answer is dropped at the boundary
-                {
-                    "dimension": "tests",
-                    "question": "Covered?",
-                    "answer": "false",
-                    "explanation": "x",
-                },
-            ],
-        }
+    """Real provider wiring: in binary mode a payload's ``verdicts`` array
+    surfaces parsed Verdict objects on the result, and malformed items are
+    dropped at the boundary BEFORE coverage validation
+    (fr_khonliang-reviewer_a585ea3d; contract updated by codex PR B R6 —
+    verdicts only surface when the mode was requested, so this now runs with
+    the binary flag and a complete dimension set)."""
+    from reviewer.providers._prompt import BINARY_QUESTION_DIMENSIONS
+
+    items = [
+        {"dimension": d, "question": q, "answer": True, "explanation": "e"}
+        for d, q in BINARY_QUESTION_DIMENSIONS
+    ]
+    # A malformed extra item (non-bool answer) is dropped at the parse
+    # boundary and therefore doesn't trip the duplicate-dimension coverage
+    # check — the six valid items above still count exactly once each.
+    items.append(
+        {"dimension": "tests", "question": "Covered?", "answer": "false",
+         "explanation": "x"}
     )
+    content = json.dumps({"summary": "reviewed", "findings": [], "verdicts": items})
     http = _make_http(post_response=_FakeResponse(json_data=_native_response(content)))
-    result = await OllamaProvider(http_client=http).review(_make_request())
+    result = await OllamaProvider(http_client=http).review(_binary_request())
     assert result.disposition == "posted"
-    assert len(result.verdicts) == 1
-    assert result.verdicts[0].dimension == "correctness"
+    assert len(result.verdicts) == len(BINARY_QUESTION_DIMENSIONS)
+    assert {v.dimension for v in result.verdicts} == {
+        d for d, _ in BINARY_QUESTION_DIMENSIONS
+    }
     assert result.verdicts[0].answer is True
 
 
@@ -1127,6 +1124,27 @@ async def test_holistic_mode_without_verdicts_unchanged():
     """No binary flag → the coverage gate must not fire; the pre-FR shape
     (posted, verdicts empty) is preserved."""
     http = _make_http()
+    result = await OllamaProvider(http_client=http).review(_make_request())
+    assert result.disposition == "posted"
+    assert result.verdicts == []
+
+
+async def test_holistic_mode_drops_unsolicited_verdicts():
+    """codex PR B R6: a model that emits an unsolicited ``verdicts`` array on a
+    holistic review must NOT change the response contract — the lib documents
+    ReviewResult.verdicts as populated only when binary mode was requested.
+    Same gate in all four providers; regression-covered on the default backend."""
+    content = json.dumps(
+        {
+            "summary": "ok",
+            "findings": [],
+            "verdicts": [
+                {"dimension": "correctness", "question": "q", "answer": True,
+                 "explanation": "unsolicited"}
+            ],
+        }
+    )
+    http = _make_http(post_response=_FakeResponse(json_data=_native_response(content)))
     result = await OllamaProvider(http_client=http).review(_make_request())
     assert result.disposition == "posted"
     assert result.verdicts == []

@@ -472,7 +472,13 @@ def _parse_payload(
         if isinstance(item, dict)
     ]
 
-    verdicts = parse_verdicts(payload)
+    # Only opted-in pr_diff reviews surface verdicts (codex PR B R6): the
+    # lib contract documents ReviewResult.verdicts as populated only when
+    # scoring_mode='binary_questions', so an unsolicited model-emitted
+    # 'verdicts' key on a holistic review is dropped, not forwarded.
+    verdicts = (
+        parse_verdicts(payload) if binary_questions_active(request) else []
+    )
     # --output-schema pins count + dimension enum, but JSON Schema can't
     # express "each dimension exactly once" (duplicates within the count still
     # validate). Enforce full coverage at parse time (codex PR B R5) — a

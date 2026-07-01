@@ -477,7 +477,13 @@ def _parse_payload(
         if isinstance(item, dict)
     ]
 
-    verdicts = parse_verdicts(payload)
+    # Only opted-in pr_diff reviews surface verdicts (codex PR B R6): the
+    # lib contract documents ReviewResult.verdicts as populated only when
+    # scoring_mode='binary_questions', so an unsolicited model-emitted
+    # 'verdicts' key on a holistic review is dropped, not forwarded.
+    verdicts = (
+        parse_verdicts(payload) if binary_questions_active(request) else []
+    )
     # copilot -p has no transport-level schema enforcement — the schema is
     # prompt text — so in binary-questions mode the model can omit or
     # underfill ``verdicts`` and the review would silently degrade to a
