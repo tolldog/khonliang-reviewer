@@ -576,3 +576,44 @@ def test_pr_diff_has_no_artifact_instruction():
         ReviewRequest(kind="pr_diff", content="+++ b/a.py\n@@ -1 +1 @@\n+x = 1\n")
     )
     assert "complete planning artifact" not in prompt
+
+
+# -- region-sweep mode (fr_khonliang-reviewer_8fb20f1f) ---------------
+
+
+def test_region_sweep_instruction_present_when_on():
+    """region_sweep=True injects the anti-cascade sweep instruction on a
+    non-artifact (code-diff) review."""
+    prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), region_sweep=True
+    )
+    assert "REGION-SWEEP MODE" in prompt
+    assert "EVERY" in prompt
+    assert "single pass" in prompt
+
+
+def test_region_sweep_instruction_absent_when_off():
+    """Default (region_sweep=False) leaves the sweep instruction out — and the
+    prompt bytes are byte-identical to omitting the arg entirely."""
+    default_prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    off_prompt = build_review_prompt(
+        ReviewRequest(kind="pr_diff", content=_CODE_DIFF), region_sweep=False
+    )
+    assert "REGION-SWEEP MODE" not in default_prompt
+    assert "REGION-SWEEP MODE" not in off_prompt
+    # region_sweep=False must reproduce the exact pre-FR bytes.
+    assert default_prompt == off_prompt
+
+
+def test_region_sweep_absent_for_non_pr_diff_kinds_even_when_on():
+    """Scoping guard (codex round 2): region_sweep is gated to ``pr_diff`` —
+    the instruction is diff-shaped (paths/lines/hunks). It must NOT appear on
+    artifact kinds (no call-site-region shape) OR on the other non-diff
+    hot-tier kinds like doc / pr_description (plain prose, no hunks/paths/lines
+    — injecting it risks hallucinated locations), even when the mode is on."""
+    for kind in ("fr", "spec", "milestone", "doc", "pr_description"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=kind, content="# doc\n"),
+            region_sweep=True,
+        )
+        assert "REGION-SWEEP MODE" not in prompt, kind

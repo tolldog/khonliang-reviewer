@@ -142,11 +142,13 @@ class ClaudeCliProvider(ReviewProvider):
         # a plain built-in prompt with no repo-side merge.
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
+        region_sweep = request.metadata.get("_khonliang_region_sweep") is True
         prompt = build_review_prompt(
             request,
             include_schema=False,
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
+            region_sweep=region_sweep,
         )
         started_wall = time.time()
         started_mono = time.monotonic()

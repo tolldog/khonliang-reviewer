@@ -148,6 +148,12 @@ _DEFAULT_SEVERITY_FLOOR = "nit"
 #: the in-process path.
 _METADATA_REPO_PROMPTS_KEY = "_khonliang_repo_prompts"
 _METADATA_EXAMPLE_FORMAT_KEY = "_khonliang_example_format"
+#: Region-sweep mode passthrough (fr_khonliang-reviewer_8fb20f1f). The
+#: ``region_sweep`` skill arg is threaded to the prompt assembler via this
+#: reserved in-process metadata key so both providers reach
+#: :func:`build_review_prompt` with the same flag without changing the
+#: ReviewRequest dataclass shape.
+_METADATA_REGION_SWEEP_KEY = "_khonliang_region_sweep"
 
 #: Reserved prefix for internal-only passthrough keys on
 #: :attr:`ReviewRequest.metadata`. Every key carrying values the agent
@@ -1450,6 +1456,20 @@ class ReviewerAgent(BaseAgent):
                     # window and can be slow under GPU contention; the
                     # timeout→skip degradation is the backstop there.
                     "fast": {"type": "boolean", "default": False},
+                    # region_sweep: opt-in anti-cascade prompt mode
+                    # (fr_khonliang-reviewer_8fb20f1f). true = when the diff
+                    # introduces a NEW predicate / state field / guard /
+                    # invariant, instruct the reviewer to enumerate EVERY
+                    # affected site (in the diff + provided context) in ONE
+                    # pass instead of surfacing one per round — collapsing a
+                    # multi-round review cascade (dog_25d57a12) toward ~2
+                    # rounds. Prompt-level sweep only (no static call-site /
+                    # AST analysis); the instruction is diff-shaped so it fires
+                    # only for kind="pr_diff" (a doc/pr_description/artifact
+                    # review has no hunks/paths/lines to anchor to). Explicitly
+                    # PARTIAL: the review-loop driver side (dog_8f702fdc) is
+                    # separate.
+                    "region_sweep": {"type": "boolean", "default": False},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     # severity_floor: drop findings below this severity
@@ -1548,6 +1568,10 @@ class ReviewerAgent(BaseAgent):
                     # fast resident local tier even for large diffs. See the
                     # review_text schema for the full semantics + caveats.
                     "fast": {"type": "boolean", "default": False},
+                    # region_sweep: opt-in anti-cascade prompt mode. See the
+                    # review_text schema for full semantics
+                    # (fr_khonliang-reviewer_8fb20f1f).
+                    "region_sweep": {"type": "boolean", "default": False},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
@@ -1770,6 +1794,15 @@ class ReviewerAgent(BaseAgent):
         # consulted on the rule-table path (no caller backend/model override),
         # where it pins the fast resident tier for pr_diff reviews.
         latency_priority = args.get("fast") is True
+        # ``region_sweep`` (fr_khonliang-reviewer_8fb20f1f): opt-in anti-cascade
+        # prompt mode. Like ``fast``, only a real ``True`` enables it; any
+        # non-bool defensively reads as "off". Unlike ``fast`` it is purely a
+        # prompt concern (threaded to build_review_prompt via reserved
+        # metadata below) — it does NOT enter the rule table / provider
+        # selection. Whether it actually fires is further gated in
+        # build_review_prompt to kind="pr_diff" (the instruction is
+        # diff-shaped).
+        region_sweep = args.get("region_sweep") is True
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the
         # severity_floor resolver and the example_format resolver
@@ -1926,6 +1959,12 @@ class ReviewerAgent(BaseAgent):
             metadata[_METADATA_REPO_PROMPTS_KEY] = repo_prompts
         if example_format is not None:
             metadata[_METADATA_EXAMPLE_FORMAT_KEY] = example_format
+        # Region-sweep passthrough (fr_khonliang-reviewer_8fb20f1f). Set the
+        # reserved key only when the mode is on — the conditional-forward
+        # pattern (mirroring num_ctx / format above) keeps the region_sweep-off
+        # path byte-identical to today's prompt.
+        if region_sweep:
+            metadata[_METADATA_REGION_SWEEP_KEY] = True
 
         request = ReviewRequest(
             kind=kind,

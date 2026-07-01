@@ -220,6 +220,37 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
 )
 
 
+#: Region-sweep review mode (fr_khonliang-reviewer_8fb20f1f). Opt-in per-call
+#: instruction that curbs the review *cascade* (dog_25d57a12): when a diff
+#: introduces a NEW predicate / state field / guard / invariant, hot-tier
+#: reviewers tend to surface ONE affected call site per round, so an N-site
+#: region takes ~N review rounds (observed R2-R11 on a new liveness-state
+#: model). This instruction tells the reviewer to enumerate ALL sites that
+#: touch the new predicate in the SAME pass, so the cascade collapses toward
+#: ~2 rounds instead of ~N. It is a *prompt-level* sweep over the diff + any
+#: provided context — deliberately NOT static call-site / AST analysis (that
+#: is a much larger effort; this is the dogfoodable first cut). It is an
+#: EXPLICITLY PARTIAL fix: the review-LOOP driver side (feeding prior-round
+#: findings + resolutions into the next round, dog_8f702fdc) is separate and
+#: out of scope. Scoped to ``kind == "pr_diff"`` (same diff-only gate as the
+#: doc-routing block): the instruction is diff-shaped (paths/lines/hunks), so
+#: it fits code diffs but would push a plain-prose ``doc`` / ``pr_description``
+#: review toward hallucinated locations, and a whole-document planning artifact
+#: has no "new predicate across call sites" shape to sweep at all.
+_REGION_SWEEP_INSTRUCTION = (
+    "REGION-SWEEP MODE: if this change introduces a NEW predicate, state "
+    "field, guard, flag, or invariant, do not stop at the first place that "
+    "needs updating. Scan the ENTIRE diff and any provided context for EVERY "
+    "site that reads, writes, checks, or otherwise depends on that new "
+    "predicate/field/invariant, and report ALL of the affected sites together "
+    "in this single pass — one finding per site, each anchored to its own "
+    "path/line — rather than surfacing only one and leaving the rest for a "
+    "later round. If a site is correctly handled, do not flag it. Restrict "
+    "the sweep to what is visible in the diff and context; do not invent "
+    "call sites you cannot see."
+)
+
+
 #: Prepended for artifact reviews. The reviewer is reading a whole planning
 #: document, not a code change, so findings are holistic and anchor to a named
 #: SECTION (e.g. "§Acceptance Criteria"), not a line number.
@@ -334,6 +365,7 @@ def build_review_prompt(
     include_schema: bool = False,
     repo_prompts: "RepoPrompts | None" = None,
     example_format: str | None = None,
+    region_sweep: bool = False,
 ) -> str:
     """Assemble the review prompt text from a :class:`ReviewRequest`.
 
@@ -359,6 +391,14 @@ def build_review_prompt(
     ``example_format`` field (see :mod:`reviewer.config.repo`). When
     ``None`` or an unrecognized value, examples default to markdown
     fences — the tokenization-neutral framing that works everywhere.
+
+    ``region_sweep`` (fr_khonliang-reviewer_8fb20f1f) opt-in per-call:
+    when ``True`` and ``kind == "pr_diff"``, an anti-cascade instruction
+    is injected telling the reviewer to enumerate every site touching a
+    newly-introduced predicate/field/invariant in one pass rather than
+    one per round. Scoped to ``pr_diff`` because the instruction is
+    diff-shaped (paths/lines/hunks). Off (default) leaves the prompt
+    bytes byte-identical to the pre-FR shape.
     """
     lines: list[str] = []
 
@@ -412,6 +452,19 @@ def build_review_prompt(
         )
         if classification == "doc":
             lines += [_DOC_REVIEW_INSTRUCTION, ""]
+        # Region-sweep mode (fr_khonliang-reviewer_8fb20f1f): opt-in per-call
+        # anti-cascade instruction. Scoped to ``pr_diff`` — the instruction is
+        # inherently diff-shaped ("scan the ENTIRE diff", one finding per site
+        # "anchored to its path/line"), so it fits code diffs but would push a
+        # ``doc`` / ``pr_description`` review (plain prose, no hunks/paths/lines)
+        # toward hallucinated locations. Same diff-only gate as the doc-routing
+        # block above (codex round 2). Off by default, so the region_sweep=False
+        # prompt stays byte-identical to the pre-FR bytes. The instruction's own
+        # "if this change introduces a new predicate" conditional means a
+        # doc-heavy pr_diff still no-ops in practice, so no extra
+        # classification gate is needed here.
+        if region_sweep:
+            lines += [_REGION_SWEEP_INSTRUCTION, ""]
     elif request.kind in _ARTIFACT_KINDS:
         # Full-document framing + per-kind rubric. A repo override
         # (.reviewer/prompts/<kind>_rubric.md, surfaced via RepoPrompts)
