@@ -80,6 +80,14 @@ _CONTROL_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+#: The FP-bait fixtures the gate is expected to exercise. Declared explicitly (like
+#: the control set in _CONTROL_EXPECTATIONS) so packaging drift or a rename that
+#: DROPS a specific fixture is caught — a "≥1 of each kind" check would let the
+#: gate silently stop covering, e.g., the echo case while still reporting green.
+_EXPECTED_FP_FIXTURES: frozenset[str] = frozenset(
+    {"fp_docstring_prose", "fp_consolidate_literals"}
+)
+
 
 @dataclass(frozen=True)
 class FpCase:
@@ -130,15 +138,18 @@ def load_fp_cases() -> list[FpCase]:
             )
         )
     cases.sort(key=lambda c: (c.kind, c.name))
-    # A gate that exercises nothing must never report green (P2): a missing
-    # package-data payload or drifted prefixes would otherwise pass vacuously.
-    n_fp = sum(1 for c in cases if c.kind == "fp")
-    n_control = sum(1 for c in cases if c.kind == "control")
-    if n_fp == 0 or n_control == 0:
+    # A gate that silently loses coverage must never report green: validate the
+    # FULL expected fixture set by name (not just "≥1 of each kind"), so a missing
+    # package-data payload OR a drop/rename of any single recorded fixture raises
+    # rather than passing vacuously on the survivors.
+    loaded = {c.name for c in cases}
+    expected = _EXPECTED_FP_FIXTURES | set(_CONTROL_EXPECTATIONS)
+    missing = expected - loaded
+    if missing:
         raise RuntimeError(
-            f"fp_regression: expected >=1 fp and >=1 control fixture in "
-            f"{_FIXTURE_PACKAGE!r}, found fp={n_fp} control={n_control}. "
-            f"Bundled *.diff package-data missing or prefixes drifted."
+            f"fp_regression: expected fixtures missing from {_FIXTURE_PACKAGE!r}: "
+            f"{sorted(missing)} (loaded {sorted(loaded)}). Bundled *.diff "
+            f"package-data missing or a recorded fixture was dropped/renamed."
         )
     return cases
 

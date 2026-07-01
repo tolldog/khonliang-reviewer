@@ -73,11 +73,34 @@ def test_load_fp_cases_raises_on_empty_fixture_set(monkeypatch):
 
     from reviewer.tools import fp_regression as m
 
-    # Only the unrelated reference diff present → zero fp/control fixtures.
+    # Only the unrelated reference diff present → all expected fixtures missing.
     monkeypatch.setattr(
         m.resources, "files", lambda pkg: _FakeRoot([_FakeEntry("bus_lib_pr14.diff")])
     )
-    with pytest.raises(RuntimeError, match="found fp=0 control=0"):
+    with pytest.raises(RuntimeError, match="expected fixtures missing"):
+        m.load_fp_cases()
+
+
+def test_load_fp_cases_raises_when_one_expected_fixture_dropped(monkeypatch):
+    """P2 (round 2): dropping a SINGLE recorded fixture while others survive must
+    raise — a '>=1 of each kind' check would silently lose that regression's
+    coverage while still reporting green."""
+    import pytest
+
+    from reviewer.tools import fp_regression as m
+
+    # Present: the control + one FP fixture; MISSING: fp_docstring_prose.
+    monkeypatch.setattr(
+        m.resources,
+        "files",
+        lambda pkg: _FakeRoot(
+            [
+                _FakeEntry("fp_consolidate_literals.diff", "d"),
+                _FakeEntry("control_resource_leak.diff", "d"),
+            ]
+        ),
+    )
+    with pytest.raises(RuntimeError, match="fp_docstring_prose"):
         m.load_fp_cases()
 
 
