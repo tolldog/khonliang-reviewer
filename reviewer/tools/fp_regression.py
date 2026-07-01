@@ -85,7 +85,7 @@ _CONTROL_EXPECTATIONS: dict[str, tuple[str, ...]] = {
 #: DROPS a specific fixture is caught — a "≥1 of each kind" check would let the
 #: gate silently stop covering, e.g., the echo case while still reporting green.
 _EXPECTED_FP_FIXTURES: frozenset[str] = frozenset(
-    {"fp_docstring_prose", "fp_consolidate_literals"}
+    {"fp_docstring_prose", "fp_consolidate_literals", "fp_applied_guard"}
 )
 
 

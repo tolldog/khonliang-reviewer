@@ -38,6 +38,10 @@ def test_load_fp_cases_picks_up_bundled_fixtures():
     # Both FP fixtures and the control ship in benchmark_data.
     assert by_name["fp_docstring_prose"].kind == "fp"
     assert by_name["fp_consolidate_literals"].kind == "fp"
+    # fr_reviewer_8d261d32: the imagined-pre-state (applied-guard) FP fixture.
+    assert by_name["fp_applied_guard"].kind == "fp"
+    assert "registry.installed" in by_name["fp_applied_guard"].diff
+    assert by_name["fp_applied_guard"].expect_keywords == ()
     assert by_name["control_resource_leak"].kind == "control"
     # The unrelated benchmark reference diff is NOT picked up.
     assert "bus_lib_pr14" not in by_name
@@ -270,6 +274,7 @@ async def test_run_with_fake_provider_end_to_end():
     # FP fixtures: fake returns only nits → zero concerns → pass.
     assert by["fp_docstring_prose"].concern_total == 0
     assert by["fp_consolidate_literals"].concern_total == 0
+    assert by["fp_applied_guard"].concern_total == 0
     # Control: fake names the leak every run → seeded defect retained.
     assert by["control_resource_leak"].finding_runs == 2
     assert by["control_resource_leak"].defect_hit_runs == 2

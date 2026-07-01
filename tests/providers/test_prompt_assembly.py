@@ -399,6 +399,28 @@ def test_review_discipline_instruction_present_for_code_diff():
     assert "Do NOT raise subjective naming, style" in prompt
 
 
+def test_applied_guard_clause_present_for_code_diff():
+    """Clause 4 (fr_reviewer_8d261d32): the 'evaluate AS APPLIED' calibration
+    curbs the imagined-pre-state FP (an added guard flagged as the missing
+    requirement / the bug — dog_0a178955). It rides on the same rubric-less
+    hot-tier discipline path as clauses 1-3, so it fires on a code diff."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "Evaluate the diff AS APPLIED" in prompt
+    assert "IS the fix" in prompt
+    assert "not an imagined version without the change" in prompt
+
+
+def test_applied_guard_clause_absent_for_artifact_kinds():
+    """Clause 4 is scoped exactly like the rest of _REVIEW_DISCIPLINE_INSTRUCTION
+    — excluded from artifact reviews (fr/spec/milestone), which carry their own
+    framing + rubric."""
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n")
+        )
+        assert "Evaluate the diff AS APPLIED" not in prompt, artifact_kind
+
+
 def test_review_discipline_absent_for_artifact_kinds():
     """Scoping regression guard (codex round 3): the code-change-framed
     discipline must NOT apply to artifact reviews (fr/spec/milestone) — those
