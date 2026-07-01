@@ -134,6 +134,40 @@ def _make_request(**overrides: Any) -> ReviewRequest:
     return ReviewRequest(**base)
 
 
+async def test_binary_questions_json_schema_carries_verdicts_for_pr_diff(monkeypatch):
+    """binary_questions on a pr_diff review passes a verdicts-carrying schema
+    via --json-schema (fr_khonliang-reviewer_a585ea3d)."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    request = _make_request(metadata={"_khonliang_binary_questions": True})
+    await ClaudeCliProvider().review(request)
+
+    argv = calls[0]
+    schema_arg = json.loads(argv[argv.index("--json-schema") + 1])
+    assert "verdicts" in schema_arg["properties"]
+    assert schema_arg["required"] == ["summary", "verdicts"]
+
+
+async def test_binary_questions_json_schema_gated_off_for_non_pr_diff(monkeypatch):
+    """Schema gate mirrors the instruction gate: binary_questions on a non-pr_diff
+    kind passes the holistic (no-verdicts) schema. codex PR B review P2."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+
+    request = _make_request(
+        kind="spec",
+        content="# Spec\n\nbody",
+        metadata={"_khonliang_binary_questions": True},
+    )
+    await ClaudeCliProvider().review(request)
+
+    argv = calls[0]
+    schema_arg = json.loads(argv[argv.index("--json-schema") + 1])
+    assert "verdicts" not in schema_arg["properties"]
+    assert schema_arg["required"] == ["summary"]
+
+
 async def test_success_envelope_produces_posted_review(monkeypatch):
     proc = _FakeProc(stdout=json.dumps(SUCCESS_ENVELOPE).encode())
     calls = _install_fake_proc(monkeypatch, proc)

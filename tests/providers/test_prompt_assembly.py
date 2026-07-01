@@ -709,5 +709,22 @@ def test_review_response_schema_binary_has_verdicts_without_mutating_constant():
     item = binary["properties"]["verdicts"]["items"]
     assert item["required"] == ["dimension", "question", "answer", "explanation"]
     assert item["properties"]["answer"]["type"] == "boolean"
+    # verdicts is REQUIRED in the binary variant so an enforced backend can't
+    # silently degrade to the holistic shape (codex PR B review P2).
+    assert binary["required"] == ["summary", "verdicts"]
     # The holistic constant must be untouched by building the variant.
     assert "verdicts" not in REVIEW_RESPONSE_SCHEMA["properties"]
+    assert REVIEW_RESPONSE_SCHEMA["required"] == ["summary"]
+
+
+def test_binary_questions_schema_not_emitted_inline_for_non_pr_diff_kind():
+    """Schema gate mirrors the instruction gate: binary_questions=True on a
+    non-pr_diff kind must NOT emit a verdicts schema (the kind never sees the
+    binary-questions instructions). codex PR B review P2."""
+    for kind in ("fr", "spec", "milestone", "doc", "pr_description"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=kind, content="# doc\n"),
+            include_schema=True,
+            binary_questions=True,
+        )
+        assert '"verdicts"' not in prompt, kind

@@ -239,7 +239,12 @@ class CodexCliProvider(ReviewProvider):
         # produces. Categorized as ``backend_error`` — the codex
         # binary isn't the problem; the local environment is.
         try:
-            schema_path = self._get_schema_path(binary_questions)
+            # Gate the verdicts schema to pr_diff — same gate as the
+            # binary-questions instruction in build_review_prompt (codex PR B
+            # review P2). The bool-keyed schema-file cache still holds.
+            schema_path = self._get_schema_path(
+                binary_questions and request.kind == "pr_diff"
+            )
         except OSError as exc:
             return _errored(
                 request,

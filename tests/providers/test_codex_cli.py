@@ -163,6 +163,58 @@ async def test_success_payload_produces_posted_review(monkeypatch):
     assert b"diff --git" in proc.stdin_received
 
 
+async def test_binary_questions_materializes_verdicts_schema_for_pr_diff(monkeypatch):
+    """binary_questions on a pr_diff review materializes the verdicts-carrying
+    output-schema and passes it via --output-schema."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    provider = CodexCliProvider()
+
+    request = _make_request(metadata={"_khonliang_binary_questions": True})
+    try:
+        await provider.review(request)
+        argv = calls[0]
+        schema_path = argv[argv.index("--output-schema") + 1]
+        with open(schema_path) as f:
+            emitted = json.load(f)
+        assert "verdicts" in emitted["properties"]
+        assert emitted["required"] == ["summary", "verdicts"]
+    finally:
+        for p in provider._schema_paths.values():
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+async def test_binary_questions_schema_gated_off_for_non_pr_diff(monkeypatch):
+    """Schema gate mirrors the instruction gate: binary_questions on a non-pr_diff
+    kind materializes the holistic (no-verdicts) schema. codex PR B review P2."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    provider = CodexCliProvider()
+
+    request = _make_request(
+        kind="spec",
+        content="# Spec\n\nbody",
+        metadata={"_khonliang_binary_questions": True},
+    )
+    try:
+        await provider.review(request)
+        argv = calls[0]
+        schema_path = argv[argv.index("--output-schema") + 1]
+        with open(schema_path) as f:
+            emitted = json.load(f)
+        assert "verdicts" not in emitted["properties"]
+        assert emitted["required"] == ["summary"]
+    finally:
+        for p in provider._schema_paths.values():
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
 async def test_request_model_overrides_default(monkeypatch):
     proc = _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
     calls = _install_fake_proc(monkeypatch, proc)

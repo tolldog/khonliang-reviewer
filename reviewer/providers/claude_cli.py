@@ -188,7 +188,15 @@ class ClaudeCliProvider(ReviewProvider):
             "-p",
             "--output-format=json",
             "--json-schema",
-            json.dumps(review_response_schema(binary_questions)),
+            # Gate the verdicts schema to pr_diff — same gate as the
+            # binary-questions instruction in build_review_prompt (codex PR B
+            # review P2), so a non-diff kind never gets a verdicts schema it
+            # was never instructed for.
+            json.dumps(
+                review_response_schema(
+                    binary_questions and request.kind == "pr_diff"
+                )
+            ),
             "--permission-mode",
             "dontAsk",
         ]

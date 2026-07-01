@@ -183,6 +183,14 @@ def review_response_schema(binary_questions: bool) -> dict[str, Any]:
         "type": "array",
         "items": copy.deepcopy(_VERDICT_ITEM_SCHEMA),
     }
+    # ``verdicts`` is REQUIRED in the binary variant: the whole point of the
+    # mode is the per-dimension verdicts, so a schema-enforced backend
+    # (claude_cli / codex_cli) must reject a holistic-shaped response rather
+    # than let binary mode silently degrade to ``verdicts == []`` (codex PR B
+    # review, P2). ``summary`` stays required as before; the holistic constant
+    # keeps its ``["summary"]`` required list untouched. (The item-level
+    # ``required`` in ``_VERDICT_ITEM_SCHEMA`` already binds each entry.)
+    schema["required"] = ["summary", "verdicts"]
     return schema
 
 
@@ -689,12 +697,18 @@ def build_review_prompt(
     )
 
     if include_schema:
+        # Gate the verdicts-carrying schema variant to ``pr_diff`` — the SAME
+        # gate the binary-questions *instruction* uses above (codex PR B review
+        # P2). Emitting a verdicts schema for a non-diff kind (fr/spec/doc/…)
+        # that never sees the binary-questions instructions would ask the model
+        # for verdicts it was never told to produce.
+        emit_verdicts = binary_questions and request.kind == "pr_diff"
         lines += [
             "## Response Schema",
             "",
             "```json",
             json.dumps(
-                review_response_schema(binary_questions),
+                review_response_schema(emit_verdicts),
                 indent=2,
                 sort_keys=True,
             ),
