@@ -9,8 +9,9 @@ things at once:
   the dogfood false-positive shapes — an echo-bait docstring addition
   (``dog_9902f2f9``) and a clean literal-duplication consolidation
   (``dog_3891542a`` "Code Repetition" bait). A well-calibrated reviewer emits
-  **zero** ``concern``-severity findings on these; the check fails if concern-count
-  exceeds ``--max-fp-concerns``.
+  **zero** ``concern``-severity findings on these; the check fails when the
+  fraction of runs emitting a concern exceeds ``--max-fp-concern-rate`` (rate-based,
+  so the verdict doesn't depend on ``--runs``).
 - **Control fixtures** (``control_*.diff``) carry a genuine introduced defect (a
   removed ``with`` → file-handle leak). The reviewer must **still** flag them — the
   check fails if the control hit-rate drops below ``--min-control-hit-rate``. This
@@ -49,21 +50,33 @@ _FIXTURE_PACKAGE = "reviewer.tools.benchmark_data"
 _FP_PREFIX = "fp_"
 _CONTROL_PREFIX = "control_"
 
-#: Case-insensitive keywords that identify a control fixture's SEEDED defect in a
+#: Case-insensitive *phrases* that identify a control fixture's SEEDED defect in a
 #: finding's title/body. A control run only counts as "retained" when it flags
 #: *this* defect — not any unrelated nit — so the gate actually catches the
 #: regression it exists for (a calibration that silences the real defect but still
-#: emits chatter). Every ``control_*.diff`` MUST have an entry here; a control
+#: emits chatter). Phrases are deliberately multi-word/specific, NOT broad single
+#: tokens: bare ``close``/``resource`` would substring-match unrelated notes ("names
+#: too close together", "resource usage could be improved") and false-green the
+#: gate. These phrases all appear verbatim in measured qwen leak findings ("File Not
+#: Closed", "resource leaks", "Resource Management Issue", "close the file",
+#: "context manager"). Every ``control_*.diff`` MUST have an entry; a control
 #: fixture with no expectation is a configuration error (see :func:`load_fp_cases`).
 _CONTROL_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "control_resource_leak": (
-        "leak",
-        "close",  # "never closed" / "not closed" / "should close"
-        "unclosed",
-        "resource",
+        "not closed",
+        "never closed",
+        "isn't closed",
+        "close the file",
+        "closing the file",
+        "without closing",
+        "resource leak",
+        "resource management",
+        "file descriptor",
+        "file handle leak",
         "context manager",
         "with statement",
         "with-statement",
+        "unclosed",
     ),
 }
 
@@ -183,33 +196,45 @@ def classify_run(report: CaseReport, result: ReviewResult) -> None:
 def evaluate(
     reports: Iterable[CaseReport],
     *,
-    max_fp_concerns: int,
+    max_fp_concern_rate: float,
     min_control_hit_rate: float,
 ) -> tuple[bool, list[str]]:
     """Turn per-fixture reports into a pass/fail verdict + human lines (pure).
 
-    - An ``fp`` fixture FAILS when its total concern count exceeds
-      ``max_fp_concerns`` — the false-positive shape leaked through.
-    - A ``control`` fixture FAILS when the fraction of runs that flagged
-      *anything* falls below ``min_control_hit_rate`` — a real defect was
-      silenced. Errored runs are excluded from the denominator so a flaky
-      timeout doesn't count as a miss (but an all-errored fixture fails).
+    Both verdicts are **rate-based** over the non-errored runs, so the outcome
+    reflects the underlying regression rate rather than the sample size
+    (``--runs``): the same behaviour passes/fails identically at N=5 and N=10.
+
+    - An ``fp`` fixture FAILS when the fraction of runs that produced any
+      ``concern`` finding exceeds ``max_fp_concern_rate`` (default 0.0 = zero
+      tolerance, matching the "zero echo/invert concerns" acceptance).
+    - A ``control`` fixture FAILS when the fraction of runs that flagged the
+      *seeded defect* falls below ``min_control_hit_rate`` — a real defect was
+      silenced.
+
+    Errored runs are excluded from both denominators so a flaky timeout isn't a
+    false FP or a false miss; a fixture whose every run errored fails (nothing
+    was actually measured).
     """
     ok = True
     lines: list[str] = []
     for r in reports:
+        scored = r.runs - r.errored_runs
         if r.kind == "fp":
-            passed = r.concern_total <= max_fp_concerns
-            detail = f"concerns={r.concern_total} (limit {max_fp_concerns})"
+            rate = (r.concern_runs / scored) if scored else 1.0
+            passed = scored > 0 and rate <= max_fp_concern_rate
+            detail = (
+                f"concern runs {r.concern_runs}/{scored} "
+                f"(rate {rate:.2f}, max {max_fp_concern_rate:.2f})"
+            )
             if r.concern_titles:
                 detail += f" :: {', '.join(sorted(set(r.concern_titles)))}"
         else:  # control
-            scored = r.runs - r.errored_runs
-            hit_rate = (r.defect_hit_runs / scored) if scored else 0.0
-            passed = scored > 0 and hit_rate >= min_control_hit_rate
+            rate = (r.defect_hit_runs / scored) if scored else 0.0
+            passed = scored > 0 and rate >= min_control_hit_rate
             detail = (
                 f"seeded defect flagged {r.defect_hit_runs}/{scored} runs "
-                f"(rate {hit_rate:.2f}, min {min_control_hit_rate:.2f})"
+                f"(rate {rate:.2f}, min {min_control_hit_rate:.2f})"
             )
         if r.errored_runs:
             detail += f" [errored {r.errored_runs}/{r.runs}]"
@@ -281,10 +306,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default="ollama")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument(
-        "--max-fp-concerns",
-        type=int,
-        default=0,
-        help="max total concern findings allowed per FP fixture (default 0)",
+        "--max-fp-concern-rate",
+        type=float,
+        default=0.0,
+        help="max fraction of runs allowed to emit a concern per FP fixture "
+        "(default 0.0 = zero tolerance; rate-based so it's --runs-independent)",
     )
     p.add_argument(
         "--min-control-hit-rate",
@@ -308,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ok, lines = evaluate(
         reports,
-        max_fp_concerns=args.max_fp_concerns,
+        max_fp_concern_rate=args.max_fp_concern_rate,
         min_control_hit_rate=args.min_control_hit_rate,
     )
     print(f"# FP-regression: {args.backend}/{args.model}, N={args.runs}")

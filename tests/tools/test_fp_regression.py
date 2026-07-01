@@ -137,27 +137,35 @@ def test_classify_run_errored_counts_as_errored_not_finding():
 # -- evaluate: FP fixtures ---------------------------------------------
 
 
-def test_evaluate_fp_passes_at_zero_concerns():
-    r = CaseReport(name="fp1", kind="fp", runs=5, finding_runs=3)
-    ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+def test_evaluate_fp_passes_at_zero_concern_runs():
+    r = CaseReport(name="fp1", kind="fp", runs=5, finding_runs=3, concern_runs=0)
+    ok, lines = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert ok
     assert "PASS" in lines[0]
 
 
-def test_evaluate_fp_fails_when_concerns_exceed_limit():
+def test_evaluate_fp_fails_when_concern_rate_exceeds_limit():
     r = CaseReport(name="fp1", kind="fp", runs=5, concern_runs=2, concern_total=3,
-                   concern_titles=["Code Repetition", "Code Repetition"])
-    ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+                   concern_titles=["Code Repetition"])
+    ok, lines = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert not ok
     assert "FAIL" in lines[0]
-    # Offending titles surface for triage.
-    assert "Code Repetition" in lines[0]
+    assert "Code Repetition" in lines[0]  # offending title surfaces
 
 
-def test_evaluate_fp_respects_nonzero_tolerance():
-    r = CaseReport(name="fp1", kind="fp", runs=5, concern_total=1)
-    assert evaluate([r], max_fp_concerns=1, min_control_hit_rate=0.6)[0]
-    assert not evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)[0]
+def test_evaluate_fp_verdict_is_runs_independent():
+    """P2: the same concern RATE passes/fails the same way regardless of --runs.
+    20% concern rate under a 0.25 tolerance passes at both N=5 and N=10."""
+    r5 = CaseReport(name="fp", kind="fp", runs=5, concern_runs=1)   # 0.20
+    r10 = CaseReport(name="fp", kind="fp", runs=10, concern_runs=2)  # 0.20
+    for r in (r5, r10):
+        assert evaluate([r], max_fp_concern_rate=0.25, min_control_hit_rate=0.6)[0]
+        assert not evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)[0]
+
+
+def test_evaluate_fp_all_errored_fails():
+    r = CaseReport(name="fp", kind="fp", runs=5, errored_runs=5)
+    assert not evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)[0]
 
 
 # -- evaluate: control fixtures ----------------------------------------
@@ -165,7 +173,7 @@ def test_evaluate_fp_respects_nonzero_tolerance():
 
 def test_evaluate_control_passes_when_defect_retained():
     r = CaseReport(name="c1", kind="control", runs=5, finding_runs=5, defect_hit_runs=5)
-    ok, _ = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+    ok, _ = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert ok
 
 
@@ -173,7 +181,7 @@ def test_evaluate_control_fails_when_defect_silenced_despite_chatter():
     # P1: model emits findings every run (chatter) but only 1/5 name the real
     # defect → the gate must FAIL on defect_hit_runs, not finding_runs.
     r = CaseReport(name="c1", kind="control", runs=5, finding_runs=5, defect_hit_runs=1)
-    ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+    ok, lines = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert not ok
     assert "FAIL" in lines[0]
 
@@ -181,15 +189,43 @@ def test_evaluate_control_fails_when_defect_silenced_despite_chatter():
 def test_evaluate_control_excludes_errored_runs_from_denominator():
     # 2 defect-hits / 2 scored (3 errored) → rate 1.0, passes; errors annotated.
     r = CaseReport(name="c1", kind="control", runs=5, defect_hit_runs=2, errored_runs=3)
-    ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+    ok, lines = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert ok
     assert "errored 3/5" in lines[0]
 
 
 def test_evaluate_control_all_errored_fails():
     r = CaseReport(name="c1", kind="control", runs=5, errored_runs=5)
-    ok, _ = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
+    ok, _ = evaluate([r], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert not ok
+
+
+def test_control_keywords_reject_unrelated_wording():
+    """P1 (substring safety): the real leak phrases must match genuine leak
+    findings (measured qwen phrasings) but NOT unrelated notes that merely share
+    a broad word ("too close together", "resource usage could be improved")."""
+    from reviewer.tools.fp_regression import (
+        _CONTROL_EXPECTATIONS,
+        _finding_hits_defect,
+    )
+
+    kw = _CONTROL_EXPECTATIONS["control_resource_leak"]
+
+    def hit(title, body=""):
+        return _finding_hits_defect(_f2(title, body), kw)
+
+    # Genuine leak findings (verbatim-ish from measured qwen runs) → match.
+    assert hit("File Not Closed", "not closed after reading; resource leaks")
+    assert hit("Resource Management Issue", "the file is opened but not closed")
+    assert hit("Best Practices", "use a context manager")
+    # Unrelated wording that shares only a broad token → must NOT match.
+    assert not hit("Naming", "these names are too close together")
+    assert not hit("Perf", "resource usage could be improved")
+    assert not hit("Style", "prefer snake_case")
+
+
+def _f2(title, body):
+    return ReviewFinding(severity="comment", title=title, body=body)  # type: ignore[arg-type]
 
 
 # -- run() with an injected fake provider (no live model) --------------
@@ -214,5 +250,5 @@ async def test_run_with_fake_provider_end_to_end():
     # Control: fake names the leak every run → seeded defect retained.
     assert by["control_resource_leak"].finding_runs == 2
     assert by["control_resource_leak"].defect_hit_runs == 2
-    ok, _ = evaluate(reports, max_fp_concerns=0, min_control_hit_rate=0.6)
+    ok, _ = evaluate(reports, max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
     assert ok
