@@ -58,6 +58,11 @@ default_models:
 providers:
   ollama:
     base_url: http://localhost:11434/v1
+    # Retry once when the FIRST /api/chat call times out (cold-start model
+    # load blowing the timeout, then a warm retry succeeds — dog_833295f0 /
+    # fr_khonliang-reviewer_26734e09). Defaults to true; set false to fail
+    # fast on the first timeout.
+    # retry_on_timeout: true
   claude_cli:
     # `claude` binary must be on PATH and `CLAUDE_CODE_OAUTH_TOKEN` must be
     # provisioned per-machine via `claude setup-token`. See CLAUDE.md.

@@ -3486,6 +3486,15 @@ class ReviewerAgent(BaseAgent):
             if isinstance(ollama_api_key_raw, str) and ollama_api_key_raw.strip()
             else None
         )
+        # Cold-start timeout retry (fr_khonliang-reviewer_26734e09): on by
+        # default; only accept an explicit bool from config so a malformed
+        # value keeps the dataclass default (retry enabled) rather than
+        # silently disabling the resilience. Pass through only when set so
+        # the default lives in one place (the dataclass).
+        ollama_retry_raw = ollama_cfg.get("retry_on_timeout")
+        ollama_retry_on_timeout = (
+            ollama_retry_raw if isinstance(ollama_retry_raw, bool) else None
+        )
         registry.register(
             OllamaProvider(
                 OllamaProviderConfig(
@@ -3496,6 +3505,11 @@ class ReviewerAgent(BaseAgent):
                     default_model=ollama_default,
                     num_ctx=ollama_num_ctx,
                     format=ollama_format,
+                    **(
+                        {"retry_on_timeout": ollama_retry_on_timeout}
+                        if ollama_retry_on_timeout is not None
+                        else {}
+                    ),
                     **({"api_key": ollama_api_key} if ollama_api_key else {}),
                 )
             ),
