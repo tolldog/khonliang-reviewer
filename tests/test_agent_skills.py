@@ -4798,6 +4798,45 @@ async def test_evaluator_hot_drops_findings_evaluator_marks_false_positive():
     assert len(fake.requests) == 2
 
 
+async def test_evaluator_hot_preserves_binary_verdicts():
+    """evaluator_hot filters *findings*, not verdicts — the reviewed result's
+    per-dimension verdicts must survive into the final response
+    (fr_khonliang-reviewer_a585ea3d, codex PR B review P2). Single-result path,
+    so the source is unambiguous."""
+    from khonliang_reviewer import Verdict
+
+    keep = _consensus_finding(title="real concern", line=10)
+    reviewed = _consensus_result([keep])
+    reviewed.verdicts = [
+        Verdict(
+            dimension="correctness",
+            question="Is it correct?",
+            answer=True,
+            explanation="yes",
+        )
+    ]
+    fake = _ScriptedProvider(
+        "ollama",
+        [reviewed, _evaluator_result([keep])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert "verdicts" in out
+    assert len(out["verdicts"]) == 1
+    assert out["verdicts"][0]["dimension"] == "correctness"
+    assert out["verdicts"][0]["answer"] is True
+
+
 async def test_evaluator_hot_threads_findings_into_evaluator_instructions():
     """The evaluator request carries the candidate findings inside
     ``instructions`` (JSON-dumped) so the evaluator can reason about

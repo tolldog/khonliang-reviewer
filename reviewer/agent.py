@@ -1521,7 +1521,10 @@ class ReviewerAgent(BaseAgent):
                     # and overall score is derivable (BinEval, arxiv:2606.27226).
                     # Only affects kind="pr_diff" (the questions evaluate a
                     # diff); one structured model call, not N. Unknown value =>
-                    # structured error.
+                    # structured error. Single-pass review only: evaluator_hot
+                    # preserves verdicts, but consensus_runs>1 (cross-run
+                    # verdict reconciliation) and review_pr forwarding are a
+                    # follow-up (PR C — cross-model disagreement capture).
                     "scoring_mode": {"type": "string", "default": "holistic"},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
@@ -2467,6 +2470,14 @@ class ReviewerAgent(BaseAgent):
             # dropped.)
             summary=eval_result.summary or consensus_result.summary,
             findings=survivors,
+            # Preserve the reviewed result's per-dimension verdicts
+            # (fr_khonliang-reviewer_a585ea3d, codex PR B review P2). The
+            # evaluator filters *findings*, not verdicts — the verdicts
+            # describe the diff as reviewed, so they carry through unchanged.
+            # This is a single-result path (one ReviewResult in, one out), so
+            # the source is unambiguous; the consensus (N-in) path is a
+            # separate follow-up (see PR C — cross-run verdict reconciliation).
+            verdicts=consensus_result.verdicts,
             disposition=consensus_result.disposition,
             error="",
             error_category="",
