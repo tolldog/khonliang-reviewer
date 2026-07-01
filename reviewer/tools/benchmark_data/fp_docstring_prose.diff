@@ -1,0 +1,14 @@
+diff --git a/parser.py b/parser.py
+index 1111111..2222222 100644
+--- a/parser.py
++++ b/parser.py
+@@ -3,6 +3,11 @@
+ def parse_header(line):
++    """Parse a unified-diff file header.
++
++    Returns the path portion of a ``+++ b/<path>`` header, or None when
++    the line is not a header. Trailing whitespace is stripped.
++    """
+     if not line.startswith("+++ "):
+         return None
+     return line[4:].strip()
