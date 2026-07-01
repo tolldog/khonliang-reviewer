@@ -44,6 +44,59 @@ def test_load_fp_cases_picks_up_bundled_fixtures():
     # Diff bodies are real.
     assert "parse_header" in by_name["fp_docstring_prose"].diff
     assert "open(path)" in by_name["control_resource_leak"].diff
+    # The control fixture carries seeded-defect keywords (P1 wiring); FP has none.
+    assert by_name["control_resource_leak"].expect_keywords  # non-empty
+    assert by_name["fp_docstring_prose"].expect_keywords == ()
+
+
+class _FakeEntry:
+    def __init__(self, name, text=""):
+        self.name = name
+        self._text = text
+
+    def read_text(self, encoding="utf-8"):
+        return self._text
+
+
+class _FakeRoot:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def iterdir(self):
+        return iter(self._entries)
+
+
+def test_load_fp_cases_raises_on_empty_fixture_set(monkeypatch):
+    """P2: a missing package-data payload / drifted prefixes must NOT pass
+    vacuously — the loader raises rather than returning an empty (green) set."""
+    import pytest
+
+    from reviewer.tools import fp_regression as m
+
+    # Only the unrelated reference diff present → zero fp/control fixtures.
+    monkeypatch.setattr(
+        m.resources, "files", lambda pkg: _FakeRoot([_FakeEntry("bus_lib_pr14.diff")])
+    )
+    with pytest.raises(RuntimeError, match="found fp=0 control=0"):
+        m.load_fp_cases()
+
+
+def test_load_fp_cases_raises_on_control_without_expectation(monkeypatch):
+    """A control fixture with no _CONTROL_EXPECTATIONS entry is refused — else its
+    retention check would pass on any finding (the P1 hole)."""
+    import pytest
+
+    from reviewer.tools import fp_regression as m
+
+    monkeypatch.setattr(
+        m.resources,
+        "files",
+        lambda pkg: _FakeRoot(
+            [_FakeEntry("fp_x.diff", "d"), _FakeEntry("control_unknown.diff", "d")]
+        ),
+    )
+    with pytest.raises(RuntimeError, match="no _CONTROL_EXPECTATIONS"):
+        m.load_fp_cases()
 
 
 # -- classify_run ------------------------------------------------------
@@ -61,12 +114,24 @@ def test_classify_run_counts_concerns_and_findings():
     assert r.errored_runs == 0
 
 
+def test_classify_run_control_hit_requires_seeded_defect():
+    """P1 regression: a control run only counts as retained when a finding names
+    the SEEDED defect — an unrelated nit must NOT count."""
+    r = CaseReport(name="c", kind="control", runs=2, expect_keywords=("leak", "close"))
+    # Run 1: flags the leak → defect hit.
+    classify_run(r, _result([_f("concern", "Resource leak: file never closed")]))
+    # Run 2: emits an unrelated nit, MISSES the leak → finding but no defect hit.
+    classify_run(r, _result([_f("nit", "Prefer snake_case")]))
+    assert r.finding_runs == 2
+    assert r.defect_hit_runs == 1  # only the run that named the defect
+
+
 def test_classify_run_errored_counts_as_errored_not_finding():
-    r = CaseReport(name="x", kind="control", runs=1)
+    r = CaseReport(name="x", kind="control", runs=1, expect_keywords=("leak",))
     classify_run(r, _result([], disposition="errored", error="timeout"))
     assert r.errored_runs == 1
     assert r.finding_runs == 0
-    assert r.concern_total == 0
+    assert r.defect_hit_runs == 0
 
 
 # -- evaluate: FP fixtures ---------------------------------------------
@@ -99,22 +164,23 @@ def test_evaluate_fp_respects_nonzero_tolerance():
 
 
 def test_evaluate_control_passes_when_defect_retained():
-    r = CaseReport(name="c1", kind="control", runs=5, finding_runs=5)
+    r = CaseReport(name="c1", kind="control", runs=5, finding_runs=5, defect_hit_runs=5)
     ok, _ = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
     assert ok
 
 
-def test_evaluate_control_fails_when_defect_silenced():
-    # Calibration that gags the model: 1/5 runs flag the real defect.
-    r = CaseReport(name="c1", kind="control", runs=5, finding_runs=1)
+def test_evaluate_control_fails_when_defect_silenced_despite_chatter():
+    # P1: model emits findings every run (chatter) but only 1/5 name the real
+    # defect → the gate must FAIL on defect_hit_runs, not finding_runs.
+    r = CaseReport(name="c1", kind="control", runs=5, finding_runs=5, defect_hit_runs=1)
     ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
     assert not ok
     assert "FAIL" in lines[0]
 
 
 def test_evaluate_control_excludes_errored_runs_from_denominator():
-    # 2 flagged / 2 scored (3 errored) → rate 1.0, passes; errors are annotated.
-    r = CaseReport(name="c1", kind="control", runs=5, finding_runs=2, errored_runs=3)
+    # 2 defect-hits / 2 scored (3 errored) → rate 1.0, passes; errors annotated.
+    r = CaseReport(name="c1", kind="control", runs=5, defect_hit_runs=2, errored_runs=3)
     ok, lines = evaluate([r], max_fp_concerns=0, min_control_hit_rate=0.6)
     assert ok
     assert "errored 3/5" in lines[0]
@@ -145,7 +211,8 @@ async def test_run_with_fake_provider_end_to_end():
     # FP fixtures: fake returns only nits → zero concerns → pass.
     assert by["fp_docstring_prose"].concern_total == 0
     assert by["fp_consolidate_literals"].concern_total == 0
-    # Control: fake flags it every run → retained.
+    # Control: fake names the leak every run → seeded defect retained.
     assert by["control_resource_leak"].finding_runs == 2
+    assert by["control_resource_leak"].defect_hit_runs == 2
     ok, _ = evaluate(reports, max_fp_concerns=0, min_control_hit_rate=0.6)
     assert ok
