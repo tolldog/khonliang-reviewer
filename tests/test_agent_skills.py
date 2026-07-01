@@ -4878,6 +4878,33 @@ async def test_binary_questions_with_consensus_rejected():
     assert "error" not in ok or not ok["error"]
 
 
+async def test_binary_questions_consensus_allowed_for_non_diff_kinds():
+    """codex PR B R4 P2: binary_questions is a no-op for kind != pr_diff (no
+    prompt section, no verdicts schema), so the consensus rejection must not
+    fire there — a caller that sets scoring_mode globally keeps consensus
+    working on doc reviews."""
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _consensus_result([f]), _consensus_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "doc",
+            "content": "some prose",
+            "scoring_mode": "binary_questions",
+            "consensus_runs": 3,
+            "consensus_min": 1,
+        },
+    )
+
+    assert not out.get("error")
+    assert len(fake.requests) == 3  # consensus actually ran
+
+
 async def test_evaluator_hot_threads_findings_into_evaluator_instructions():
     """The evaluator request carries the candidate findings inside
     ``instructions`` (JSON-dumped) so the evaluator can reason about

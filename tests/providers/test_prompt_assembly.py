@@ -712,9 +712,22 @@ def test_review_response_schema_binary_has_verdicts_without_mutating_constant():
     # verdicts is REQUIRED in the binary variant so an enforced backend can't
     # silently degrade to the holistic shape (codex PR B review P2).
     assert binary["required"] == ["summary", "verdicts"]
-    # The holistic constant must be untouched by building the variant.
+    # Constrained to the fixed dimension set with one item per dimension
+    # (codex PR B R4 P2): empty / underfilled / invented-dimension arrays are
+    # rejected by schema-enforced backends instead of skewing score_verdicts.
+    from reviewer.providers._prompt import BINARY_QUESTION_DIMENSIONS
+
+    expected_dims = [d for d, _ in BINARY_QUESTION_DIMENSIONS]
+    assert item["properties"]["dimension"]["enum"] == expected_dims
+    assert binary["properties"]["verdicts"]["minItems"] == len(expected_dims)
+    assert binary["properties"]["verdicts"]["maxItems"] == len(expected_dims)
+    # The holistic constant must be untouched by building the variant —
+    # including the item fragment the variant deep-copies before mutating.
     assert "verdicts" not in REVIEW_RESPONSE_SCHEMA["properties"]
     assert REVIEW_RESPONSE_SCHEMA["required"] == ["summary"]
+    from reviewer.providers._prompt import _VERDICT_ITEM_SCHEMA
+
+    assert "enum" not in _VERDICT_ITEM_SCHEMA["properties"]["dimension"]
 
 
 def test_binary_questions_schema_not_emitted_inline_for_non_pr_diff_kind():

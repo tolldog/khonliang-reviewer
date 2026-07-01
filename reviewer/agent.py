@@ -2081,8 +2081,12 @@ class ReviewerAgent(BaseAgent):
         # findings and would silently DROP every run's verdicts — the caller
         # asked for a scoring mode the response then doesn't carry. Reject the
         # combination with a structured error instead of a documented silent
-        # drop (codex PR B R3 P1; no-silent-caps principle).
-        if binary_questions and consensus_runs > 1:
+        # drop (codex PR B R3 P1; no-silent-caps principle). Gated to
+        # kind="pr_diff" — the only kind that emits verdicts (the prompt
+        # section and schema variant are pr_diff-scoped), so a caller that
+        # sets scoring_mode globally keeps consensus working on doc / fr /
+        # spec reviews, where binary mode is a no-op (codex PR B R4 P2).
+        if binary_questions and consensus_runs > 1 and kind == "pr_diff":
             return {
                 "error": (
                     "scoring_mode='binary_questions' with consensus_runs>1 is "

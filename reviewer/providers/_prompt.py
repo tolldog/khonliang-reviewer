@@ -179,9 +179,22 @@ def review_response_schema(binary_questions: bool) -> dict[str, Any]:
     if not binary_questions:
         return REVIEW_RESPONSE_SCHEMA
     schema = copy.deepcopy(REVIEW_RESPONSE_SCHEMA)
+    verdict_item = copy.deepcopy(_VERDICT_ITEM_SCHEMA)
+    # Pin ``dimension`` to the fixed set and require one verdict per dimension
+    # via item count: on schema-enforced backends (claude_cli / codex_cli) an
+    # empty, underfilled, or invented-dimension verdicts array is rejected
+    # instead of validating and silently skewing ``score_verdicts`` (codex PR B
+    # R4 P2). JSON Schema can't cheaply express "each dimension exactly once"
+    # (count + enum still admits duplicates); parse-time coverage validation
+    # is a dogfood-driven follow-up if real models turn out to underfill.
+    verdict_item["properties"]["dimension"]["enum"] = [
+        dimension for dimension, _ in BINARY_QUESTION_DIMENSIONS
+    ]
     schema["properties"]["verdicts"] = {
         "type": "array",
-        "items": copy.deepcopy(_VERDICT_ITEM_SCHEMA),
+        "items": verdict_item,
+        "minItems": len(BINARY_QUESTION_DIMENSIONS),
+        "maxItems": len(BINARY_QUESTION_DIMENSIONS),
     }
     # ``verdicts`` is REQUIRED in the binary variant: the whole point of the
     # mode is the per-dimension verdicts, so a schema-enforced backend
