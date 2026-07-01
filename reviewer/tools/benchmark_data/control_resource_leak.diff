@@ -1,0 +1,10 @@
+diff --git a/loader.py b/loader.py
+index 1111111..2222222 100644
+--- a/loader.py
++++ b/loader.py
+@@ -1,4 +1,4 @@
+ def load_config(path):
+-    with open(path) as f:
+-        return f.read()
++    f = open(path)
++    return f.read()
