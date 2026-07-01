@@ -605,22 +605,15 @@ def test_region_sweep_instruction_absent_when_off():
     assert default_prompt == off_prompt
 
 
-def test_region_sweep_absent_for_artifact_kinds_even_when_on():
-    """Scoping guard: region_sweep is gated to non-artifact kinds — a whole-
-    document planning artifact has no 'new predicate across call sites' shape to
-    sweep, so the instruction must NOT appear even when the mode is on."""
-    for artifact_kind in ("fr", "spec", "milestone"):
+def test_region_sweep_absent_for_non_pr_diff_kinds_even_when_on():
+    """Scoping guard (codex round 2): region_sweep is gated to ``pr_diff`` —
+    the instruction is diff-shaped (paths/lines/hunks). It must NOT appear on
+    artifact kinds (no call-site-region shape) OR on the other non-diff
+    hot-tier kinds like doc / pr_description (plain prose, no hunks/paths/lines
+    — injecting it risks hallucinated locations), even when the mode is on."""
+    for kind in ("fr", "spec", "milestone", "doc", "pr_description"):
         prompt = build_review_prompt(
-            ReviewRequest(kind=artifact_kind, content="# doc\n"),
+            ReviewRequest(kind=kind, content="# doc\n"),
             region_sweep=True,
         )
-        assert "REGION-SWEEP MODE" not in prompt, artifact_kind
-
-
-def test_region_sweep_present_for_non_artifact_non_diff_kind():
-    """region_sweep also fires for the other rubric-less hot-tier kinds
-    (e.g. doc / pr_description), not just pr_diff."""
-    prompt = build_review_prompt(
-        ReviewRequest(kind="doc", content="some text"), region_sweep=True
-    )
-    assert "REGION-SWEEP MODE" in prompt
+        assert "REGION-SWEEP MODE" not in prompt, kind

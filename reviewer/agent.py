@@ -1464,7 +1464,9 @@ class ReviewerAgent(BaseAgent):
                     # pass instead of surfacing one per round — collapsing a
                     # multi-round review cascade (dog_25d57a12) toward ~2
                     # rounds. Prompt-level sweep only (no static call-site /
-                    # AST analysis); gated to non-artifact kinds. Explicitly
+                    # AST analysis); the instruction is diff-shaped so it fires
+                    # only for kind="pr_diff" (a doc/pr_description/artifact
+                    # review has no hunks/paths/lines to anchor to). Explicitly
                     # PARTIAL: the review-loop driver side (dog_8f702fdc) is
                     # separate.
                     "region_sweep": {"type": "boolean", "default": False},
@@ -1798,7 +1800,8 @@ class ReviewerAgent(BaseAgent):
         # prompt concern (threaded to build_review_prompt via reserved
         # metadata below) — it does NOT enter the rule table / provider
         # selection. Whether it actually fires is further gated in
-        # build_review_prompt to non-artifact kinds.
+        # build_review_prompt to kind="pr_diff" (the instruction is
+        # diff-shaped).
         region_sweep = args.get("region_sweep") is True
 
         # Load ``.reviewer/config.yaml`` **once** per review. Both the

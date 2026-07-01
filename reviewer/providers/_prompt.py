@@ -232,9 +232,11 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
 #: is a much larger effort; this is the dogfoodable first cut). It is an
 #: EXPLICITLY PARTIAL fix: the review-LOOP driver side (feeding prior-round
 #: findings + resolutions into the next round, dog_8f702fdc) is separate and
-#: out of scope. Gated to the non-artifact kinds — same scope as
-#: :data:`_REVIEW_DISCIPLINE_INSTRUCTION` — because a whole-document planning
-#: artifact has no "new predicate across call sites" shape to sweep.
+#: out of scope. Scoped to ``kind == "pr_diff"`` (same diff-only gate as the
+#: doc-routing block): the instruction is diff-shaped (paths/lines/hunks), so
+#: it fits code diffs but would push a plain-prose ``doc`` / ``pr_description``
+#: review toward hallucinated locations, and a whole-document planning artifact
+#: has no "new predicate across call sites" shape to sweep at all.
 _REGION_SWEEP_INSTRUCTION = (
     "REGION-SWEEP MODE: if this change introduces a NEW predicate, state "
     "field, guard, flag, or invariant, do not stop at the first place that "
@@ -391,11 +393,12 @@ def build_review_prompt(
     fences — the tokenization-neutral framing that works everywhere.
 
     ``region_sweep`` (fr_khonliang-reviewer_8fb20f1f) opt-in per-call:
-    when ``True`` and the kind is not an artifact kind, an anti-cascade
-    instruction is injected telling the reviewer to enumerate every site
-    touching a newly-introduced predicate/field/invariant in one pass
-    rather than one per round. Off (default) leaves the prompt bytes
-    byte-identical to the pre-FR shape.
+    when ``True`` and ``kind == "pr_diff"``, an anti-cascade instruction
+    is injected telling the reviewer to enumerate every site touching a
+    newly-introduced predicate/field/invariant in one pass rather than
+    one per round. Scoped to ``pr_diff`` because the instruction is
+    diff-shaped (paths/lines/hunks). Off (default) leaves the prompt
+    bytes byte-identical to the pre-FR shape.
     """
     lines: list[str] = []
 
@@ -434,14 +437,6 @@ def build_review_prompt(
         anti_examples = _builtin_anti_examples()
         if anti_examples:
             lines += [_ANTI_EXAMPLES_HEADER, "", anti_examples.rstrip(), ""]
-        # Region-sweep mode (fr_khonliang-reviewer_8fb20f1f): opt-in per-call
-        # anti-cascade instruction. Same non-artifact scope as the discipline
-        # block above — a whole-document planning artifact has no
-        # "new predicate across call sites" shape to sweep. Off by default,
-        # so the region_sweep=False prompt stays byte-identical to the pre-FR
-        # bytes.
-        if region_sweep:
-            lines += [_REGION_SWEEP_INSTRUCTION, ""]
 
     # Doc-hunk routing (fr_reviewer_1262ce18): a predominantly-prose change
     # gets a critique-not-summarize instruction so the model doesn't echo the
@@ -457,6 +452,19 @@ def build_review_prompt(
         )
         if classification == "doc":
             lines += [_DOC_REVIEW_INSTRUCTION, ""]
+        # Region-sweep mode (fr_khonliang-reviewer_8fb20f1f): opt-in per-call
+        # anti-cascade instruction. Scoped to ``pr_diff`` — the instruction is
+        # inherently diff-shaped ("scan the ENTIRE diff", one finding per site
+        # "anchored to its path/line"), so it fits code diffs but would push a
+        # ``doc`` / ``pr_description`` review (plain prose, no hunks/paths/lines)
+        # toward hallucinated locations. Same diff-only gate as the doc-routing
+        # block above (codex round 2). Off by default, so the region_sweep=False
+        # prompt stays byte-identical to the pre-FR bytes. The instruction's own
+        # "if this change introduces a new predicate" conditional means a
+        # doc-heavy pr_diff still no-ops in practice, so no extra
+        # classification gate is needed here.
+        if region_sweep:
+            lines += [_REGION_SWEEP_INSTRUCTION, ""]
     elif request.kind in _ARTIFACT_KINDS:
         # Full-document framing + per-kind rubric. A repo override
         # (.reviewer/prompts/<kind>_rubric.md, surfaced via RepoPrompts)
