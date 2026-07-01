@@ -195,6 +195,7 @@ class CodexCliProvider(ReviewProvider):
         # a plain built-in prompt with no repo-side merge.
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
+        region_sweep = request.metadata.get("_khonliang_region_sweep") is True
         # ``--output-schema`` enforces the response shape externally —
         # mirrors claude_cli's ``--json-schema`` arrangement, so the
         # prompt body does not need to carry the schema.
@@ -203,6 +204,7 @@ class CodexCliProvider(ReviewProvider):
             include_schema=False,
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
+            region_sweep=region_sweep,
         )
         started_wall = time.time()
         started_mono = time.monotonic()
