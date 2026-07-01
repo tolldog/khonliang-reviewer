@@ -1522,9 +1522,11 @@ class ReviewerAgent(BaseAgent):
                     # Only affects kind="pr_diff" (the questions evaluate a
                     # diff); one structured model call, not N. Unknown value =>
                     # structured error. Single-pass review only: evaluator_hot
-                    # preserves verdicts, but consensus_runs>1 (cross-run
-                    # verdict reconciliation) and review_pr forwarding are a
-                    # follow-up (PR C — cross-model disagreement capture).
+                    # preserves verdicts (its filter call runs WITHOUT the
+                    # verdicts schema), while consensus_runs>1 is REJECTED with
+                    # a structured error — cross-run verdict reconciliation and
+                    # review_pr forwarding are the PR C follow-up (cross-model
+                    # disagreement capture).
                     "scoring_mode": {"type": "string", "default": "holistic"},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
@@ -2073,6 +2075,24 @@ class ReviewerAgent(BaseAgent):
             _validate_consensus(consensus_runs, consensus_min)
         except ConsensusError as exc:
             return {"error": str(exc)}
+        # binary_questions + consensus is unsupported until cross-run verdict
+        # reconciliation lands (PR C of fr_khonliang-reviewer_a585ea3d):
+        # _consolidate_consensus_results rebuilds the result from per-run
+        # findings and would silently DROP every run's verdicts — the caller
+        # asked for a scoring mode the response then doesn't carry. Reject the
+        # combination with a structured error instead of a documented silent
+        # drop (codex PR B R3 P1; no-silent-caps principle).
+        if binary_questions and consensus_runs > 1:
+            return {
+                "error": (
+                    "scoring_mode='binary_questions' with consensus_runs>1 is "
+                    "not supported yet: consensus consolidation would drop the "
+                    "verdicts (cross-run verdict reconciliation is the PR C "
+                    "follow-up of fr_khonliang-reviewer_a585ea3d). Use "
+                    "holistic consensus, or binary_questions with "
+                    "consensus_runs=1."
+                )
+            }
 
         # Pre-validate ``evaluator_hot`` BEFORE the consensus / provider
         # call so an invalid spec or unknown backend doesn't waste
@@ -2301,7 +2321,14 @@ class ReviewerAgent(BaseAgent):
             **{
                 k: v
                 for k, v in original_request.metadata.items()
-                if k != "model"
+                # Strip the binary-questions flag along with the model: the
+                # evaluator is a findings-filter call whose instructions say
+                # "return ONLY the findings" — forwarding the flag would force
+                # the verdicts-REQUIRED schema onto claude/codex evaluator
+                # calls, so a model that (correctly) omits verdicts errors the
+                # evaluator and it fails open, silently disabling FP filtering
+                # for this mode/backend combination (codex PR B R3 P2).
+                if k not in ("model", _METADATA_BINARY_QUESTIONS_KEY)
             },
             "model": model,
         }

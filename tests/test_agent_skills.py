@@ -4835,6 +4835,47 @@ async def test_evaluator_hot_preserves_binary_verdicts():
     assert len(out["verdicts"]) == 1
     assert out["verdicts"][0]["dimension"] == "correctness"
     assert out["verdicts"][0]["answer"] is True
+    # codex PR B R3 P2: the evaluator call is a findings-filter pass — it must
+    # NOT inherit the binary-questions flag, which would force the
+    # verdicts-REQUIRED schema on it; a model that (correctly) returns only
+    # findings would then error the evaluator and fail open, silently
+    # disabling FP filtering. The review call carries the flag; the evaluator
+    # call must not.
+    assert len(fake.requests) == 2
+    assert fake.requests[0].metadata.get("_khonliang_binary_questions") is True
+    assert "_khonliang_binary_questions" not in fake.requests[1].metadata
+
+
+async def test_binary_questions_with_consensus_rejected():
+    """codex PR B R3 P1: consensus consolidation would silently drop every
+    run's verdicts, so the combination is rejected up-front with a structured
+    error (no provider call, no tokens spent) until PR C lands cross-run
+    verdict reconciliation."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "consensus_runs": 3,
+            "consensus_min": 2,
+        },
+    )
+
+    assert "error" in out
+    assert "binary_questions" in out["error"]
+    assert "consensus" in out["error"]
+    assert fake.last_request is None  # rejected before any provider call
+
+    # Sanity: holistic consensus and single-run binary_questions both remain valid
+    ok = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+    assert "error" not in ok or not ok["error"]
 
 
 async def test_evaluator_hot_threads_findings_into_evaluator_instructions():
