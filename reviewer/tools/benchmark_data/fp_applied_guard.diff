@@ -2,11 +2,12 @@ diff --git a/server.py b/server.py
 index 1111111..2222222 100644
 --- a/server.py
 +++ b/server.py
-@@ -10,4 +10,7 @@ def cold_start(agent_id):
-     """Spin up the agent process and warm its provider registry."""
-+    if not is_installed(agent_id):
-+        # Uninstalled agents have no process to warm — skip the cold-start path.
-+        return None
-     proc = launch(agent_id)
-     warm_registry(proc)
-     return proc
+@@ -8,6 +8,9 @@ class AgentServer:
+     def cold_start(self, agent_id):
+         """Spin up the agent process and warm its provider registry."""
++        if agent_id not in self.registry.installed:
++            # Uninstalled agents have no process to warm — skip cold-start.
++            return None
+         proc = self.launch(agent_id)
+         self.warm_registry(proc)
+         return proc

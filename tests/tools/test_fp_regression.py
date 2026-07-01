@@ -40,7 +40,7 @@ def test_load_fp_cases_picks_up_bundled_fixtures():
     assert by_name["fp_consolidate_literals"].kind == "fp"
     # fr_reviewer_8d261d32: the imagined-pre-state (applied-guard) FP fixture.
     assert by_name["fp_applied_guard"].kind == "fp"
-    assert "is_installed" in by_name["fp_applied_guard"].diff
+    assert "registry.installed" in by_name["fp_applied_guard"].diff
     assert by_name["fp_applied_guard"].expect_keywords == ()
     assert by_name["control_resource_leak"].kind == "control"
     # The unrelated benchmark reference diff is NOT picked up.
