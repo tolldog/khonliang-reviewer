@@ -834,3 +834,105 @@ async def test_review_pr_artifact_review_raise_is_comment_not_fatal(monkeypatch)
     assert github.submit_calls, "review still posts"
     body = github.submit_calls[0]["body"]
     assert "[specs/MS-B/spec.md]" in body and "raised" in body
+
+
+# ---------------------------------------------------------------------------
+# scoring_mode forwarding (fr_khonliang-reviewer_a585ea3d PR C)
+# ---------------------------------------------------------------------------
+
+
+def test_review_pr_scoring_mode_declared_not_verdict_probe():
+    """review_pr gains ``scoring_mode`` (deferred from PR B) but deliberately
+    NOT ``verdict_probe`` — minimal surface, probe stays on review_text/diff."""
+    provider = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness(provider)
+    skill = next(s for s in harness.skills if s.name == "review_pr")
+    assert skill.parameters["scoring_mode"]["type"] == "string"
+    assert skill.parameters["scoring_mode"].get("default") == "holistic"
+    assert "verdict_probe" not in skill.parameters
+
+
+async def test_review_pr_forwards_scoring_mode_to_diff_review():
+    """scoring_mode='binary_questions' reaches the internal review_text pass:
+    the provider request carries the reserved binary flag and the returned
+    result surfaces the provider's verdicts."""
+    from khonliang_reviewer import Verdict
+
+    response = _make_result(summary="reviewed")
+    response.verdicts = [
+        Verdict(
+            dimension="correctness",
+            question="Is it correct?",
+            answer=True,
+            explanation="yes",
+        )
+    ]
+    provider = _RecordingProvider("ollama", response)
+    github = _FakeGithub()
+    harness = _make_harness(provider, github=github)
+
+    result = await harness.call(
+        "review_pr",
+        {
+            "repo": "tolldog/example",
+            "pr_number": 42,
+            "scoring_mode": "binary_questions",
+            "dry_run": True,
+        },
+    )
+
+    assert provider.last_request is not None
+    assert provider.last_request.metadata.get("_khonliang_binary_questions") is True
+    assert not result.get("error")
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["dimension"] == "correctness"
+
+
+async def test_review_pr_default_scoring_mode_stays_holistic():
+    provider = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness(provider)
+
+    await harness.call(
+        "review_pr",
+        {"repo": "tolldog/example", "pr_number": 42, "dry_run": True},
+    )
+
+    assert provider.last_request is not None
+    assert "_khonliang_binary_questions" not in provider.last_request.metadata
+
+
+async def test_review_pr_unknown_scoring_mode_propagates_error():
+    provider = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness(provider)
+
+    result = await harness.call(
+        "review_pr",
+        {
+            "repo": "tolldog/example",
+            "pr_number": 42,
+            "scoring_mode": "bogus",
+            "dry_run": True,
+        },
+    )
+
+    assert "error" in result
+    assert "scoring_mode" in result["error"]
+    assert provider.last_request is None
+
+
+def test_merge_review_results_carries_verdicts_from_first_bearing_part():
+    """Mixed-PR merge: only the diff pipeline emits verdicts, so the merge
+    carries them from the first result that has them instead of dropping
+    them (fr_khonliang-reviewer_a585ea3d PR C)."""
+    from reviewer.agent import _merge_review_results
+
+    verdicts = [
+        {"dimension": "correctness", "question": "q", "answer": True,
+         "explanation": "e"}
+    ]
+    code = {"summary": "code", "findings": [], "verdicts": verdicts}
+    spec = {"summary": "spec", "findings": []}
+    merged = _merge_review_results(code, spec)
+    assert merged["verdicts"] == verdicts
+    # absent everywhere -> absent in the merge (holistic shape unchanged)
+    assert "verdicts" not in _merge_review_results(spec, {"summary": "s2", "findings": []})
