@@ -76,7 +76,11 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
-from reviewer.providers._prompt import _METADATA_BINARY_QUESTIONS_KEY
+from reviewer.providers._prompt import (
+    _METADATA_BINARY_QUESTIONS_KEY,
+    BINARY_QUESTION_DIMENSIONS,
+    validate_verdict_coverage,
+)
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyInput, decide_distill, evaluate
@@ -2693,11 +2697,17 @@ class ReviewerAgent(BaseAgent):
         - **Storage only.** ``primary`` is read, never modified; the caller
           returns it unchanged regardless of what happens here.
         - **Fail-open everywhere.** Probe provider error (including a PR B
-          coverage-validation ``malformed_envelope``), empty verdicts, and
-          store-write failure each log a warning and skip capture — no
-          store write happens on a failed probe (an error carries no
-          verdicts to compare, and a partial record would poison the
-          tuning corpus with non-comparisons).
+          coverage-validation ``malformed_envelope``), an INCOMPLETE
+          verdict set on either side, and store-write failure each log a
+          warning and skip capture — no store write happens on a failed or
+          partial probe (an error carries no verdicts to compare, and a
+          partial record would poison the tuning corpus with
+          non-comparisons). Completeness is checked explicitly via
+          :func:`validate_verdict_coverage` on BOTH sides — the enforcing
+          providers already error on incomplete coverage, but a
+          non-enforcing / future provider could return a subset without
+          setting ``error``, and that subset must not persist as a
+          seemingly-valid record (codex PR C R1 P2).
         - **The artifact is written even when the models fully agree.**
           Agreement rate is signal too: the tuning loop needs the
           denominator (how often does the local model already match the
@@ -2707,14 +2717,26 @@ class ReviewerAgent(BaseAgent):
           request id) — the pass costs real compute even when capture is
           skipped.
         """
-        if primary.error or not primary.verdicts:
+        if primary.error:
             # Validation guarantees binary mode was requested, but the
-            # primary may still have errored or (via a non-enforcing
-            # provider) come back verdict-less. Nothing to compare.
+            # primary may still have errored. Nothing to compare.
             logger.warning(
-                "reviewer.verdict_probe: primary result has no verdicts "
-                "(error=%r); skipping probe pass",
+                "reviewer.verdict_probe: primary result errored (%s); "
+                "skipping probe pass",
                 primary.error,
+            )
+            return
+        primary_coverage = validate_verdict_coverage(primary.verdicts)
+        if primary_coverage is not None:
+            # Incomplete primary verdicts (a non-enforcing provider can
+            # return a subset — or none — without setting ``error``). Skip
+            # BEFORE spending the probe call: a partial comparison would be
+            # persisted as a seemingly-valid record and poison the tuning
+            # corpus (codex PR C R1 P2).
+            logger.warning(
+                "reviewer.verdict_probe: primary verdicts incomplete (%s); "
+                "skipping probe pass",
+                primary_coverage,
             )
             return
 
@@ -2771,32 +2793,38 @@ class ReviewerAgent(BaseAgent):
                 probe_result.error,
             )
             return
-        if not probe_result.verdicts:
+        probe_coverage = validate_verdict_coverage(probe_result.verdicts)
+        if probe_coverage is not None:
+            # Same completeness contract as the primary side: enforcing
+            # providers error on incomplete coverage (and are caught by the
+            # ``probe_result.error`` gate above), but a non-enforcing /
+            # future provider could hand back a subset without an error. A
+            # partial comparison must skip, not persist (codex PR C R1 P2).
             logger.warning(
-                "reviewer.verdict_probe: probe %s returned no verdicts; "
+                "reviewer.verdict_probe: probe %s verdicts incomplete (%s); "
                 "skipping disagreement capture",
                 probe_spec,
+                probe_coverage,
             )
             return
 
-        # Per-dimension comparison. Coverage validation (PR B) means both
-        # sides should carry each dimension exactly once; a non-enforcing
-        # provider could still deliver duplicates or gaps, so key on first-
-        # occurrence-per-dimension and compare over the intersection —
-        # ``total_questions`` is the compared count, never an assumed 6.
-        local_by_dim: dict[str, Verdict] = {}
-        for v in primary.verdicts:
-            local_by_dim.setdefault(v.dimension, v)
-        probe_by_dim: dict[str, Verdict] = {}
-        for v in probe_result.verdicts:
-            probe_by_dim.setdefault(v.dimension, v)
+        # Per-dimension comparison. Both sides just passed
+        # ``validate_verdict_coverage``, so each carries every templated
+        # dimension exactly once; iterate the canonical dimension order so
+        # the persisted ``disagreements`` list is stably ordered across
+        # runs, and ``total_questions`` is always the full template size.
+        local_by_dim: dict[str, Verdict] = {
+            v.dimension: v for v in primary.verdicts
+        }
+        probe_by_dim: dict[str, Verdict] = {
+            v.dimension: v for v in probe_result.verdicts
+        }
 
         agreements = 0
         disagreements: list[dict[str, Any]] = []
-        for dimension, local_v in local_by_dim.items():
-            probe_v = probe_by_dim.get(dimension)
-            if probe_v is None:
-                continue
+        for dimension, _question in BINARY_QUESTION_DIMENSIONS:
+            local_v = local_by_dim[dimension]
+            probe_v = probe_by_dim[dimension]
             if local_v.answer == probe_v.answer:
                 agreements += 1
                 continue

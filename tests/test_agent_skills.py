@@ -6487,3 +6487,51 @@ async def test_verdict_probe_composes_with_evaluator_hot(monkeypatch):
     payload = _json.loads(create_calls[0]["content"])
     assert {d["dimension"] for d in payload["disagreements"]} == {"tests"}
     assert payload["agreements"] == len(BINARY_QUESTION_DIMENSIONS) - 1
+
+
+async def test_verdict_probe_incomplete_primary_verdicts_skips_probe(monkeypatch):
+    """codex PR C R1 P2: a partial primary verdict set (non-enforcing
+    provider, no error) must skip BEFORE spending the probe call — a
+    partial comparison would persist as a seemingly-valid record and
+    poison the tuning corpus."""
+    partial = _full_verdicts(lambda d: True)[:-1]  # one dimension missing
+    harness, _, probe = _probe_harness(partial, _full_verdicts(lambda d: True))
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert probe.last_request is None  # probe call never spent
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_incomplete_probe_verdicts_no_store_write(monkeypatch):
+    """Same completeness contract on the probe side: a subset without an
+    error skips capture instead of persisting a partial record
+    (codex PR C R1 P2)."""
+    partial = _full_verdicts(lambda d: False)[:-2]
+    harness, _, probe = _probe_harness(_full_verdicts(lambda d: True), partial)
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert probe.last_request is not None  # probe DID run
+    assert [op for op, _ in calls if op == "artifact_create"] == []
