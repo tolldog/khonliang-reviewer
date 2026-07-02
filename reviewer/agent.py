@@ -75,6 +75,8 @@ from reviewer.providers import (
     GhCopilotProviderConfig,
     OllamaProvider,
     OllamaProviderConfig,
+    TabbyAPIProvider,
+    TabbyAPIProviderConfig,
 )
 from reviewer.providers._prompt import (
     _METADATA_BINARY_QUESTIONS_KEY,
@@ -85,6 +87,7 @@ from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyInput, decide_distill, evaluate
 from reviewer.selector import (
+    DEFAULT_REVIEWER_BACKEND,
     DEFAULT_REVIEWER_MODEL,
     ProviderSelector,
     SelectorConfig,
@@ -3932,6 +3935,7 @@ class ReviewerAgent(BaseAgent):
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
 
         # Per-backend declared-models comes from the pricing YAML;
         # operators add a row per (backend, model) they care about,
@@ -3984,19 +3988,13 @@ class ReviewerAgent(BaseAgent):
         )
         # Source Ollama's provider-default model from
         # ``providers.ollama.default_model`` (per-provider config),
-        # falling back to ``DEFAULT_REVIEWER_MODEL`` (defined in
-        # reviewer/defaults.py, re-exported from reviewer/selector.py).
-        # This baseline backs the SelectorConfig + agent-boot fallback
-        # paths and is also referenced by
-        # ``rules.policy.DEFAULT_FALLBACK`` (the rule-table fallback),
-        # so a swap of the constant flips both fallback paths in
-        # lockstep. The ``docs_kind_to_qwen_small`` rule in
-        # ``rules.policy`` deliberately pins ``qwen2.5-coder:14b`` for
-        # short-text reviews (spec/doc/fr/pr_description) — that's an
-        # intentional small-model carve-out, not a fallback, and is
-        # not affected by promotions of this constant. Decoupled from
-        # the global ``config.default_model`` so an operator who sets
-        # ``default_provider: claude_cli`` and ``default_model:
+        # falling back to a pinned ollama-served model. Since the
+        # fr_0e7ccff1 consolidation, ``DEFAULT_REVIEWER_MODEL`` names the
+        # TabbyAPI-resident model — an id ollama does not serve — so the
+        # ollama block keeps its own fallback pin (the pre-consolidation
+        # ecosystem default) instead of the shared constant. Decoupled
+        # from the global ``config.default_model`` so an operator who
+        # sets ``default_provider: claude_cli`` and ``default_model:
         # claude-opus-4-7`` doesn't accidentally inject a Claude model
         # id into Ollama when a caller picks ``backend: ollama``
         # without specifying a model. The selector deliberately
@@ -4004,7 +4002,7 @@ class ReviewerAgent(BaseAgent):
         # ``ProviderSelector.select``); each provider then applies its
         # own config-level default.
         ollama_default = str(
-            ollama_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+            ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
         )
         # Thread per-provider knobs through to the dataclass so the
         # config-layer rung of the resolution order ("caller →
@@ -4073,6 +4071,56 @@ class ReviewerAgent(BaseAgent):
             default_model=ollama_default,
             declared_models=declared_by_backend.get("ollama", []),
         )
+        # TabbyAPI — the resident GPU engine (fr_khonliang-reviewer_0e7ccff1).
+        # ``api_key`` resolution: explicit config wins, else delegate to
+        # credentials discovery (env var → the engine's own api_tokens.yml).
+        # Discovery failure leaves the key empty; the provider then surfaces
+        # ``auth_not_provisioned`` on first use instead of failing boot —
+        # same graceful-degrade shape as the other backends.
+        tabby_default = str(
+            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+        )
+        tabby_api_key_raw = tabbyapi_cfg.get("api_key")
+        tabby_api_key = (
+            tabby_api_key_raw.strip()
+            if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
+            else None
+        )
+        if tabby_api_key is None:
+            try:
+                from reviewer.credentials import get_tabbyapi_key
+
+                tabby_api_key = get_tabbyapi_key()
+            except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+                logger.debug("tabbyapi key discovery failed: %s", exc)
+                tabby_api_key = None
+        tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
+        tabby_timeout = (
+            float(tabby_timeout_raw)
+            if isinstance(tabby_timeout_raw, (int, float))
+            and not isinstance(tabby_timeout_raw, bool)
+            and tabby_timeout_raw > 0
+            else None
+        )
+        registry.register(
+            TabbyAPIProvider(
+                TabbyAPIProviderConfig(
+                    base_url=str(
+                        tabbyapi_cfg.get("base_url")
+                        or "http://localhost:5000/v1"
+                    ),
+                    default_model=tabby_default,
+                    **({"api_key": tabby_api_key} if tabby_api_key else {}),
+                    **(
+                        {"timeout_seconds": tabby_timeout}
+                        if tabby_timeout is not None
+                        else {}
+                    ),
+                )
+            ),
+            default_model=tabby_default,
+            declared_models=declared_by_backend.get("tabbyapi", []),
+        )
         return registry
 
     def _build_default_selector(self) -> ProviderSelector:
@@ -4080,7 +4128,9 @@ class ReviewerAgent(BaseAgent):
         return ProviderSelector(
             self._ensure_registry().providers,
             SelectorConfig(
-                default_backend=str(config.get("default_provider") or "ollama"),
+                default_backend=str(
+                    config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
+                ),
                 default_model=str(config.get("default_model") or DEFAULT_REVIEWER_MODEL),
                 default_models=_coerce_default_models(config.get("default_models")),
             ),

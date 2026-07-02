@@ -29,7 +29,12 @@ from reviewer.agent import (
 )
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import FAST_TIER_MODEL
-from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
+from reviewer.selector import (
+    DEFAULT_REVIEWER_BACKEND,
+    DEFAULT_REVIEWER_MODEL,
+    ProviderSelector,
+    SelectorConfig,
+)
 from reviewer.storage import open_usage_store
 
 
@@ -80,10 +85,14 @@ def _make_harness(
     """Build an AgentTestHarness with an injected :class:`ProviderSelector`.
 
     The default provider map registers a single fake under ``"ollama"``
-    so the rule table's default fallback (``ollama`` / ``qwen2.5-coder:14b``)
-    resolves cleanly in tests that don't care about provider identity.
-    Tests that want multiple providers pass their own map; tests that
-    want caller-override pass ``backend=...`` explicitly.
+    so caller-pinned ``backend="ollama"`` tests resolve cleanly. The
+    rule table's default backend is ``DEFAULT_REVIEWER_BACKEND``
+    (``tabbyapi`` since the fr_0e7ccff1 consolidation), so when the
+    caller's map doesn't cover that backend the harness ALIASES it onto
+    the map's first fake — tests that don't care about provider
+    identity keep routing to their fake regardless of which backend the
+    rule table names. Tests that DO care about routing register an
+    explicit map covering every backend they expect to be hit.
 
     Tests that exercise ``list_models`` can pass a pre-built
     :class:`ProviderRegistry` to override the auto-derived registry —
@@ -95,6 +104,14 @@ def _make_harness(
     """
     if providers is None:
         providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))}
+    if DEFAULT_REVIEWER_BACKEND not in providers and providers:
+        # Alias the rule-table default backend onto the first fake so
+        # default-routed reviews reach a registered provider (see
+        # docstring). dict insertion order makes "first" deterministic.
+        providers = {
+            **providers,
+            DEFAULT_REVIEWER_BACKEND: next(iter(providers.values())),
+        }
     if registry is None:
         registry = ProviderRegistry()
         for name, provider in providers.items():
@@ -1293,20 +1310,24 @@ async def test_review_text_empty_content_falls_through_to_diff():
 # ---------------------------------------------------------------------------
 
 
-async def test_rule_table_routes_docs_kind_to_ollama():
-    """A doc / fr / pr_description review (no override) → ollama + qwen2.5-coder:14b."""
-    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+async def test_rule_table_routes_docs_kind_to_resident_tier():
+    """A doc / fr / pr_description review (no override) → the resident GPU
+    tier (fr_0e7ccff1 consolidation), not claude. Registers an explicit
+    fake for the default backend so the routing assertion is direct."""
+    resident = _RecordingProvider(
+        DEFAULT_REVIEWER_BACKEND, _make_result(backend=DEFAULT_REVIEWER_BACKEND)
+    )
     claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
-    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+    harness = _make_harness({DEFAULT_REVIEWER_BACKEND: resident, "claude_cli": claude})
 
     await harness.call(
         "review_text",
         {"kind": "fr", "content": "# A small FR\n\nContent."},
     )
 
-    assert ollama.last_request is not None
+    assert resident.last_request is not None
     assert claude.last_request is None
-    assert ollama.last_request.metadata["model"] == "qwen2.5-coder:14b"
+    assert resident.last_request.metadata["model"] == FAST_TIER_MODEL
 
 
 async def test_rule_table_routes_design_artifact_to_claude():
@@ -2539,8 +2560,9 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         "codex_cli",
         "gh_copilot",
         "ollama",
+        "tabbyapi",
     }
-    assert selector.config.default_backend == "ollama"
+    assert selector.config.default_backend == DEFAULT_REVIEWER_BACKEND
     # Reference the constant rather than the literal so future model
     # promotions don't have to touch this assertion. The value the
     # constant resolves to is the ``SelectorConfig.default_model``
@@ -2659,9 +2681,12 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
     # Built-in baseline applies; the global default_model 'claude-opus-4-7'
-    # must NOT have leaked into Ollama's provider config. Reference the
-    # constant so future model promotions don't have to touch this assertion.
-    assert ollama_provider.config.default_model == DEFAULT_REVIEWER_MODEL
+    # must NOT have leaked into Ollama's provider config. Since the
+    # fr_0e7ccff1 consolidation the shared DEFAULT_REVIEWER_MODEL names the
+    # TabbyAPI-resident model, so ollama's baseline is its own pinned
+    # ollama-served model (see _build_default_registry) — assert it is
+    # ollama-shaped and specifically NOT the leaked global or the tabby id.
+    assert ollama_provider.config.default_model == "deepseek-coder-v2:16b"
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):

@@ -205,3 +205,50 @@ def test_unrelated_env_vars_preserved_in_subprocess(monkeypatch):
     monkeypatch.setattr(credentials.subprocess, "run", fake_run)
     get_github_token()
     assert captured_env.get("UNRELATED") == "preserve-me"
+
+
+# ---------------------------------------------------------------------------
+# get_tabbyapi_key (fr_khonliang-reviewer_0e7ccff1)
+# ---------------------------------------------------------------------------
+
+from reviewer.credentials import get_tabbyapi_key  # noqa: E402
+
+
+def test_tabbyapi_env_var_wins(monkeypatch, tmp_path):
+    tokens = tmp_path / "api_tokens.yml"
+    tokens.write_text("api_key: from-file\nadmin_key: admin-secret\n")
+    monkeypatch.setenv("TABBY_API_KEY", "from-env")
+    monkeypatch.setenv("TABBY_API_TOKENS_FILE", str(tokens))
+    assert get_tabbyapi_key() == "from-env"
+
+
+def test_tabbyapi_falls_back_to_tokens_file(monkeypatch, tmp_path):
+    tokens = tmp_path / "api_tokens.yml"
+    tokens.write_text("admin_key: admin-secret\napi_key: 'file-key'\n")
+    monkeypatch.delenv("TABBY_API_KEY", raising=False)
+    monkeypatch.setenv("TABBY_API_TOKENS_FILE", str(tokens))
+    # api_key is read (quotes stripped); admin_key is NEVER returned —
+    # the reviewer has no business with admin endpoints.
+    assert get_tabbyapi_key() == "file-key"
+
+
+def test_tabbyapi_whitespace_env_falls_through(monkeypatch, tmp_path):
+    tokens = tmp_path / "api_tokens.yml"
+    tokens.write_text("api_key: file-key\n")
+    monkeypatch.setenv("TABBY_API_KEY", "   ")
+    monkeypatch.setenv("TABBY_API_TOKENS_FILE", str(tokens))
+    assert get_tabbyapi_key() == "file-key"
+
+
+def test_tabbyapi_missing_file_returns_none(monkeypatch, tmp_path):
+    monkeypatch.delenv("TABBY_API_KEY", raising=False)
+    monkeypatch.setenv("TABBY_API_TOKENS_FILE", str(tmp_path / "nope.yml"))
+    assert get_tabbyapi_key() is None
+
+
+def test_tabbyapi_file_without_api_key_returns_none(monkeypatch, tmp_path):
+    tokens = tmp_path / "api_tokens.yml"
+    tokens.write_text("admin_key: admin-secret\n")
+    monkeypatch.delenv("TABBY_API_KEY", raising=False)
+    monkeypatch.setenv("TABBY_API_TOKENS_FILE", str(tokens))
+    assert get_tabbyapi_key() is None

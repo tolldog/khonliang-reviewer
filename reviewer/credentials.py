@@ -31,7 +31,7 @@ import logging
 import os
 import subprocess
 
-__all__ = ["get_github_token"]
+__all__ = ["get_github_token", "get_tabbyapi_key"]
 
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,68 @@ def _gh_auth_token() -> str | None:
 
     token = proc.stdout.strip()
     return token or None
+
+
+#: Env var checked before reading TabbyAPI's own token file.
+_TABBY_ENV_VAR = "TABBY_API_KEY"
+
+#: Env var that overrides where TabbyAPI's ``api_tokens.yml`` lives.
+_TABBY_TOKENS_FILE_ENV_VAR = "TABBY_API_TOKENS_FILE"
+
+#: Default location of TabbyAPI's own token store on this host layout
+#: (the engine's systemd WorkingDirectory). TabbyAPI generates and owns
+#: this file; reading it is the same delegate-to-the-tool move as asking
+#: ``gh`` for its token — the engine's store is the source of truth, so
+#: key rotation on the engine side Just Works here.
+_TABBY_TOKENS_FILE_DEFAULT = "/opt/tabbyapi/tabbyAPI/api_tokens.yml"
+
+
+def get_tabbyapi_key() -> str | None:
+    """Return the TabbyAPI ``api_key``, or ``None`` if none can be found.
+
+    Discovery order (each step skipped silently when empty/unreadable):
+
+    1. ``TABBY_API_KEY`` environment variable.
+    2. TabbyAPI's own ``api_tokens.yml`` — path from
+       ``TABBY_API_TOKENS_FILE`` when set, else the standard engine
+       location. Only the ``api_key`` entry is read (never
+       ``admin_key`` — the reviewer has no business with admin
+       endpoints like model load/unload).
+
+    The value is never cached or logged; every call reruns discovery so
+    an engine-side key rotation is picked up without a restart.
+    """
+    value = os.environ.get(_TABBY_ENV_VAR)
+    if value is not None and value.strip():
+        return value.strip()
+    path = (
+        os.environ.get(_TABBY_TOKENS_FILE_ENV_VAR, "").strip()
+        or _TABBY_TOKENS_FILE_DEFAULT
+    )
+    return _tabby_tokens_file_key(path)
+
+
+def _tabby_tokens_file_key(path: str) -> str | None:
+    """Read ``api_key`` from a TabbyAPI ``api_tokens.yml``.
+
+    The file is two flat scalar keys (``api_key`` / ``admin_key``), so a
+    line scan avoids a YAML dependency here and — more importantly —
+    cannot be tricked into resolving anchors/includes from a file we
+    don't control. Unreadable / missing / malformed files return
+    ``None`` with a debug log (no token bodies, no file contents).
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("api_key:"):
+                    key = stripped[len("api_key:") :].strip().strip("'\"")
+                    return key or None
+    except OSError as exc:
+        logger.debug("tabbyapi token file unreadable at %s: %s", path, exc)
+        return None
+    logger.debug("tabbyapi token file at %s has no api_key entry", path)
+    return None
 
 
 def _sanitized_subprocess_env() -> dict[str, str]:

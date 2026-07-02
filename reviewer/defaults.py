@@ -27,7 +27,25 @@ from __future__ import annotations
 #: - ``reviewer.rules.policy.DEFAULT_FALLBACK.model`` (the rule-table
 #:   fallback, used when ``decide()`` doesn't match a more specific
 #:   rule — i.e. the typical no-override review path).
-DEFAULT_REVIEWER_MODEL = "deepseek-coder-v2:16b"
+#:
+#: fr_khonliang-reviewer_0e7ccff1 consolidation: the hot tier now rides
+#: the box's resident GPU engine (TabbyAPI serving the Qwen3-14B exl3
+#: quant) instead of ollama — with TabbyAPI holding the VRAM, the old
+#: ollama hot-tier models (deepseek-coder-v2:16b / qwen2.5-coder:14b)
+#: run CPU-bound into timeouts (dog_d6895752). The name is the model id
+#: TabbyAPI reports for its loaded model; a box serving a different
+#: quant overrides ``default_model`` / ``default_models`` in the local
+#: ``config.yaml`` (gitignored) rather than editing this constant.
+DEFAULT_REVIEWER_MODEL = "Qwen3-14B-exl3-6bpw"
+
+#: Backend paired with :data:`DEFAULT_REVIEWER_MODEL`. Flipped together
+#: (a model id only means something to its own backend); every fallback
+#: path that reads the model constant reads this one alongside it —
+#: ``SelectorConfig.default_backend``, the rule-table hot-tier rows, and
+#: ``DEFAULT_FALLBACK``. Cloud-routed rules (e.g. the long-context kimi
+#: row) deliberately keep their own backend pins: they never depended on
+#: local VRAM, so consolidation doesn't move them.
+DEFAULT_REVIEWER_BACKEND = "tabbyapi"
 
 
-__all__ = ["DEFAULT_REVIEWER_MODEL"]
+__all__ = ["DEFAULT_REVIEWER_BACKEND", "DEFAULT_REVIEWER_MODEL"]

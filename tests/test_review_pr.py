@@ -349,8 +349,14 @@ def _make_harness(
     *,
     github: _FakeGithub | None = None,
 ) -> AgentTestHarness:
+    # Register the fake under BOTH the explicit "ollama" name (for
+    # caller-pinned backend tests) and the rule-table default backend
+    # (tabbyapi since the fr_0e7ccff1 consolidation) so default-routed
+    # reviews reach the recording fake either way.
+    from reviewer.defaults import DEFAULT_REVIEWER_BACKEND
+
     selector = ProviderSelector(
-        {"ollama": provider},
+        {"ollama": provider, DEFAULT_REVIEWER_BACKEND: provider},
         SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
     )
     return AgentTestHarness(
@@ -707,8 +713,17 @@ def _make_artifact_harness(github, *, spec_findings=None):
         "claude_cli",
         ReviewResult(request_id="r", summary="spec review", findings=spec_findings or []),
     )
+    from reviewer.defaults import DEFAULT_REVIEWER_BACKEND
+
+    # Same default-backend alias as _make_harness: the code-diff half of a
+    # mixed PR routes via the rule table (tabbyapi since fr_0e7ccff1), so
+    # point that name at the "ollama" recording fake too.
     selector = ProviderSelector(
-        {"ollama": ollama, "claude_cli": claude},
+        {
+            "ollama": ollama,
+            DEFAULT_REVIEWER_BACKEND: ollama,
+            "claude_cli": claude,
+        },
         SelectorConfig(default_backend="ollama", default_model="qwen2.5-coder:14b"),
     )
     harness = AgentTestHarness(ReviewerAgent, selector=selector, github_client=github)

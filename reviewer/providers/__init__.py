@@ -29,6 +29,12 @@ from reviewer.providers.ollama import (
     OllamaProvider,
     OllamaProviderConfig,
 )
+from reviewer.providers.tabbyapi import (
+    TabbyAPIAuthError,
+    TabbyAPIHealthcheckError,
+    TabbyAPIProvider,
+    TabbyAPIProviderConfig,
+)
 
 
 __all__ = [
@@ -46,5 +52,9 @@ __all__ = [
     "OllamaHealthcheckError",
     "OllamaProvider",
     "OllamaProviderConfig",
+    "TabbyAPIAuthError",
+    "TabbyAPIHealthcheckError",
+    "TabbyAPIProvider",
+    "TabbyAPIProviderConfig",
     "build_review_prompt",
 ]
