@@ -8,10 +8,18 @@ contributes only its severity if higher.
 
 Strategies, mapped from ``DistillConfig.dedup``:
 
-- ``none``: pass-through. Used as the default so a misconfigured rule
-  never silently drops findings.
-- ``exact``: identical ``(title, body)`` tuple, case-sensitive. Catches
-  literal repeats from a model that emitted the same finding twice.
+- ``none``: pass-through. Opt-out for callers that need the raw
+  emission stream (e.g. measuring a model's duplicate-emission rate).
+- ``exact``: byte-identical repeat — every content field matches
+  (``title``, ``body``, ``path``, ``line``, ``section``, ``category``,
+  ``suggestion``; only ``severity`` is excluded, see ``_bumped``).
+  Catches literal repeats from a model that emitted the same finding
+  several times in one response (dog_fa0e1a48 saw 5 byte-identical
+  copies of one nit). Two findings that differ in ANY content field —
+  same text on different lines, same text with/without a concrete
+  suggestion — are distinct observations, not repeats. This is the
+  ``DistillConfig.dedup`` default — safe because the collapsed
+  duplicates land on ``dropped_findings``, so nothing drops silently.
 - ``title_substring``: one finding's title appears as a substring of
   the other's title (case-insensitive, stripped). Catches the common
   case where a model emits "Missing test" and "Missing test for
@@ -117,7 +125,38 @@ def _merge(
 
 
 def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
-    return a.title == b.title and a.body == b.body
+    """Byte-identical repeat: every content field matches.
+
+    Location (``path``, ``line``, ``section``) is part of the key —
+    identical terse text anchored to different files/lines is two
+    distinct observations. So are ``category`` and ``suggestion``:
+    a copy that carries a concrete suggestion block (or a different
+    category label) is not a pure repeat, and merging it away would
+    drop the suggested fix from GitHub-comment rendering and from
+    ``sign_off_trailer``'s actionability check. ``severity`` is the
+    one deliberate exclusion — the same text re-emitted at a
+    different severity is still one finding, and ``_bumped`` keeps
+    the highest severity on the survivor.
+
+    Two findings that are byte-identical in EVERY content field —
+    including all-``None`` locations — DO merge, by design. This is
+    the dog_fa0e1a48 shape itself (hot-tier models emit unanchored
+    descriptive nits, repeated verbatim), so exempting locationless
+    findings would un-fix the bug this default exists for. Even when
+    a model "meant" two different spots, a second copy with zero
+    distinguishing content is not separately actionable by any
+    consumer; the repeat count stays auditable on
+    ``dropped_findings``.
+    """
+    return (
+        a.title == b.title
+        and a.body == b.body
+        and a.path == b.path
+        and a.line == b.line
+        and a.section == b.section
+        and a.category == b.category
+        and a.suggestion == b.suggestion
+    )
 
 
 def _is_title_substring_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:

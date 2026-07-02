@@ -69,18 +69,20 @@ def test_audit_corpus_short_circuits_with_unchanged_findings():
 
 
 def test_default_config_path_is_identity_preserving():
-    """Inert-config invariant: every transform must return the same
-    object on its inert slot (``dedup="none"``, ``severity_floor="nit"``,
-    ``body_mode="full"``, ``max_findings=None``) so a default-config
-    review never pays for a no-op clone. The default ``DistillConfig()``
-    sets every slot inert by design — a misconfigured rule never
-    silently shapes findings.
+    """Inert-path invariant: every transform must return the same
+    object when it changes nothing (``dedup`` with no duplicates,
+    ``severity_floor="nit"``, ``body_mode="full"``,
+    ``max_findings=None``) so a default-config review never pays for
+    a no-op clone. The default ``DistillConfig()`` carries
+    ``dedup="exact"`` (dog_fa0e1a48), but exact dedup over a
+    duplicate-free result is still identity — only an actual merge
+    allocates a new result.
 
     Future transform PRs MUST keep returning ``result is`` on their
-    inert slot or this assertion trips.
+    no-change path or this assertion trips.
     """
-    result = _result_with_findings("nit", "concern")
-    config = DistillConfig()  # all slots inert by default
+    result = _result_with_findings("nit", "concern")  # distinct findings
+    config = DistillConfig()
 
     out = run_pipeline(result, config)
 
