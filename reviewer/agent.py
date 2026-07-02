@@ -2748,16 +2748,28 @@ class ReviewerAgent(BaseAgent):
             backend=backend, model=model
         )
 
-        # Same metadata carry as ``_run_evaluator_hot``'s ``eval_metadata``:
-        # copy everything except ``model`` (repo prompts, example format,
-        # num_ctx, region_sweep all describe the REVIEW, so the probe pass
-        # keeps them — maximally comparable prompts), then pin the probe
-        # model. Unlike the evaluator, the binary-questions flag is kept ON:
-        # the probe must answer the same verdict questions, and PR B's
-        # coverage enforcement on the probe result is exactly what makes the
-        # comparison trustworthy.
+        # Metadata carry, following ``_run_evaluator_hot``'s ``eval_metadata``
+        # pattern but with a wider strip set (codex PR C R2 P2): the probe
+        # usually runs on a DIFFERENT backend, so backend-specific tuning
+        # knobs the caller set for the primary provider must not leak into
+        # it — ``num_ctx`` and ``format`` are Ollama-only (a ``format`` set
+        # alongside a Claude primary would unexpectedly force Ollama's
+        # grammar-constrained path on an Ollama probe, failing or skewing
+        # the probe for reasons unrelated to model disagreement). The probe
+        # provider applies its own defaults instead. The reserved
+        # ``_khonliang_*`` keys (repo prompts, example format, region sweep)
+        # describe the REVIEW, are safe on every backend, and keep the two
+        # prompts maximally comparable, so they carry through. Unlike the
+        # evaluator, the binary-questions flag is kept ON: the probe must
+        # answer the same verdict questions, and PR B's coverage enforcement
+        # on the probe result is exactly what makes the comparison
+        # trustworthy.
         probe_metadata = {
-            **{k: v for k, v in request.metadata.items() if k != "model"},
+            **{
+                k: v
+                for k, v in request.metadata.items()
+                if k not in ("model", "num_ctx", "format")
+            },
             _METADATA_BINARY_QUESTIONS_KEY: True,
             "model": probe_model,
         }

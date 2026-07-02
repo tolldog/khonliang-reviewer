@@ -6535,3 +6535,39 @@ async def test_verdict_probe_incomplete_probe_verdicts_no_store_write(monkeypatc
     assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
     assert probe.last_request is not None  # probe DID run
     assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_strips_backend_specific_metadata(monkeypatch):
+    """codex PR C R2 P2: Ollama-only tuning knobs (num_ctx / format) set for
+    the primary provider must not leak into a cross-backend probe request —
+    they could force e.g. grammar-constrained decoding on the probe and skew
+    it for reasons unrelated to model disagreement. Reserved review-shaped
+    keys (the binary flag) still carry."""
+    harness, primary, probe = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: True)
+    )
+    _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+            "num_ctx": 32768,
+            "format": "json",
+        },
+    )
+
+    assert not out.get("error")
+    # primary saw the knobs...
+    assert primary.last_request is not None
+    assert primary.last_request.metadata.get("num_ctx") == 32768
+    assert primary.last_request.metadata.get("format") == "json"
+    # ...the probe did not
+    assert probe.last_request is not None
+    assert "num_ctx" not in probe.last_request.metadata
+    assert "format" not in probe.last_request.metadata
+    assert probe.last_request.metadata.get("_khonliang_binary_questions") is True
+    assert probe.last_request.metadata.get("model") == "probe-model"
