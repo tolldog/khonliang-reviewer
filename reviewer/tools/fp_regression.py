@@ -16,7 +16,9 @@ things at once:
   (rate-based, so the verdict doesn't depend on ``--runs``). Fixtures with a
   ``_FP_FORBIDDEN`` entry additionally fail on a *forbidden claim* at ANY
   severity — a provably-false statement (e.g. "imported but never used" about
-  an import every later hunk uses) is an FP even as a nit.
+  an import every later hunk uses) is an FP even as a nit. This check is
+  unconditionally zero-tolerance: ``--max-fp-concern-rate`` relaxes ordinary
+  concern-noise only, never a provably-false claim.
 - **Control fixtures** (``control_*.diff``) carry a genuine introduced defect (a
   removed ``with`` → file-handle leak). The reviewer must **still** flag them — the
   check fails if the control hit-rate drops below ``--min-control-hit-rate``. This
@@ -291,14 +293,15 @@ def evaluate(
             if r.concern_titles:
                 detail += f" :: {', '.join(sorted(set(r.concern_titles)))}"
             if r.forbid_keywords:
-                # Forbidden-claim verdict shares the FP tolerance: the claim is
-                # provably false at any severity, so the same zero-tolerance
-                # default applies (rate-based, --runs-independent).
-                frate = (r.forbidden_hit_runs / scored) if scored else 1.0
-                fpassed = scored > 0 and frate <= max_fp_concern_rate
+                # Forbidden-claim verdict is unconditionally zero-tolerance
+                # (codex P2 on PR #71): the claim is PROVABLY false — the
+                # fixture is constructed so it cannot be true — so relaxing
+                # --max-fp-concern-rate for ordinary concern-noise must not
+                # also excuse it. One forbidden hit fails the fixture.
+                fpassed = scored > 0 and r.forbidden_hit_runs == 0
                 detail += (
                     f"; forbidden-claim runs {r.forbidden_hit_runs}/{scored} "
-                    f"(rate {frate:.2f}, max {max_fp_concern_rate:.2f})"
+                    f"(tolerance 0)"
                 )
                 if r.forbidden_titles:
                     detail += f" :: {', '.join(sorted(set(r.forbidden_titles)))}"

@@ -207,8 +207,8 @@ def test_classify_run_forbidden_ignores_unrelated_findings():
 
 
 def test_evaluate_fp_fails_on_forbidden_claim_even_without_concerns():
-    """A fixture with forbidden keywords fails when the forbidden-claim rate
-    exceeds the shared FP tolerance, independent of the concern metric."""
+    """A fixture with forbidden keywords fails on ANY forbidden hit,
+    independent of the concern metric."""
     report = CaseReport(
         name="fp_hunk_isolation",
         kind="fp",
@@ -218,6 +218,23 @@ def test_evaluate_fp_fails_on_forbidden_claim_even_without_concerns():
         forbidden_titles=["Unused Import"],
     )
     ok, lines = evaluate([report], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
+    assert not ok
+    assert "forbidden-claim runs 1/2" in lines[0]
+
+
+def test_evaluate_forbidden_claim_ignores_relaxed_concern_tolerance():
+    """codex P2 (PR #71): a relaxed --max-fp-concern-rate excuses ordinary
+    concern-noise but must NEVER excuse a provably-false forbidden claim —
+    the forbidden check is unconditionally zero-tolerance."""
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=2,
+        forbid_keywords=("unused",),
+        forbidden_hit_runs=1,
+        forbidden_titles=["Unused Import"],
+    )
+    ok, lines = evaluate([report], max_fp_concern_rate=1.0, min_control_hit_rate=0.6)
     assert not ok
     assert "forbidden-claim runs 1/2" in lines[0]
 
