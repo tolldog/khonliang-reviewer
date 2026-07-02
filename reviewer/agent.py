@@ -46,6 +46,7 @@ from khonliang_reviewer import (
     ReviewRequest,
     ReviewResult,
     UsageEvent,
+    Verdict,
     severity_rank,
 )
 
@@ -75,7 +76,11 @@ from reviewer.providers import (
     OllamaProvider,
     OllamaProviderConfig,
 )
-from reviewer.providers._prompt import _METADATA_BINARY_QUESTIONS_KEY
+from reviewer.providers._prompt import (
+    _METADATA_BINARY_QUESTIONS_KEY,
+    BINARY_QUESTION_DIMENSIONS,
+    validate_verdict_coverage,
+)
 from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyInput, decide_distill, evaluate
@@ -382,6 +387,13 @@ _ARTIFACT_GET_MAX_CHARS = 200_000
 #: (write in :meth:`_persist_review`, read in ``list_reviews``).
 _REVIEW_ARTIFACT_KIND = "reviewer_artifact_review"
 
+#: Store artifact ``kind`` under which cross-model verdict-disagreement
+#: records are persisted (fr_khonliang-reviewer_a585ea3d PR C). One artifact
+#: per ``verdict_probe`` run; written in :meth:`_run_verdict_probe`. Storage
+#: only in this FR — the prompt-rule tuning loop that consumes these is a
+#: follow-up FR.
+_VERDICT_DISAGREEMENT_KIND = "reviewer_verdict_disagreement"
+
 
 def _parse_created_at(created_at: Any) -> float | None:
     """Epoch seconds for the store's ISO-8601 ``created_at``, or ``None``.
@@ -628,8 +640,13 @@ def _merge_review_results(*results: dict[str, Any]) -> dict[str, Any]:
     }
     # Carry provider identity + usage from the first result that has it (the
     # primary code review in the mixed case) rather than hard-coding empties
-    # or dropping it.
-    for key in ("backend", "model", "usage", "error_category"):
+    # or dropping it. ``verdicts`` rides the same rule: only the diff
+    # pipeline produces them (binary_questions is pr_diff-scoped), so the
+    # first — and only — verdicts-bearing part is the code review; without
+    # this carry a mixed PR under scoring_mode='binary_questions' would
+    # silently drop the verdicts the caller asked for
+    # (fr_khonliang-reviewer_a585ea3d PR C).
+    for key in ("backend", "model", "usage", "error_category", "verdicts"):
         for r in results:
             val = r.get(key)
             if val:
@@ -755,6 +772,47 @@ def _parse_evaluator_spec(spec: str) -> tuple[str, str]:
             f"(after whitespace trimming)"
         )
     return head, tail
+
+
+class VerdictProbeError(ValueError):
+    """Raised when caller-supplied ``verdict_probe`` spec fails validation.
+
+    Same contract shape as :class:`EvaluatorError`: empty string is the
+    absence sentinel (no probe); non-empty values must parse cleanly and
+    reference a registered backend, or the handler converts this into a
+    structured error response before any provider call.
+    """
+
+
+def _parse_verdict_probe_spec(spec: str) -> tuple[str, str | None]:
+    """Parse ``"<backend>"`` or ``"<backend>:<model>"`` into the pair.
+
+    The two-part form reuses :func:`_parse_evaluator_spec` (same separator
+    semantics: first colon splits, the model half is opaque and may itself
+    carry colons — Ollama ``model:tag``). The bare-backend form returns
+    ``model=None`` so the selector's default-model resolution applies —
+    unlike ``evaluator_hot``, a probe caller may reasonably say "whatever
+    that backend's default is". Errors raise :class:`VerdictProbeError`
+    naming the ``verdict_probe`` arg (not ``evaluator_hot``) so the caller
+    can correct the right field.
+    """
+    if ":" not in spec:
+        backend = spec.strip()
+        if not backend:
+            raise VerdictProbeError(
+                f"verdict_probe={spec!r} must be '<backend>' or "
+                f"'<backend>:<model>' with non-empty parts "
+                f"(after whitespace trimming)"
+            )
+        return backend, None
+    try:
+        return _parse_evaluator_spec(spec)
+    except EvaluatorError as exc:
+        raise VerdictProbeError(
+            f"verdict_probe={spec!r} must be '<backend>' or "
+            f"'<backend>:<model>' with non-empty parts "
+            f"(after whitespace trimming)"
+        ) from exc
 
 
 def _coerce_consensus_int(value: Any, *, default: int) -> int:
@@ -1524,10 +1582,27 @@ class ReviewerAgent(BaseAgent):
                     # structured error. Single-pass review only: evaluator_hot
                     # preserves verdicts (its filter call runs WITHOUT the
                     # verdicts schema), while consensus_runs>1 is REJECTED with
-                    # a structured error — cross-run verdict reconciliation and
-                    # review_pr forwarding are the PR C follow-up (cross-model
-                    # disagreement capture).
+                    # a structured error — cross-run verdict reconciliation
+                    # (same-model variance) is a follow-up FR.
                     "scoring_mode": {"type": "string", "default": "holistic"},
+                    # verdict_probe: opt-in cross-model disagreement capture
+                    # (fr_khonliang-reviewer_a585ea3d PR C). "" (default) = off.
+                    # "<backend>" or "<backend>:<model>" = after a successful
+                    # binary_questions review, re-run the SAME request on the
+                    # named provider (the explicit "escalated pass" — there is
+                    # no implicit escalation mechanism) and persist a
+                    # per-dimension (question, local_answer, probe_answer)
+                    # disagreement record to the store for later prompt-rule
+                    # tuning. Storage only: the primary ReviewResult is
+                    # returned UNCHANGED, and every probe failure (provider
+                    # error, coverage failure, store write) is fail-open.
+                    # Requires scoring_mode="binary_questions" AND
+                    # kind="pr_diff" (the only combination that produces
+                    # verdicts to compare) — otherwise a structured error.
+                    # Rejected with consensus_runs>1 (no single verdict set to
+                    # compare against). The tuning loop that consumes these
+                    # records is a follow-up FR.
+                    "verdict_probe": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     # severity_floor: drop findings below this severity
@@ -1634,6 +1709,10 @@ class ReviewerAgent(BaseAgent):
                     # semantics (fr_khonliang-reviewer_a585ea3d).
                     # "holistic" (default) | "binary_questions".
                     "scoring_mode": {"type": "string", "default": "holistic"},
+                    # verdict_probe: opt-in cross-model disagreement capture.
+                    # See the review_text schema for full semantics
+                    # (fr_khonliang-reviewer_a585ea3d PR C).
+                    "verdict_probe": {"type": "string", "default": ""},
                     "request_id": {"type": "string", "default": ""},
                     "metadata": {"type": "object", "default": {}},
                     "severity_floor": {"type": "string", "default": ""},
@@ -1664,6 +1743,14 @@ class ReviewerAgent(BaseAgent):
                     "dry_run": {"type": "boolean", "default": False},
                     "event": {"type": "string", "default": "COMMENT"},
                     "severity_floor": {"type": "string", "default": ""},
+                    # scoring_mode: forwarded to the internal review_text
+                    # pass over the code diff (fr_khonliang-reviewer_a585ea3d
+                    # PR C — deferred from PR B). "holistic" (default) |
+                    # "binary_questions". Applies to the diff pipeline only;
+                    # the artifact pipeline (spec files) never emits verdicts.
+                    # ``verdict_probe`` is deliberately NOT exposed here —
+                    # keep the review_pr surface minimal (future work).
+                    "scoring_mode": {"type": "string", "default": "holistic"},
                 },
                 since="0.1.0",
             ),
@@ -2076,7 +2163,7 @@ class ReviewerAgent(BaseAgent):
         except ConsensusError as exc:
             return {"error": str(exc)}
         # binary_questions + consensus is unsupported until cross-run verdict
-        # reconciliation lands (PR C of fr_khonliang-reviewer_a585ea3d):
+        # reconciliation lands (follow-up FR to fr_khonliang-reviewer_a585ea3d):
         # _consolidate_consensus_results rebuilds the result from per-run
         # findings and would silently DROP every run's verdicts — the caller
         # asked for a scoring mode the response then doesn't carry. Reject the
@@ -2091,12 +2178,66 @@ class ReviewerAgent(BaseAgent):
                 "error": (
                     "scoring_mode='binary_questions' with consensus_runs>1 is "
                     "not supported yet: consensus consolidation would drop the "
-                    "verdicts (cross-run verdict reconciliation is the PR C "
-                    "follow-up of fr_khonliang-reviewer_a585ea3d). Use "
-                    "holistic consensus, or binary_questions with "
-                    "consensus_runs=1."
+                    "verdicts (cross-run verdict reconciliation is a follow-up "
+                    "FR to fr_khonliang-reviewer_a585ea3d). Use holistic "
+                    "consensus, or binary_questions with consensus_runs=1."
                 )
             }
+
+        # Pre-validate ``verdict_probe`` (fr_khonliang-reviewer_a585ea3d PR C)
+        # BEFORE any provider call — same eager pattern as ``evaluator_hot``
+        # below: a bad spec / unknown backend / meaningless combination must
+        # not cost a review whose probe then can't run. Checks, in order:
+        #
+        # 1. Spec parses ('<backend>' or '<backend>:<model>').
+        # 2. Backend is registered.
+        # 3. Binary mode is ACTIVE for this request (scoring_mode=
+        #    'binary_questions' AND kind='pr_diff' — the only combination
+        #    that produces verdicts). A probe on any other request would
+        #    compare verdict sets no pass will ever produce; reject rather
+        #    than silently no-op (mirrors the binary+consensus rejection
+        #    style above).
+        # 4. consensus_runs == 1. Today this is defense-in-depth — check 3
+        #    plus the binary+consensus rejection above already exclude the
+        #    combination — but it stays explicit so that when cross-run
+        #    verdict reconciliation lifts that rejection, verdict_probe ×
+        #    consensus (WHICH run's verdicts compare against the probe?)
+        #    doesn't silently become reachable with undefined semantics.
+        verdict_probe_arg = args.get("verdict_probe")
+        verdict_probe_active = bool(
+            isinstance(verdict_probe_arg, str) and verdict_probe_arg
+        )
+        if verdict_probe_active:
+            try:
+                probe_backend, _ = _parse_verdict_probe_spec(verdict_probe_arg)
+            except VerdictProbeError as exc:
+                return {"error": str(exc)}
+            if probe_backend not in self._ensure_selector().providers:
+                return {
+                    "error": (
+                        f"verdict_probe backend={probe_backend!r} is not "
+                        f"registered; known backends: "
+                        f"{sorted(self._ensure_selector().providers)}"
+                    )
+                }
+            if not (binary_questions and kind == "pr_diff"):
+                return {
+                    "error": (
+                        "verdict_probe requires scoring_mode="
+                        "'binary_questions' AND kind='pr_diff' — the only "
+                        "combination that produces verdicts to compare "
+                        f"(got scoring_mode={scoring_mode!r}, kind={kind!r})."
+                    )
+                }
+            if consensus_runs > 1:
+                return {
+                    "error": (
+                        "verdict_probe with consensus_runs>1 is not "
+                        "supported: there is no single primary verdict set "
+                        "to compare the probe pass against. Use "
+                        "consensus_runs=1."
+                    )
+                }
 
         # Pre-validate ``evaluator_hot`` BEFORE the consensus / provider
         # call so an invalid spec or unknown backend doesn't waste
@@ -2156,6 +2297,23 @@ class ReviewerAgent(BaseAgent):
         # provider output.
         result = run_pipeline(result, distill_config)
         await self._record_usage(result)
+
+        # Cross-model disagreement capture (fr_khonliang-reviewer_a585ea3d
+        # PR C). Storage only: the probe pass runs AFTER the primary result
+        # is fully shaped (pipeline + usage recorded) and writes a
+        # disagreement artifact to the store — it never modifies the
+        # returned result. The outer try/except is the hard fail-open
+        # guarantee: no probe failure mode (provider error, comparison bug,
+        # store write) may sink an otherwise-successful review.
+        if verdict_probe_active:
+            try:
+                await self._run_verdict_probe(result, request, verdict_probe_arg)
+            except Exception as exc:
+                logger.warning(
+                    "reviewer.verdict_probe: probe pass failed (%s); "
+                    "fail-open — primary result returned unchanged",
+                    exc,
+                )
         return result.to_dict()
 
     async def _run_consensus(
@@ -2517,6 +2675,234 @@ class ReviewerAgent(BaseAgent):
             model=consensus_result.model,
         )
 
+    async def _run_verdict_probe(
+        self,
+        primary: ReviewResult,
+        request: ReviewRequest,
+        probe_spec: str,
+    ) -> None:
+        """Run a second (probe) pass and persist per-question disagreements.
+
+        Cross-model disagreement capture from
+        ``fr_khonliang-reviewer_a585ea3d`` PR C: re-run the SAME
+        binary-questions request on the caller-named probe provider (the
+        explicit "escalated pass" — the agent has no implicit escalation
+        mechanism) and record, per dimension, where the two models' yes/no
+        answers diverge. The record feeds the (follow-up FR) prompt-rule
+        tuning loop: "which specific questions does the local model get
+        wrong vs a stronger model".
+
+        Contract:
+
+        - **Storage only.** ``primary`` is read, never modified; the caller
+          returns it unchanged regardless of what happens here.
+        - **Fail-open everywhere.** Probe provider error (including a PR B
+          coverage-validation ``malformed_envelope``), an INCOMPLETE
+          verdict set on either side, and store-write failure each log a
+          warning and skip capture — no store write happens on a failed or
+          partial probe (an error carries no verdicts to compare, and a
+          partial record would poison the tuning corpus with
+          non-comparisons). Completeness is checked explicitly via
+          :func:`validate_verdict_coverage` on BOTH sides — the enforcing
+          providers already error on incomplete coverage, but a
+          non-enforcing / future provider could return a subset without
+          setting ``error``, and that subset must not persist as a
+          seemingly-valid record (codex PR C R1 P2).
+        - **The artifact is written even when the models fully agree.**
+          Agreement rate is signal too: the tuning loop needs the
+          denominator (how often does the local model already match the
+          probe?) to know whether a rule change helped, not just the
+          disagreeing numerator.
+        - Probe spend IS recorded to the usage store (own ``-probe``
+          request id) — the pass costs real compute even when capture is
+          skipped.
+        """
+        if primary.error:
+            # Validation guarantees binary mode was requested, but the
+            # primary may still have errored. Nothing to compare.
+            logger.warning(
+                "reviewer.verdict_probe: primary result errored (%s); "
+                "skipping probe pass",
+                primary.error,
+            )
+            return
+        primary_coverage = validate_verdict_coverage(primary.verdicts)
+        if primary_coverage is not None:
+            # Incomplete primary verdicts (a non-enforcing provider can
+            # return a subset — or none — without setting ``error``). Skip
+            # BEFORE spending the probe call: a partial comparison would be
+            # persisted as a seemingly-valid record and poison the tuning
+            # corpus (codex PR C R1 P2).
+            logger.warning(
+                "reviewer.verdict_probe: primary verdicts incomplete (%s); "
+                "skipping probe pass",
+                primary_coverage,
+            )
+            return
+
+        backend, model = _parse_verdict_probe_spec(probe_spec)
+        # ``model=None`` (bare-backend spec) takes the selector's
+        # default-model resolution, mirroring how an unpinned review
+        # resolves; an explicit model is passed through verbatim.
+        probe_provider, probe_model = self._ensure_selector().select(
+            backend=backend, model=model
+        )
+
+        # Metadata carry, following ``_run_evaluator_hot``'s ``eval_metadata``
+        # pattern but with a wider strip set (codex PR C R2 P2): the probe
+        # usually runs on a DIFFERENT backend, so backend-specific tuning
+        # knobs the caller set for the primary provider must not leak into
+        # it — ``num_ctx`` and ``format`` are Ollama-only (a ``format`` set
+        # alongside a Claude primary would unexpectedly force Ollama's
+        # grammar-constrained path on an Ollama probe, failing or skewing
+        # the probe for reasons unrelated to model disagreement). The probe
+        # provider applies its own defaults instead. The reserved
+        # ``_khonliang_*`` keys (repo prompts, example format, region sweep)
+        # describe the REVIEW, are safe on every backend, and keep the two
+        # prompts maximally comparable, so they carry through. Unlike the
+        # evaluator, the binary-questions flag is kept ON: the probe must
+        # answer the same verdict questions, and PR B's coverage enforcement
+        # on the probe result is exactly what makes the comparison
+        # trustworthy.
+        probe_metadata = {
+            **{
+                k: v
+                for k, v in request.metadata.items()
+                if k not in ("model", "num_ctx", "format")
+            },
+            _METADATA_BINARY_QUESTIONS_KEY: True,
+            "model": probe_model,
+        }
+        probe_request = ReviewRequest(
+            kind=request.kind,
+            content=request.content,
+            instructions=request.instructions,
+            context=request.context,
+            metadata=probe_metadata,
+            request_id=f"{request.request_id}-probe",
+        )
+
+        try:
+            probe_result = await probe_provider.review(probe_request)
+        except Exception as exc:  # provider raised instead of erroring
+            logger.warning(
+                "reviewer.verdict_probe: probe provider %s raised (%s); "
+                "fail-open — skipping disagreement capture",
+                probe_spec,
+                exc,
+            )
+            return
+        # Record probe spend regardless of outcome — an errored probe
+        # (e.g. a parse failure on a real LLM response) still burned
+        # compute. ``_record_usage`` is itself fully fail-safe.
+        await self._record_usage(probe_result)
+
+        if probe_result.error:
+            logger.warning(
+                "reviewer.verdict_probe: probe %s failed (%s); fail-open — "
+                "skipping disagreement capture",
+                probe_spec,
+                probe_result.error,
+            )
+            return
+        probe_coverage = validate_verdict_coverage(probe_result.verdicts)
+        if probe_coverage is not None:
+            # Same completeness contract as the primary side: enforcing
+            # providers error on incomplete coverage (and are caught by the
+            # ``probe_result.error`` gate above), but a non-enforcing /
+            # future provider could hand back a subset without an error. A
+            # partial comparison must skip, not persist (codex PR C R1 P2).
+            logger.warning(
+                "reviewer.verdict_probe: probe %s verdicts incomplete (%s); "
+                "skipping disagreement capture",
+                probe_spec,
+                probe_coverage,
+            )
+            return
+
+        # Per-dimension comparison. Both sides just passed
+        # ``validate_verdict_coverage``, so each carries every templated
+        # dimension exactly once; iterate the canonical dimension order so
+        # the persisted ``disagreements`` list is stably ordered across
+        # runs, and ``total_questions`` is always the full template size.
+        local_by_dim: dict[str, Verdict] = {
+            v.dimension: v for v in primary.verdicts
+        }
+        probe_by_dim: dict[str, Verdict] = {
+            v.dimension: v for v in probe_result.verdicts
+        }
+
+        agreements = 0
+        disagreements: list[dict[str, Any]] = []
+        for dimension, _question in BINARY_QUESTION_DIMENSIONS:
+            local_v = local_by_dim[dimension]
+            probe_v = probe_by_dim[dimension]
+            if local_v.answer == probe_v.answer:
+                agreements += 1
+                continue
+            disagreements.append(
+                {
+                    "dimension": dimension,
+                    # The templated question as the local pass phrased it —
+                    # both passes receive the same template, so one copy
+                    # suffices for the tuning loop.
+                    "question": local_v.question,
+                    "local_answer": local_v.answer,
+                    "probe_answer": probe_v.answer,
+                    "local_explanation": local_v.explanation,
+                    "probe_explanation": probe_v.explanation,
+                }
+            )
+
+        payload = {
+            "request_id": primary.request_id,
+            "local": {"backend": primary.backend, "model": primary.model},
+            "probe": {
+                "backend": probe_result.backend,
+                "model": probe_result.model,
+            },
+            "total_questions": agreements + len(disagreements),
+            "agreements": agreements,
+            "disagreements": disagreements,
+        }
+        # Same store shape as ``_persist_review``; the metadata mirrors its
+        # filterable fields (``review_kind`` plus identity keys) so the
+        # tuning loop can query e.g. "all disagreement records for
+        # local_model=X" via ``artifact_list`` metadata filters.
+        try:
+            resp = await self._store_request(
+                "artifact_create",
+                {
+                    "kind": _VERDICT_DISAGREEMENT_KIND,
+                    "title": (
+                        f"verdict-disagreement:{primary.request_id}"[:200]
+                    ),
+                    "content": json.dumps(payload, indent=2, sort_keys=True),
+                    "content_type": "application/json",
+                    "producer": getattr(self, "agent_id", "reviewer"),
+                    "metadata": {
+                        "review_kind": request.kind,
+                        "request_id": primary.request_id,
+                        "local_backend": primary.backend,
+                        "local_model": primary.model,
+                        "probe_backend": probe_result.backend,
+                        "probe_model": probe_result.model,
+                    },
+                },
+            )
+        except Exception as exc:  # bus unreachable / transport error
+            logger.warning(
+                "reviewer.verdict_probe: disagreement persistence skipped "
+                "(store unreachable): %s",
+                exc,
+            )
+            return
+        if not isinstance(resp, dict) or "error" in resp:
+            logger.warning(
+                "reviewer.verdict_probe: disagreement persistence failed: %s",
+                resp,
+            )
+
     def _severity_floor_override(
         self, args: dict[str, Any], cfg: RepoConfig | None
     ) -> str | None:
@@ -2716,6 +3102,17 @@ class ReviewerAgent(BaseAgent):
             }
         event = event_raw
 
+        # Validate ``scoring_mode`` eagerly (fr_khonliang-reviewer_a585ea3d
+        # PR C). The value is forwarded to the diff-pipeline review_text call
+        # below, which validates it too — but a docs-only PR never reaches
+        # that call (the artifact pipeline doesn't take scoring_mode), and a
+        # bogus value must fail loudly on EVERY routing shape rather than
+        # silently no-op on one of them.
+        try:
+            _resolve_scoring_mode(args.get("scoring_mode"))
+        except ScoringModeError as exc:
+            return {"error": str(exc)}
+
         github = self._ensure_github_client()
         try:
             # Fetches are independent; run them concurrently to halve
@@ -2768,6 +3165,11 @@ class ReviewerAgent(BaseAgent):
                     # review_pr fetches via API (no local clone), so the
                     # ``.reviewer/config.yaml`` layer can't activate here.
                     "severity_floor": args.get("severity_floor") or "",
+                    # scoring_mode forwards to the diff review pass
+                    # (fr_khonliang-reviewer_a585ea3d PR C — deferred from
+                    # PR B); review_text validates the value and returns
+                    # the structured error on an unknown mode.
+                    "scoring_mode": args.get("scoring_mode") or "",
                 }
                 code_result = await self.handle_review_text(review_args)
                 if code_result.get("error"):

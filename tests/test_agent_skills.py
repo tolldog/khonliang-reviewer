@@ -6033,3 +6033,541 @@ async def test_binary_questions_end_to_end_verdicts_and_score():
     scores = score_verdicts(rebuilt)
     assert "overall" in scores
     assert 0.0 <= scores["overall"] <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# verdict_probe / cross-model disagreement capture
+# (fr_khonliang-reviewer_a585ea3d PR C)
+# ---------------------------------------------------------------------------
+
+from khonliang_reviewer import Verdict  # noqa: E402
+
+from reviewer.providers._prompt import (  # noqa: E402
+    BINARY_QUESTION_DIMENSIONS,
+)
+
+
+def _full_verdicts(answer_fn) -> list[Verdict]:
+    """One verdict per templated dimension; ``answer_fn(dimension) -> bool``."""
+    return [
+        Verdict(
+            dimension=dimension,
+            question=question,
+            answer=answer_fn(dimension),
+            explanation=f"{dimension} explanation",
+        )
+        for dimension, question in BINARY_QUESTION_DIMENSIONS
+    ]
+
+
+def _verdict_result(
+    *, backend: str, model: str, verdicts: list[Verdict], error: str = ""
+) -> ReviewResult:
+    res = _make_result(backend=backend, model=model)
+    res.verdicts = verdicts
+    if error:
+        res.error = error
+        res.error_category = "malformed_envelope"
+        res.disposition = "errored"  # type: ignore[assignment]
+    return res
+
+
+def _probe_harness(primary_verdicts, probe_verdicts, *, probe_error=""):
+    """Two-backend harness: primary under 'ollama' (rule-table default),
+    probe under 'claude_cli'. Returns (harness, primary_fake, probe_fake)."""
+    primary = _RecordingProvider(
+        "ollama",
+        _verdict_result(
+            backend="ollama", model="qwen2.5-coder:14b",
+            verdicts=primary_verdicts,
+        ),
+    )
+    probe = _RecordingProvider(
+        "claude_cli",
+        _verdict_result(
+            backend="claude_cli", model="probe-model",
+            verdicts=probe_verdicts, error=probe_error,
+        ),
+    )
+    harness = _make_harness({"ollama": primary, "claude_cli": probe})
+    return harness, primary, probe
+
+
+def test_verdict_probe_declared_on_review_text_and_diff_schemas():
+    """The opt-in ``verdict_probe`` string is declared (optional, default "")
+    on both review_text and review_diff; review_pr deliberately does NOT
+    carry it (minimal surface — future work)."""
+    harness = _make_harness()
+    for skill_name in ("review_text", "review_diff"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "verdict_probe" in s.parameters, skill_name
+        assert s.parameters["verdict_probe"]["type"] == "string", skill_name
+        assert s.parameters["verdict_probe"].get("default") == "", skill_name
+        assert s.parameters["verdict_probe"].get("required", False) is False
+    review_pr = next(sk for sk in harness.skills if sk.name == "review_pr")
+    assert "verdict_probe" not in review_pr.parameters
+
+
+async def test_verdict_probe_bad_spec_errors_before_provider_call():
+    """A malformed spec (empty half around the colon) surfaces a structured
+    error naming verdict_probe and never reaches any provider."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    for bad in (":model", "backend:", "  ", ":"):
+        result = await harness.call(
+            "review_text",
+            {
+                "kind": "pr_diff",
+                "content": "x",
+                "scoring_mode": "binary_questions",
+                "verdict_probe": bad,
+            },
+        )
+        assert "error" in result, bad
+        assert "verdict_probe" in result["error"], bad
+    assert fake.last_request is None
+
+
+async def test_verdict_probe_unknown_backend_errors_before_provider_call():
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "nope:some-model",
+        },
+    )
+
+    assert "error" in result
+    assert "verdict_probe" in result["error"]
+    assert "nope" in result["error"]
+    assert fake.last_request is None
+
+
+async def test_verdict_probe_requires_binary_mode_active():
+    """verdict_probe without binary mode active (holistic, or a non-diff
+    kind) is a structured error — the caller asked for a verdict comparison
+    no pass will produce."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    # holistic pr_diff
+    r1 = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "verdict_probe": "ollama:m"},
+    )
+    assert "error" in r1
+    assert "binary_questions" in r1["error"]
+    # binary_questions on a non-diff kind (binary mode is a no-op there)
+    r2 = await harness.call(
+        "review_text",
+        {
+            "kind": "doc",
+            "content": "prose",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "ollama:m",
+        },
+    )
+    assert "error" in r2
+    assert "pr_diff" in r2["error"]
+    assert fake.last_request is None
+
+
+async def test_verdict_probe_with_consensus_error_ordering_stays_coherent():
+    """verdict_probe + binary + consensus>1: the pre-existing binary+consensus
+    rejection fires (it subsumes the probe concern); verdict_probe's own
+    consensus guard exists for the day that rejection is lifted."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "ollama:m",
+            "consensus_runs": 3,
+            "consensus_min": 2,
+        },
+    )
+
+    assert "error" in out
+    assert "consensus" in out["error"]
+    assert fake.last_request is None
+
+
+async def test_verdict_probe_disagreement_artifact_written(monkeypatch):
+    """Happy path: primary + probe both return full verdict sets with two
+    differing answers -> ONE artifact_create with kind
+    reviewer_verdict_disagreement carrying exactly the differing dimensions,
+    correct counts, and both identities; the primary response is unchanged."""
+    differ = {"tests", "security"}
+    primary_verdicts = _full_verdicts(lambda d: True)
+    probe_verdicts = _full_verdicts(lambda d: d not in differ)
+    harness, primary, probe = _probe_harness(primary_verdicts, probe_verdicts)
+    calls = _fake_store(monkeypatch, harness, create_id="art_disagree_1")
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    # Primary result returned unchanged (storage only): verdicts are the
+    # primary's, no error, no extra keys about the probe.
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert all(v["answer"] is True for v in out["verdicts"])
+
+    # Probe request: same content/kind, binary flag ON, probe model pinned,
+    # -probe request id suffix.
+    assert probe.last_request is not None
+    assert probe.last_request.kind == "pr_diff"
+    assert probe.last_request.content == "x"
+    assert probe.last_request.metadata.get("_khonliang_binary_questions") is True
+    assert probe.last_request.metadata.get("model") == "probe-model"
+    assert probe.last_request.request_id.endswith("-probe")
+    assert primary.last_request is not None
+    assert probe.last_request.request_id == f"{primary.last_request.request_id}-probe"
+
+    # Store artifact: one create, right kind, correct payload.
+    create_calls = [a for op, a in calls if op == "artifact_create"]
+    assert len(create_calls) == 1
+    ca = create_calls[0]
+    assert ca["kind"] == "reviewer_verdict_disagreement"
+    assert ca["content_type"] == "application/json"
+    assert ca["metadata"]["review_kind"] == "pr_diff"
+    assert ca["metadata"]["local_backend"] == "ollama"
+    assert ca["metadata"]["local_model"] == "qwen2.5-coder:14b"
+    assert ca["metadata"]["probe_backend"] == "claude_cli"
+    assert ca["metadata"]["probe_model"] == "probe-model"
+    payload = _json.loads(ca["content"])
+    assert payload["local"] == {"backend": "ollama", "model": "qwen2.5-coder:14b"}
+    assert payload["probe"] == {"backend": "claude_cli", "model": "probe-model"}
+    assert payload["total_questions"] == len(BINARY_QUESTION_DIMENSIONS)
+    assert payload["agreements"] == len(BINARY_QUESTION_DIMENSIONS) - len(differ)
+    assert {d["dimension"] for d in payload["disagreements"]} == differ
+    for d in payload["disagreements"]:
+        assert d["local_answer"] is True
+        assert d["probe_answer"] is False
+        assert d["question"]
+        assert d["local_explanation"]
+        assert d["probe_explanation"]
+
+
+async def test_verdict_probe_all_agree_still_writes_artifact(monkeypatch):
+    """Full agreement still persists a record (empty disagreements list):
+    the agreement rate is the tuning loop's denominator, not a no-op."""
+    verdicts = _full_verdicts(lambda d: d != "clarity")
+    harness, _, _ = _probe_harness(verdicts, _full_verdicts(lambda d: d != "clarity"))
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    create_calls = [a for op, a in calls if op == "artifact_create"]
+    assert len(create_calls) == 1
+    payload = _json.loads(create_calls[0]["content"])
+    assert payload["disagreements"] == []
+    assert payload["agreements"] == len(BINARY_QUESTION_DIMENSIONS)
+    assert payload["total_questions"] == len(BINARY_QUESTION_DIMENSIONS)
+
+
+async def test_verdict_probe_bare_backend_spec_uses_selector_default_model(
+    monkeypatch,
+):
+    """'<backend>' (no colon) resolves the model via the selector's default
+    resolution — here claude_cli has no per-backend default and isn't the
+    default backend, so the empty-string 'provider decides' sentinel lands
+    in the probe request's metadata."""
+    harness, _, probe = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: True)
+    )
+    _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli",
+        },
+    )
+
+    assert not out.get("error")
+    assert probe.last_request is not None
+    assert probe.last_request.metadata.get("model") == ""
+
+
+async def test_verdict_probe_probe_error_fails_open_no_store_write(monkeypatch):
+    """An errored probe pass (e.g. PR B coverage enforcement ->
+    malformed_envelope) skips capture entirely: no store write, and the
+    primary result is returned unchanged."""
+    harness, _, probe = _probe_harness(
+        _full_verdicts(lambda d: True),
+        [],
+        probe_error="binary_questions verdicts incomplete",
+    )
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert probe.last_request is not None  # probe DID run
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_provider_raise_fails_open(monkeypatch):
+    """A probe provider that RAISES (transport bug, not an errored result)
+    must not sink the primary review."""
+
+    class _RaisingProvider(ReviewProvider):
+        name = "claude_cli"
+
+        async def review(self, request: ReviewRequest) -> ReviewResult:
+            raise RuntimeError("probe transport kaboom")
+
+    primary = _RecordingProvider(
+        "ollama",
+        _verdict_result(
+            backend="ollama", model="qwen2.5-coder:14b",
+            verdicts=_full_verdicts(lambda d: True),
+        ),
+    )
+    harness = _make_harness(
+        {"ollama": primary, "claude_cli": _RaisingProvider()}
+    )
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_store_failure_is_non_fatal(monkeypatch):
+    """artifact_create failing (store error) must not touch the primary
+    result — capture is best-effort."""
+    harness, _, _ = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: False)
+    )
+    calls = _fake_store(monkeypatch, harness, error_op="artifact_create")
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    # the write was attempted (fail-open is about the outcome, not skipping)
+    assert [op for op, _ in calls if op == "artifact_create"]
+
+
+async def test_verdict_probe_store_unreachable_is_non_fatal():
+    """No store stub at all: self.request hits the mock bus and raises ->
+    the warning path swallows it and the review still succeeds."""
+    harness, _, _ = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: False)
+    )
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+
+
+async def test_verdict_probe_off_by_default_no_probe_call(monkeypatch):
+    """Holistic-regression guard: binary_questions WITHOUT verdict_probe
+    never touches the probe backend or the store."""
+    harness, _, probe = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: True)
+    )
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+
+    assert not out.get("error")
+    assert probe.last_request is None
+    assert calls == []
+
+
+async def test_verdict_probe_composes_with_evaluator_hot(monkeypatch):
+    """verdict_probe x evaluator_hot: the evaluator filters findings (and
+    preserves verdicts); the probe then still runs and captures against the
+    surviving result's verdicts. Three provider calls total on the primary
+    backend path (review + eval) plus one probe call."""
+    keep = _consensus_finding(title="real concern", line=10)
+    reviewed = _consensus_result([keep])
+    reviewed.verdicts = _full_verdicts(lambda d: True)
+    primary = _ScriptedProvider("ollama", [reviewed, _evaluator_result([keep])])
+    probe = _RecordingProvider(
+        "claude_cli",
+        _verdict_result(
+            backend="claude_cli", model="probe-model",
+            verdicts=_full_verdicts(lambda d: d != "tests"),
+        ),
+    )
+    harness = _make_harness({"ollama": primary, "claude_cli": probe})
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert len(primary.requests) == 2  # review + evaluator
+    assert probe.last_request is not None
+    # the probe request is the -probe suffix of the BASE id, not the -eval one
+    assert probe.last_request.request_id.endswith("-probe")
+    assert not probe.last_request.request_id.endswith("-eval-probe")
+    create_calls = [a for op, a in calls if op == "artifact_create"]
+    assert len(create_calls) == 1
+    payload = _json.loads(create_calls[0]["content"])
+    assert {d["dimension"] for d in payload["disagreements"]} == {"tests"}
+    assert payload["agreements"] == len(BINARY_QUESTION_DIMENSIONS) - 1
+
+
+async def test_verdict_probe_incomplete_primary_verdicts_skips_probe(monkeypatch):
+    """codex PR C R1 P2: a partial primary verdict set (non-enforcing
+    provider, no error) must skip BEFORE spending the probe call — a
+    partial comparison would persist as a seemingly-valid record and
+    poison the tuning corpus."""
+    partial = _full_verdicts(lambda d: True)[:-1]  # one dimension missing
+    harness, _, probe = _probe_harness(partial, _full_verdicts(lambda d: True))
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert probe.last_request is None  # probe call never spent
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_incomplete_probe_verdicts_no_store_write(monkeypatch):
+    """Same completeness contract on the probe side: a subset without an
+    error skips capture instead of persisting a partial record
+    (codex PR C R1 P2)."""
+    partial = _full_verdicts(lambda d: False)[:-2]
+    harness, _, probe = _probe_harness(_full_verdicts(lambda d: True), partial)
+    calls = _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+        },
+    )
+
+    assert not out.get("error")
+    assert len(out["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    assert probe.last_request is not None  # probe DID run
+    assert [op for op, _ in calls if op == "artifact_create"] == []
+
+
+async def test_verdict_probe_strips_backend_specific_metadata(monkeypatch):
+    """codex PR C R2 P2: Ollama-only tuning knobs (num_ctx / format) set for
+    the primary provider must not leak into a cross-backend probe request —
+    they could force e.g. grammar-constrained decoding on the probe and skew
+    it for reasons unrelated to model disagreement. Reserved review-shaped
+    keys (the binary flag) still carry."""
+    harness, primary, probe = _probe_harness(
+        _full_verdicts(lambda d: True), _full_verdicts(lambda d: True)
+    )
+    _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "claude_cli:probe-model",
+            "num_ctx": 32768,
+            "format": "json",
+        },
+    )
+
+    assert not out.get("error")
+    # primary saw the knobs...
+    assert primary.last_request is not None
+    assert primary.last_request.metadata.get("num_ctx") == 32768
+    assert primary.last_request.metadata.get("format") == "json"
+    # ...the probe did not
+    assert probe.last_request is not None
+    assert "num_ctx" not in probe.last_request.metadata
+    assert "format" not in probe.last_request.metadata
+    assert probe.last_request.metadata.get("_khonliang_binary_questions") is True
+    assert probe.last_request.metadata.get("model") == "probe-model"
