@@ -44,11 +44,15 @@ SeverityFloor = Literal["nit", "comment", "concern"]
 BodyMode = Literal["compact", "brief", "full"]
 
 #: Dedup strategy. ``semantic`` is reserved for a future
-#: embedding-similarity transform; no dedup transforms or runtime
-#: validation are implemented in this shell yet — the dedup-transform
-#: PR will add the runtime guard that raises on ``semantic`` until
-#: that transform lands. The other three values are the targets of
-#: that same PR.
+#: embedding-similarity transform; ``apply_dedup`` raises on it until
+#: that transform lands. ``exact`` is the default: hot-tier models
+#: sometimes emit the same finding verbatim several times in one
+#: response (dog_fa0e1a48 saw 5 byte-identical copies), and a
+#: byte-identical repeat at the same location is never signal. The
+#: drop is not silent — collapsed duplicates are recorded on
+#: ``ReviewResult.dropped_findings``. Callers that need the raw
+#: emission stream pass ``dedup="none"`` (or use ``audit_corpus``,
+#: which short-circuits the whole pipeline).
 DedupStrategy = Literal["none", "exact", "title_substring", "semantic"]
 
 
@@ -65,7 +69,7 @@ class DistillConfig:
     severity_floor: SeverityFloor = "nit"
     body_mode: BodyMode = "full"
     consensus: bool = False
-    dedup: DedupStrategy = "none"
+    dedup: DedupStrategy = "exact"
     max_findings: int | None = None
     audience: Audience = "agent_consumption"
 
@@ -79,8 +83,9 @@ class DistillConfig:
 # keyed on diff size). Keeping distill in its own small audience-indexed
 # table avoids multiplying the provider rules by audience. ``decide_distill``
 # is a pure lookup; an unmapped audience returns the non-aggressive default
-# config (carrying only the audience marker) so the default path stays a
-# no-op over raw provider output.
+# config (carrying only the audience marker). The default config is not a
+# strict no-op — it collapses byte-identical duplicate findings
+# (``dedup="exact"``, dog_fa0e1a48) — but it never drops unique content.
 _DISTILL_BY_AUDIENCE: dict[Audience, DistillConfig] = {
     # User-facing GitHub comment lists must be terse: floor out nits,
     # compact the bodies, cap the count.
@@ -111,8 +116,11 @@ def decide_distill(
     Distill shaping keys on the *audience* (who consumes the findings),
     independent of the provider rule table (which keys on diff size).
     Unmapped audiences (``agent_consumption``, ``human_review``) get the
-    non-aggressive default config carrying just the audience marker, so
-    the default path stays a no-op over raw provider output.
+    non-aggressive default config carrying just the audience marker.
+    Every audience inherits ``dedup="exact"`` from the dataclass default
+    (byte-identical repeats are model-emission noise, never signal —
+    dog_fa0e1a48); ``audit_corpus`` still sees raw output because
+    ``run_pipeline`` short-circuits before any transform runs.
 
     ``kind`` is accepted for forward-compatibility (a future row may
     shape spec/doc reviews differently) but is not consulted yet.

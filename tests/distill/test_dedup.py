@@ -2,7 +2,8 @@
 
 Pins the contract every other transform-PR depends on:
 - ``dedup="none"`` is identity (in and out are the same object).
-- ``dedup="exact"`` collapses identical (title, body) findings.
+- ``dedup="exact"`` (the default) collapses identical
+  (title, body, path, line, section) findings.
 - ``dedup="title_substring"`` collapses findings whose titles share
   a substring relationship (case-insensitive).
 - The merged survivor's severity is bumped to the highest in the
@@ -26,13 +27,20 @@ def _result(*findings: ReviewFinding) -> ReviewResult:
     return ReviewResult(request_id="req-test", summary="ok", findings=list(findings))
 
 
-def _f(severity: str, title: str, body: str = "b") -> ReviewFinding:
-    return ReviewFinding(severity=severity, title=title, body=body)  # type: ignore[arg-type]
+def _f(
+    severity: str,
+    title: str,
+    body: str = "b",
+    path: str | None = None,
+    line: int | None = None,
+) -> ReviewFinding:
+    return ReviewFinding(severity=severity, title=title, body=body, path=path, line=line)  # type: ignore[arg-type]
 
 
 def test_none_is_identity():
-    """The default strategy passes the result through unchanged so a
-    misconfigured rule never silently drops findings.
+    """The opt-out strategy passes the result through unchanged —
+    callers that need the raw emission stream (e.g. measuring a
+    model's duplicate-emission rate) see every repeat.
     """
     result = _result(_f("nit", "x"), _f("nit", "x"))  # would dedup if asked
     out = apply_dedup(result, DistillConfig(dedup="none"))
@@ -68,6 +76,41 @@ def test_exact_keeps_distinct_findings():
     # No merging happened → identity preserved (composes cleanly with
     # subsequent transforms that may be inert too).
     assert out is result
+
+
+def test_exact_keeps_same_text_at_different_locations():
+    """Identical terse text anchored to different files/lines is two
+    distinct observations, not a repeat — location is part of the
+    exact-dup key. A model legitimately emits "Missing docstring"
+    against three different functions; collapsing them would erase
+    two real findings.
+    """
+    result = _result(
+        _f("nit", "Missing docstring", "Add one.", path="a.py", line=10),
+        _f("nit", "Missing docstring", "Add one.", path="b.py", line=10),
+        _f("nit", "Missing docstring", "Add one.", path="a.py", line=42),
+    )
+    out = apply_dedup(result, DistillConfig(dedup="exact"))
+    assert len(out.findings) == 3
+    assert out is result
+
+
+def test_exact_is_the_default_and_records_drops():
+    """The dog_fa0e1a48 shape: one diff, the same byte-identical
+    descriptive nit emitted 5 times. The default config (no explicit
+    ``dedup``) collapses them to one survivor and records the four
+    collapsed copies on ``dropped_findings`` — the drop is auditable,
+    never silent.
+    """
+    copies = [
+        _f("nit", "Code Clarification", "The SKIP branch returns early.")
+        for _ in range(5)
+    ]
+    result = _result(*copies)
+    out = apply_dedup(result, DistillConfig())
+    assert len(out.findings) == 1
+    assert len(out.dropped_findings) == 4
+    assert all(d.title == "Code Clarification" for d in out.dropped_findings)
 
 
 def test_title_substring_merges_supersets():

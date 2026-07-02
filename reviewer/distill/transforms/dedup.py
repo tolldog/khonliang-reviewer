@@ -8,10 +8,16 @@ contributes only its severity if higher.
 
 Strategies, mapped from ``DistillConfig.dedup``:
 
-- ``none``: pass-through. Used as the default so a misconfigured rule
-  never silently drops findings.
-- ``exact``: identical ``(title, body)`` tuple, case-sensitive. Catches
-  literal repeats from a model that emitted the same finding twice.
+- ``none``: pass-through. Opt-out for callers that need the raw
+  emission stream (e.g. measuring a model's duplicate-emission rate).
+- ``exact``: identical ``(title, body, path, line, section)`` tuple,
+  case-sensitive. Catches literal repeats from a model that emitted
+  the same finding several times in one response (dog_fa0e1a48 saw 5
+  byte-identical copies of one nit). Location is part of the key on
+  purpose: two findings with identical terse text on *different*
+  files/lines are distinct observations, not repeats. This is the
+  ``DistillConfig.dedup`` default — safe because the collapsed
+  duplicates land on ``dropped_findings``, so nothing drops silently.
 - ``title_substring``: one finding's title appears as a substring of
   the other's title (case-insensitive, stripped). Catches the common
   case where a model emits "Missing test" and "Missing test for
@@ -117,7 +123,22 @@ def _merge(
 
 
 def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
-    return a.title == b.title and a.body == b.body
+    """Byte-identical text at the same location.
+
+    Location (``path``, ``line``, ``section``) is part of the key:
+    identical terse text anchored to different files/lines is two
+    distinct observations. ``severity`` is deliberately NOT part of
+    the key — the same text re-emitted at a different severity is
+    still one finding, and ``_bumped`` keeps the highest severity on
+    the survivor.
+    """
+    return (
+        a.title == b.title
+        and a.body == b.body
+        and a.path == b.path
+        and a.line == b.line
+        and a.section == b.section
+    )
 
 
 def _is_title_substring_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:

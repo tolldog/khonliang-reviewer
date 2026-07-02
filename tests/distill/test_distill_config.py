@@ -47,8 +47,14 @@ def test_default_consensus_is_off():
     assert DistillConfig().consensus is False
 
 
-def test_default_dedup_is_none():
-    assert DistillConfig().dedup == "none"
+def test_default_dedup_is_exact():
+    """Byte-identical repeats at the same location are model-emission
+    noise, never signal (dog_fa0e1a48: one nit emitted 5×). The drop
+    is auditable via ``dropped_findings``, so exact dedup is safe as
+    the default; ``dedup="none"`` remains the opt-out for callers
+    that want the raw emission stream.
+    """
+    assert DistillConfig().dedup == "exact"
 
 
 def test_default_max_findings_is_unbounded():
