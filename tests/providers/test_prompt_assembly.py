@@ -416,6 +416,36 @@ def test_applied_guard_clause_present_for_code_diff():
     assert "not an imagined version without the change" in prompt
 
 
+def test_partial_view_clause_present_for_code_diff():
+    """Clause 5 (dog_05937209): the partial-view calibration curbs the
+    hunk-isolation FP — an import added in hunk 1 flagged 'unused' because
+    the flagging pass only looked at one hunk. Rides on the same rubric-less
+    hot-tier discipline path as clauses 1-4."""
+    prompt = build_review_prompt(ReviewRequest(kind="pr_diff", content=_CODE_DIFF))
+    assert "PARTIAL view" in prompt
+    assert "unused, undefined, or unreferenced" in prompt
+    assert "an identifier added in one hunk" in prompt
+
+
+def test_partial_view_clause_absent_for_non_diff_kinds():
+    """Clause 5 is scoped TIGHTER than clauses 1-4 (codex P2, PR #71): doc /
+    pr_description reviews receive the COMPLETE text under review, so the
+    partial-view framing would misdescribe their input and license the model
+    to suppress legitimate whole-file findings. Artifact kinds skip the whole
+    discipline block as before."""
+    for kind in ("doc", "pr_description"):
+        prompt = build_review_prompt(ReviewRequest(kind=kind, content="some text"))
+        # clauses 1-4 still fire on the rubric-less hot-tier path...
+        assert "REVIEW DISCIPLINE" in prompt, kind
+        # ...but the diff-only partial-view clause does not.
+        assert "PARTIAL view" not in prompt, kind
+    for artifact_kind in ("fr", "spec", "milestone"):
+        prompt = build_review_prompt(
+            ReviewRequest(kind=artifact_kind, content="# doc\n")
+        )
+        assert "PARTIAL view" not in prompt, artifact_kind
+
+
 def test_applied_guard_clause_absent_for_artifact_kinds():
     """Clause 4 is scoped exactly like the rest of _REVIEW_DISCIPLINE_INSTRUCTION
     — excluded from artifact reviews (fr/spec/milestone), which carry their own

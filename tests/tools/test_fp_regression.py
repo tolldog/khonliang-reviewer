@@ -29,6 +29,10 @@ def _f(severity, title="t"):
     return ReviewFinding(severity=severity, title=title, body="b")  # type: ignore[arg-type]
 
 
+def _finding(severity, title, body):
+    return ReviewFinding(severity=severity, title=title, body=body)  # type: ignore[arg-type]
+
+
 # -- fixtures load + classify by prefix -------------------------------
 
 
@@ -51,6 +55,13 @@ def test_load_fp_cases_picks_up_bundled_fixtures():
     # The control fixture carries seeded-defect keywords (P1 wiring); FP has none.
     assert by_name["control_resource_leak"].expect_keywords  # non-empty
     assert by_name["fp_docstring_prose"].expect_keywords == ()
+    # dog_05937209: the hunk-isolation (import-then-use) FP fixture, with its
+    # forbidden-claim keywords; fixtures without a _FP_FORBIDDEN entry get none.
+    assert by_name["fp_hunk_isolation"].kind == "fp"
+    assert "from contextlib import closing" in by_name["fp_hunk_isolation"].diff
+    assert "closing(self._conn())" in by_name["fp_hunk_isolation"].diff
+    assert "unused" in by_name["fp_hunk_isolation"].forbid_keywords
+    assert by_name["fp_docstring_prose"].forbid_keywords == ()
 
 
 class _FakeEntry:
@@ -162,6 +173,83 @@ def test_classify_run_errored_counts_as_errored_not_finding():
 
 
 # -- evaluate: FP fixtures ---------------------------------------------
+
+
+def test_classify_run_forbidden_claim_counts_any_severity():
+    """dog_05937209: a provably-false claim ('imported but never used') is an
+    FP even at nit severity. The forbidden-claim counter must catch what the
+    concern-rate metric misses."""
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=1,
+        forbid_keywords=("unused", "imported but"),
+    )
+    result = _result(
+        [_finding("nit", "Unused Import", "'closing' is imported but never used.")],
+    )
+    classify_run(report, result)
+    assert report.forbidden_hit_runs == 1
+    assert report.concern_runs == 0  # nit — invisible to the concern metric
+    assert report.forbidden_titles == ["Unused Import"]
+
+
+def test_classify_run_forbidden_ignores_unrelated_findings():
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=1,
+        forbid_keywords=("unused", "imported but"),
+    )
+    result = _result([_finding("nit", "Naming", "Consider a longer variable name.")])
+    classify_run(report, result)
+    assert report.forbidden_hit_runs == 0
+
+
+def test_evaluate_fp_fails_on_forbidden_claim_even_without_concerns():
+    """A fixture with forbidden keywords fails on ANY forbidden hit,
+    independent of the concern metric."""
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=2,
+        forbid_keywords=("unused",),
+        forbidden_hit_runs=1,
+        forbidden_titles=["Unused Import"],
+    )
+    ok, lines = evaluate([report], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
+    assert not ok
+    assert "forbidden-claim runs 1/2" in lines[0]
+
+
+def test_evaluate_forbidden_claim_ignores_relaxed_concern_tolerance():
+    """codex P2 (PR #71): a relaxed --max-fp-concern-rate excuses ordinary
+    concern-noise but must NEVER excuse a provably-false forbidden claim —
+    the forbidden check is unconditionally zero-tolerance."""
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=2,
+        forbid_keywords=("unused",),
+        forbidden_hit_runs=1,
+        forbidden_titles=["Unused Import"],
+    )
+    ok, lines = evaluate([report], max_fp_concern_rate=1.0, min_control_hit_rate=0.6)
+    assert not ok
+    assert "forbidden-claim runs 1/2" in lines[0]
+
+
+def test_evaluate_fp_forbidden_clean_passes():
+    report = CaseReport(
+        name="fp_hunk_isolation",
+        kind="fp",
+        runs=2,
+        forbid_keywords=("unused",),
+        forbidden_hit_runs=0,
+    )
+    ok, lines = evaluate([report], max_fp_concern_rate=0.0, min_control_hit_rate=0.6)
+    assert ok
+    assert "forbidden-claim runs 0/2" in lines[0]
 
 
 def test_evaluate_fp_passes_at_zero_concern_runs():

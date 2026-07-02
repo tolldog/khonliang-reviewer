@@ -40,3 +40,19 @@ WHY THIS IS WRONG: a subjective style/formatting preference is not a
 blocking defect. If worth mentioning at all, it is a `comment` or `nit` —
 never a `concern`. Reserve `concern` for something that should stop the
 change (a real bug, regression, or security problem).
+
+### Anti-example 4 — "unused" claim from reading hunks in isolation
+
+```json
+{"severity": "nit", "title": "Unused Import",
+ "body": "'from contextlib import closing' is imported but never used in
+ this file."}
+```
+
+WHY THIS IS WRONG: this fired on a diff whose first hunk adds the import
+and whose LATER hunks — in the same file — use `closing(...)` at every
+call site. A diff is a partial view: hunks from one file are fragments of
+one file, and unchanged code outside the hunks also exists. Absence from
+the hunk you are looking at is not evidence that a name is unused,
+undefined, or unreferenced. Never emit an unused/undefined claim unless
+the full file content is visible and confirms it.
