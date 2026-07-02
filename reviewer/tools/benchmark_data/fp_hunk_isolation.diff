@@ -1,0 +1,27 @@
+diff --git a/watcher_store.py b/watcher_store.py
+index 3333333..4444444 100644
+--- a/watcher_store.py
++++ b/watcher_store.py
+@@ -1,4 +1,5 @@
+ """SQLite-backed persistence for the ingest watcher registry."""
+ 
++from contextlib import closing
+ import sqlite3
+ 
+@@ -14,7 +15,7 @@ class WatcherStore:
+         return conn
+ 
+     def init_schema(self):
+-        with self._conn() as conn:
++        with closing(self._conn()) as conn, conn:
+             conn.executescript(SCHEMA)
+ 
+     def touch_last_poll(self, watcher_id, at):
+@@ -23,6 +24,6 @@ class WatcherStore:
+         )
+ 
+     def remove_watcher(self, watcher_id):
+-        with self._conn() as conn:
++        with closing(self._conn()) as conn, conn:
+             conn.execute(
+                 "DELETE FROM watcher_registry WHERE watcher_id = ?",

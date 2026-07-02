@@ -7,11 +7,16 @@ things at once:
 
 - **FP fixtures** (``fp_*.diff`` in :mod:`reviewer.tools.benchmark_data`) reproduce
   the dogfood false-positive shapes — an echo-bait docstring addition
-  (``dog_9902f2f9``) and a clean literal-duplication consolidation
-  (``dog_3891542a`` "Code Repetition" bait). A well-calibrated reviewer emits
-  **zero** ``concern``-severity findings on these; the check fails when the
-  fraction of runs emitting a concern exceeds ``--max-fp-concern-rate`` (rate-based,
-  so the verdict doesn't depend on ``--runs``).
+  (``dog_9902f2f9``), a clean literal-duplication consolidation
+  (``dog_3891542a`` "Code Repetition" bait), an added-guard diff
+  (``fr_reviewer_8d261d32`` imagined-pre-state bait), and a multi-hunk
+  import-then-use diff (``dog_05937209`` hunk-isolation bait). A well-calibrated
+  reviewer emits **zero** ``concern``-severity findings on these; the check fails
+  when the fraction of runs emitting a concern exceeds ``--max-fp-concern-rate``
+  (rate-based, so the verdict doesn't depend on ``--runs``). Fixtures with a
+  ``_FP_FORBIDDEN`` entry additionally fail on a *forbidden claim* at ANY
+  severity — a provably-false statement (e.g. "imported but never used" about
+  an import every later hunk uses) is an FP even as a nit.
 - **Control fixtures** (``control_*.diff``) carry a genuine introduced defect (a
   removed ``with`` → file-handle leak). The reviewer must **still** flag them — the
   check fails if the control hit-rate drops below ``--min-control-hit-rate``. This
@@ -85,8 +90,33 @@ _CONTROL_EXPECTATIONS: dict[str, tuple[str, ...]] = {
 #: DROPS a specific fixture is caught — a "≥1 of each kind" check would let the
 #: gate silently stop covering, e.g., the echo case while still reporting green.
 _EXPECTED_FP_FIXTURES: frozenset[str] = frozenset(
-    {"fp_docstring_prose", "fp_consolidate_literals", "fp_applied_guard"}
+    {
+        "fp_docstring_prose",
+        "fp_consolidate_literals",
+        "fp_applied_guard",
+        "fp_hunk_isolation",
+    }
 )
+
+#: Forbidden-claim keywords per FP fixture, matched against findings of ANY
+#: severity (same case-insensitive matching as _CONTROL_EXPECTATIONS). The
+#: concern-rate metric alone misses factually-false claims emitted at nit /
+#: comment severity — dog_05937209's "imported but never used" FP was a nit.
+#: A finding on the fixture whose title/body names the forbidden claim is a
+#: false positive regardless of severity: the fixture is constructed so the
+#: claim is provably wrong (e.g. the import added in hunk 1 is used in every
+#: later hunk). Only fixtures with an entry get the extra check.
+_FP_FORBIDDEN: dict[str, tuple[str, ...]] = {
+    "fp_hunk_isolation": (
+        "unused",
+        "never used",
+        "not used",
+        "isn't used",
+        "unreferenced",
+        "imported but",
+        "undefined",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +128,9 @@ class FpCase:
     diff: str
     #: For control fixtures: keywords identifying the seeded defect. Empty for FP.
     expect_keywords: tuple[str, ...] = ()
+    #: For FP fixtures: keywords of the forbidden (provably false) claim, any
+    #: severity. Empty when the fixture has no forbidden-claim entry.
+    forbid_keywords: tuple[str, ...] = ()
 
 
 def load_fp_cases() -> list[FpCase]:
@@ -115,8 +148,10 @@ def load_fp_cases() -> list[FpCase]:
         if not fname.endswith(".diff"):
             continue
         name = fname[: -len(".diff")]
+        forbid: tuple[str, ...] = ()
         if fname.startswith(_FP_PREFIX):
             kind, expect = "fp", ()
+            forbid = _FP_FORBIDDEN.get(name, ())
         elif fname.startswith(_CONTROL_PREFIX):
             kind = "control"
             expect = _CONTROL_EXPECTATIONS.get(name)
@@ -135,6 +170,7 @@ def load_fp_cases() -> list[FpCase]:
                 kind=kind,
                 diff=entry.read_text(encoding="utf-8"),
                 expect_keywords=expect,
+                forbid_keywords=forbid,
             )
         )
     cases.sort(key=lambda c: (c.kind, c.name))
@@ -163,12 +199,16 @@ class CaseReport:
     runs: int
     #: Keywords identifying the seeded defect (control fixtures only).
     expect_keywords: tuple[str, ...] = ()
+    #: Forbidden-claim keywords (FP fixtures only; see _FP_FORBIDDEN).
+    forbid_keywords: tuple[str, ...] = ()
     concern_runs: int = 0  # runs that produced >=1 concern-severity finding
     concern_total: int = 0  # total concern findings across all runs
     finding_runs: int = 0  # runs that produced >=1 finding of any severity
     defect_hit_runs: int = 0  # control runs that flagged the SEEDED defect
     errored_runs: int = 0
     concern_titles: list[str] = field(default_factory=list)
+    forbidden_hit_runs: int = 0  # fp runs that emitted the forbidden claim (any severity)
+    forbidden_titles: list[str] = field(default_factory=list)
 
 
 def _finding_hits_defect(finding, keywords: tuple[str, ...]) -> bool:
@@ -202,6 +242,16 @@ def classify_run(report: CaseReport, result: ReviewResult) -> None:
         _finding_hits_defect(f, report.expect_keywords) for f in findings
     ):
         report.defect_hit_runs += 1
+    if report.kind == "fp" and report.forbid_keywords:
+        # Forbidden-claim check (dog_05937209): the fixture is constructed so
+        # this claim is provably false — emitting it at ANY severity is an FP,
+        # not just at concern. Reuses the control-keyword matcher.
+        hits = [
+            f for f in findings if _finding_hits_defect(f, report.forbid_keywords)
+        ]
+        if hits:
+            report.forbidden_hit_runs += 1
+            report.forbidden_titles.extend((f.title or "(untitled)") for f in hits)
 
 
 def evaluate(
@@ -240,6 +290,19 @@ def evaluate(
             )
             if r.concern_titles:
                 detail += f" :: {', '.join(sorted(set(r.concern_titles)))}"
+            if r.forbid_keywords:
+                # Forbidden-claim verdict shares the FP tolerance: the claim is
+                # provably false at any severity, so the same zero-tolerance
+                # default applies (rate-based, --runs-independent).
+                frate = (r.forbidden_hit_runs / scored) if scored else 1.0
+                fpassed = scored > 0 and frate <= max_fp_concern_rate
+                detail += (
+                    f"; forbidden-claim runs {r.forbidden_hit_runs}/{scored} "
+                    f"(rate {frate:.2f}, max {max_fp_concern_rate:.2f})"
+                )
+                if r.forbidden_titles:
+                    detail += f" :: {', '.join(sorted(set(r.forbidden_titles)))}"
+                passed = passed and fpassed
         else:  # control
             rate = (r.defect_hit_runs / scored) if scored else 0.0
             passed = scored > 0 and rate >= min_control_hit_rate
@@ -284,6 +347,7 @@ async def run(
             kind=case.kind,
             runs=runs,
             expect_keywords=case.expect_keywords,
+            forbid_keywords=case.forbid_keywords,
         )
         for i in range(runs):
             request = ReviewRequest(

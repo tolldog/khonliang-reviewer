@@ -477,7 +477,14 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
     "4. Evaluate the diff AS APPLIED. An added guard/check/validation/early-"
     "return IS the fix — do NOT flag it as a missing/unmet requirement or as "
     "the defect. Judge the post-diff code, not an imagined version without the "
-    "change."
+    "change.\n"
+    "5. A diff is a PARTIAL view of the files it touches. Hunks from the same "
+    "file are fragments of ONE file, and unchanged code outside the visible "
+    "hunks still exists. Never claim an import, name, or identifier is "
+    "unused, undefined, or unreferenced based on its absence from the hunks "
+    "you can see — an identifier added in one hunk is often used in another "
+    "hunk or in unchanged code between them. Only flag unused/undefined when "
+    "the full file content is visible and confirms it."
 )
 
 
