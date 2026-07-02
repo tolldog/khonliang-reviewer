@@ -42,7 +42,12 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import build_review_prompt
+from reviewer.providers._prompt import (
+    binary_questions_active,
+    build_review_prompt,
+    parse_verdicts,
+    validate_verdict_coverage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -200,12 +205,16 @@ class OllamaProvider(ReviewProvider):
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
         region_sweep = request.metadata.get("_khonliang_region_sweep") is True
+        binary_questions = (
+            request.metadata.get("_khonliang_binary_questions") is True
+        )
         prompt = build_review_prompt(
             request,
             include_schema=True,
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
             region_sweep=region_sweep,
+            binary_questions=binary_questions,
         )
         model = _resolve_model(request, self.config.default_model)
         started_wall = time.time()
@@ -771,6 +780,32 @@ def _parse_response(
         if isinstance(item, dict)
     ]
 
+    # Only opted-in pr_diff reviews surface verdicts (codex PR B R6): the
+    # lib contract documents ReviewResult.verdicts as populated only when
+    # scoring_mode='binary_questions', so an unsolicited model-emitted
+    # 'verdicts' key on a holistic review is dropped, not forwarded.
+    verdicts = (
+        parse_verdicts(payload) if binary_questions_active(request) else []
+    )
+    # Ollama has no transport-level schema enforcement — the schema is prompt
+    # text — so in binary-questions mode the model can omit or underfill
+    # ``verdicts`` and the review would silently degrade to a holistic shape
+    # (codex PR B R5). Enforce the fixed-dimensions contract here: incomplete
+    # coverage is the same class as unparseable JSON — the model failed the
+    # response contract.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"ollama response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                response=response,
+            )
+
     usage = _build_usage(
         response,
         request=request,
@@ -784,6 +819,7 @@ def _parse_response(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=OllamaProvider.name,

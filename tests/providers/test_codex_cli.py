@@ -22,6 +22,7 @@ from reviewer.providers.codex_cli import (
     CodexCliProvider,
     CodexCliProviderConfig,
 )
+from reviewer.providers._prompt import review_response_schema
 
 
 SUCCESS_PAYLOAD: dict[str, Any] = {
@@ -160,6 +161,58 @@ async def test_success_payload_produces_posted_review(monkeypatch):
     assert not any("diff --git" in part for part in argv)
     assert proc.stdin_received is not None
     assert b"diff --git" in proc.stdin_received
+
+
+async def test_binary_questions_materializes_verdicts_schema_for_pr_diff(monkeypatch):
+    """binary_questions on a pr_diff review materializes the verdicts-carrying
+    output-schema and passes it via --output-schema."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    provider = CodexCliProvider()
+
+    request = _make_request(metadata={"_khonliang_binary_questions": True})
+    try:
+        await provider.review(request)
+        argv = calls[0]
+        schema_path = argv[argv.index("--output-schema") + 1]
+        with open(schema_path) as f:
+            emitted = json.load(f)
+        assert "verdicts" in emitted["properties"]
+        assert emitted["required"] == ["summary", "verdicts"]
+    finally:
+        for p in provider._schema_paths.values():
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+async def test_binary_questions_schema_gated_off_for_non_pr_diff(monkeypatch):
+    """Schema gate mirrors the instruction gate: binary_questions on a non-pr_diff
+    kind materializes the holistic (no-verdicts) schema. codex PR B review P2."""
+    proc = _FakeProc(stdout=json.dumps(SUCCESS_PAYLOAD).encode())
+    calls = _install_fake_proc(monkeypatch, proc)
+    provider = CodexCliProvider()
+
+    request = _make_request(
+        kind="spec",
+        content="# Spec\n\nbody",
+        metadata={"_khonliang_binary_questions": True},
+    )
+    try:
+        await provider.review(request)
+        argv = calls[0]
+        schema_path = argv[argv.index("--output-schema") + 1]
+        with open(schema_path) as f:
+            emitted = json.load(f)
+        assert "verdicts" not in emitted["properties"]
+        assert emitted["required"] == ["summary"]
+    finally:
+        for p in provider._schema_paths.values():
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 async def test_request_model_overrides_default(monkeypatch):
@@ -496,7 +549,7 @@ def test_schema_file_lazy_init_writes_on_first_use():
     """Schema path is None at construction; first access materializes the file."""
     provider = CodexCliProvider()
     # Eager-init regression guard: __init__ must NOT touch the disk.
-    assert provider._schema_path is None
+    assert provider._schema_paths == {}
     path = provider._get_schema_path()
     try:
         assert os.path.isfile(path)
@@ -504,7 +557,8 @@ def test_schema_file_lazy_init_writes_on_first_use():
         assert provider._get_schema_path() == path
         with open(path) as f:
             loaded = json.load(f)
-        assert loaded == codex_cli.REVIEW_RESPONSE_SCHEMA
+        # Holistic (default) mode materializes the pre-FR schema.
+        assert loaded == review_response_schema(False)
         finding_props = loaded["properties"]["findings"]["items"]["properties"]
         assert finding_props["severity"]["enum"] == ["nit", "comment", "concern"]
     finally:
@@ -539,7 +593,7 @@ async def test_schema_materialization_oserror_yields_errored_result(monkeypatch)
     """A tempfile/disk failure during lazy schema init should not crash review()."""
     provider = CodexCliProvider()
 
-    def fail_materialize() -> str:
+    def fail_materialize(binary_questions: bool = False) -> str:
         raise OSError("No space left on device")
 
     monkeypatch.setattr(provider, "_get_schema_path", fail_materialize)

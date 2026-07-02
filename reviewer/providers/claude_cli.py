@@ -34,7 +34,14 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
+from reviewer.providers._prompt import (
+    REVIEW_RESPONSE_SCHEMA,
+    binary_questions_active,
+    build_review_prompt,
+    parse_verdicts,
+    review_response_schema,
+    validate_verdict_coverage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -143,12 +150,16 @@ class ClaudeCliProvider(ReviewProvider):
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
         region_sweep = request.metadata.get("_khonliang_region_sweep") is True
+        binary_questions = (
+            request.metadata.get("_khonliang_binary_questions") is True
+        )
         prompt = build_review_prompt(
             request,
             include_schema=False,
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
             region_sweep=region_sweep,
+            binary_questions=binary_questions,
         )
         started_wall = time.time()
         started_mono = time.monotonic()
@@ -179,7 +190,15 @@ class ClaudeCliProvider(ReviewProvider):
             "-p",
             "--output-format=json",
             "--json-schema",
-            json.dumps(REVIEW_RESPONSE_SCHEMA),
+            # Gate the verdicts schema to pr_diff — same gate as the
+            # binary-questions instruction in build_review_prompt (codex PR B
+            # review P2), so a non-diff kind never gets a verdicts schema it
+            # was never instructed for.
+            json.dumps(
+                review_response_schema(
+                    binary_questions and request.kind == "pr_diff"
+                )
+            ),
             "--permission-mode",
             "dontAsk",
         ]
@@ -398,6 +417,30 @@ def _parse_envelope(
         if isinstance(item, dict)
     ]
 
+    # Only opted-in pr_diff reviews surface verdicts (codex PR B R6): the
+    # lib contract documents ReviewResult.verdicts as populated only when
+    # scoring_mode='binary_questions', so an unsolicited model-emitted
+    # 'verdicts' key on a holistic review is dropped, not forwarded.
+    verdicts = (
+        parse_verdicts(payload) if binary_questions_active(request) else []
+    )
+    # The --json-schema variant already pins the item count + dimension enum,
+    # but JSON Schema can't express "each dimension exactly once" — six copies
+    # of one dimension still validate. Enforce full coverage at parse time
+    # (codex PR B R5): incomplete coverage is a response-contract failure,
+    # same class as unparseable JSON.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"claude -p response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+                envelope=envelope,
+            )
+
     usage = _build_usage(
         envelope,
         request=request,
@@ -411,6 +454,7 @@ def _parse_envelope(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=ClaudeCliProvider.name,

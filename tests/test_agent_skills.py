@@ -4798,6 +4798,113 @@ async def test_evaluator_hot_drops_findings_evaluator_marks_false_positive():
     assert len(fake.requests) == 2
 
 
+async def test_evaluator_hot_preserves_binary_verdicts():
+    """evaluator_hot filters *findings*, not verdicts — the reviewed result's
+    per-dimension verdicts must survive into the final response
+    (fr_khonliang-reviewer_a585ea3d, codex PR B review P2). Single-result path,
+    so the source is unambiguous."""
+    from khonliang_reviewer import Verdict
+
+    keep = _consensus_finding(title="real concern", line=10)
+    reviewed = _consensus_result([keep])
+    reviewed.verdicts = [
+        Verdict(
+            dimension="correctness",
+            question="Is it correct?",
+            answer=True,
+            explanation="yes",
+        )
+    ]
+    fake = _ScriptedProvider(
+        "ollama",
+        [reviewed, _evaluator_result([keep])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "evaluator_hot": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert "verdicts" in out
+    assert len(out["verdicts"]) == 1
+    assert out["verdicts"][0]["dimension"] == "correctness"
+    assert out["verdicts"][0]["answer"] is True
+    # codex PR B R3 P2: the evaluator call is a findings-filter pass — it must
+    # NOT inherit the binary-questions flag, which would force the
+    # verdicts-REQUIRED schema on it; a model that (correctly) returns only
+    # findings would then error the evaluator and fail open, silently
+    # disabling FP filtering. The review call carries the flag; the evaluator
+    # call must not.
+    assert len(fake.requests) == 2
+    assert fake.requests[0].metadata.get("_khonliang_binary_questions") is True
+    assert "_khonliang_binary_questions" not in fake.requests[1].metadata
+
+
+async def test_binary_questions_with_consensus_rejected():
+    """codex PR B R3 P1: consensus consolidation would silently drop every
+    run's verdicts, so the combination is rejected up-front with a structured
+    error (no provider call, no tokens spent) until PR C lands cross-run
+    verdict reconciliation."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "scoring_mode": "binary_questions",
+            "consensus_runs": 3,
+            "consensus_min": 2,
+        },
+    )
+
+    assert "error" in out
+    assert "binary_questions" in out["error"]
+    assert "consensus" in out["error"]
+    assert fake.last_request is None  # rejected before any provider call
+
+    # Sanity: holistic consensus and single-run binary_questions both remain valid
+    ok = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+    assert "error" not in ok or not ok["error"]
+
+
+async def test_binary_questions_consensus_allowed_for_non_diff_kinds():
+    """codex PR B R4 P2: binary_questions is a no-op for kind != pr_diff (no
+    prompt section, no verdicts schema), so the consensus rejection must not
+    fire there — a caller that sets scoring_mode globally keeps consensus
+    working on doc reviews."""
+    f = _consensus_finding()
+    fake = _ScriptedProvider(
+        "ollama",
+        [_consensus_result([f]), _consensus_result([f]), _consensus_result([f])],
+    )
+    harness = _make_harness({"ollama": fake})
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "doc",
+            "content": "some prose",
+            "scoring_mode": "binary_questions",
+            "consensus_runs": 3,
+            "consensus_min": 1,
+        },
+    )
+
+    assert not out.get("error")
+    assert len(fake.requests) == 3  # consensus actually ran
+
+
 async def test_evaluator_hot_threads_findings_into_evaluator_instructions():
     """The evaluator request carries the candidate findings inside
     ``instructions`` (JSON-dumped) so the evaluator can reason about
@@ -5782,3 +5889,147 @@ async def test_region_sweep_non_bool_reads_as_off():
 
     assert fake.last_request is not None
     assert "_khonliang_region_sweep" not in fake.last_request.metadata
+
+
+# ---------------------------------------------------------------------------
+# scoring_mode / binary_questions (fr_khonliang-reviewer_a585ea3d)
+# ---------------------------------------------------------------------------
+
+
+def test_scoring_mode_declared_on_review_text_and_diff_schemas():
+    """The opt-in ``scoring_mode`` string is declared (optional, default
+    'holistic') on both review_text and review_diff so bus schema discovery
+    surfaces it."""
+    harness = _make_harness()
+    for skill_name in ("review_text", "review_diff"):
+        s = next(sk for sk in harness.skills if sk.name == skill_name)
+        assert "scoring_mode" in s.parameters, skill_name
+        assert s.parameters["scoring_mode"]["type"] == "string", skill_name
+        assert s.parameters["scoring_mode"].get("default") == "holistic", skill_name
+        assert s.parameters["scoring_mode"].get("required", False) is False
+
+
+async def test_review_text_binary_questions_threads_reserved_metadata():
+    """``scoring_mode='binary_questions'`` lands on the request's reserved
+    passthrough metadata key so providers reach build_review_prompt +
+    review_response_schema with the flag on."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_binary_questions") is True
+
+
+async def test_review_text_holistic_omits_reserved_metadata():
+    """Default (holistic) leaves the reserved key off entirely — conditional-
+    forward, so the holistic path is byte-identical to today."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call("review_text", {"kind": "pr_diff", "content": "x"})
+
+    assert fake.last_request is not None
+    assert "_khonliang_binary_questions" not in fake.last_request.metadata
+
+
+async def test_review_diff_binary_questions_threads_through_forward():
+    """review_diff forwards ``scoring_mode`` to handle_review_text, so the
+    reserved metadata key lands on the request from the diff shortcut too."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    await harness.call(
+        "review_diff",
+        {"diff": "diff body", "scoring_mode": "binary_questions"},
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("_khonliang_binary_questions") is True
+
+
+async def test_unknown_scoring_mode_returns_error_before_provider_call():
+    """An unknown ``scoring_mode`` surfaces a structured error and never
+    reaches the provider (mirrors audience validation)."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "bogus"},
+    )
+
+    assert "error" in result
+    assert "scoring_mode" in result["error"]
+    assert fake.last_request is None
+
+
+async def test_binary_questions_end_to_end_verdicts_and_score():
+    """Integration: a provider returning a verdicts-bearing result surfaces
+    those verdicts through the distill pipeline into the skill response, and
+    an overall score is derivable via score_verdicts."""
+    from khonliang_reviewer import Verdict
+
+    from reviewer.providers._prompt import (
+        BINARY_QUESTION_DIMENSIONS,
+        parse_verdicts,
+        score_verdicts,
+    )
+
+    # Model-shaped payload the provider would parse: one verdict per active
+    # dimension. Round-trip through parse_verdicts so the fake mirrors real
+    # provider construction.
+    payload = {
+        "summary": "reviewed",
+        "verdicts": [
+            {
+                "dimension": dimension,
+                "question": question,
+                "answer": i % 2 == 0,  # alternate true/false for a mixed score
+                "explanation": f"because {dimension}",
+            }
+            for i, (dimension, question) in enumerate(BINARY_QUESTION_DIMENSIONS)
+        ],
+    }
+    verdicts = parse_verdicts(payload)
+    assert len(verdicts) == len(BINARY_QUESTION_DIMENSIONS)
+
+    result = _make_result(backend="ollama", model="qwen2.5-coder:14b")
+    result.verdicts = verdicts
+    result.summary = "reviewed"
+    fake = _RecordingProvider("ollama", result)
+    harness = _make_harness({"ollama": fake})
+
+    response = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "x", "scoring_mode": "binary_questions"},
+    )
+
+    # The skill response dict (post-distill, post-serialize) carries verdicts.
+    assert "verdicts" in response
+    assert len(response["verdicts"]) == len(BINARY_QUESTION_DIMENSIONS)
+    first = response["verdicts"][0]
+    assert set(first) >= {"dimension", "question", "answer", "explanation"}
+    assert isinstance(first["answer"], bool)
+
+    # At least one verdict per active dimension.
+    dims = {v["dimension"] for v in response["verdicts"]}
+    assert dims == {d for d, _ in BINARY_QUESTION_DIMENSIONS}
+
+    # Overall score is derivable from the returned verdicts.
+    rebuilt = [
+        Verdict(
+            dimension=v["dimension"],
+            question=v["question"],
+            answer=v["answer"],
+            explanation=v["explanation"],
+        )
+        for v in response["verdicts"]
+    ]
+    scores = score_verdicts(rebuilt)
+    assert "overall" in scores
+    assert 0.0 <= scores["overall"] <= 1.0

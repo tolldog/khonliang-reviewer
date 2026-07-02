@@ -36,7 +36,13 @@ from khonliang_reviewer import (
     UsageEvent,
 )
 
-from reviewer.providers._prompt import REVIEW_RESPONSE_SCHEMA, build_review_prompt
+from reviewer.providers._prompt import (
+    binary_questions_active,
+    build_review_prompt,
+    parse_verdicts,
+    review_response_schema,
+    validate_verdict_coverage,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -52,8 +58,8 @@ class CodexCliAuthError(RuntimeError):
     """
 
 
-def _materialize_schema_file() -> str:
-    """Materialize REVIEW_RESPONSE_SCHEMA to a fresh tempfile and return its path.
+def _materialize_schema_file(schema: dict[str, Any]) -> str:
+    """Materialize ``schema`` to a fresh tempfile and return its path.
 
     Uses :func:`tempfile.mkstemp` so the file is created with ``O_EXCL``
     (no clobber of a hostile pre-existing path) and an unpredictable
@@ -74,7 +80,7 @@ def _materialize_schema_file() -> str:
         prefix="khonliang_codex_review_schema_", suffix=".json"
     )
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(REVIEW_RESPONSE_SCHEMA, f)
+        json.dump(schema, f)
     return path
 
 
@@ -114,13 +120,23 @@ class CodexCliProvider(ReviewProvider):
         # earlier shape; Copilot flagged it as a bus-wide single point of
         # failure for any deployment that wires codex_cli into the default
         # selector but never actually calls it.
-        self._schema_path: str | None = None
+        # Two lazily-materialized schema files, keyed by scoring mode. The
+        # provider instance is reused across requests and ``binary_questions``
+        # is per-request, so the holistic and binary-questions schemas each
+        # get their own cached path (materialized at most once). ``False`` =>
+        # holistic (the pre-FR schema); ``True`` => the verdicts-carrying
+        # variant.
+        self._schema_paths: dict[bool, str] = {}
 
-    def _get_schema_path(self) -> str:
-        """Return the on-disk schema path, materializing it on first use."""
-        if self._schema_path is None:
-            self._schema_path = _materialize_schema_file()
-        return self._schema_path
+    def _get_schema_path(self, binary_questions: bool = False) -> str:
+        """Return the on-disk schema path for the mode, materializing on first use."""
+        path = self._schema_paths.get(binary_questions)
+        if path is None:
+            path = _materialize_schema_file(
+                review_response_schema(binary_questions)
+            )
+            self._schema_paths[binary_questions] = path
+        return path
 
     async def healthcheck(self) -> None:
         """Verify the CLI is authenticated. Intended for agent boot.
@@ -196,6 +212,9 @@ class CodexCliProvider(ReviewProvider):
         repo_prompts = request.metadata.get("_khonliang_repo_prompts")
         example_format = request.metadata.get("_khonliang_example_format")
         region_sweep = request.metadata.get("_khonliang_region_sweep") is True
+        binary_questions = (
+            request.metadata.get("_khonliang_binary_questions") is True
+        )
         # ``--output-schema`` enforces the response shape externally —
         # mirrors claude_cli's ``--json-schema`` arrangement, so the
         # prompt body does not need to carry the schema.
@@ -205,6 +224,7 @@ class CodexCliProvider(ReviewProvider):
             repo_prompts=repo_prompts,
             example_format=example_format if isinstance(example_format, str) else None,
             region_sweep=region_sweep,
+            binary_questions=binary_questions,
         )
         started_wall = time.time()
         started_mono = time.monotonic()
@@ -221,7 +241,12 @@ class CodexCliProvider(ReviewProvider):
         # produces. Categorized as ``backend_error`` — the codex
         # binary isn't the problem; the local environment is.
         try:
-            schema_path = self._get_schema_path()
+            # Gate the verdicts schema to pr_diff — same gate as the
+            # binary-questions instruction in build_review_prompt (codex PR B
+            # review P2). The bool-keyed schema-file cache still holds.
+            schema_path = self._get_schema_path(
+                binary_questions and request.kind == "pr_diff"
+            )
         except OSError as exc:
             return _errored(
                 request,
@@ -447,6 +472,29 @@ def _parse_payload(
         if isinstance(item, dict)
     ]
 
+    # Only opted-in pr_diff reviews surface verdicts (codex PR B R6): the
+    # lib contract documents ReviewResult.verdicts as populated only when
+    # scoring_mode='binary_questions', so an unsolicited model-emitted
+    # 'verdicts' key on a holistic review is dropped, not forwarded.
+    verdicts = (
+        parse_verdicts(payload) if binary_questions_active(request) else []
+    )
+    # --output-schema pins count + dimension enum, but JSON Schema can't
+    # express "each dimension exactly once" (duplicates within the count still
+    # validate). Enforce full coverage at parse time (codex PR B R5) — a
+    # response-contract failure, same class as unparseable JSON.
+    if binary_questions_active(request):
+        coverage_error = validate_verdict_coverage(verdicts)
+        if coverage_error is not None:
+            return _errored(
+                request,
+                error=f"codex exec response failed binary-questions contract: {coverage_error}",
+                error_category="malformed_envelope",
+                model=model,
+                started_wall=started_wall,
+                duration_ms=duration_ms,
+            )
+
     usage = _build_usage(
         request=request,
         model=model,
@@ -459,6 +507,7 @@ def _parse_payload(
         request_id=request.request_id,
         summary=summary,
         findings=findings,
+        verdicts=verdicts,
         disposition="posted",
         usage=usage,
         backend=CodexCliProvider.name,
