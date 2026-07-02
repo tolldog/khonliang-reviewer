@@ -477,7 +477,18 @@ _REVIEW_DISCIPLINE_INSTRUCTION = (
     "4. Evaluate the diff AS APPLIED. An added guard/check/validation/early-"
     "return IS the fix — do NOT flag it as a missing/unmet requirement or as "
     "the defect. Judge the post-diff code, not an imagined version without the "
-    "change.\n"
+    "change."
+)
+
+
+#: Clause 5 of the review discipline, rendered ONLY for ``kind == "pr_diff"``
+#: (codex P2 on PR #71: same diff-only gate as region-sweep / binary-questions
+#: / doc-hunk routing). ``doc`` and ``pr_description`` reviews receive the
+#: COMPLETE text under review, so framing the input as a partial view there
+#: would wrongly license the model to assume unseen content and suppress
+#: legitimate unused/undefined findings on a whole file. Hunk isolation
+#: (dog_05937209) is a diff-shaped failure mode; the clause stays diff-scoped.
+_PARTIAL_VIEW_CLAUSE = (
     "5. A diff is a PARTIAL view of the files it touches. Hunks from the same "
     "file are fragments of ONE file, and unchanged code outside the visible "
     "hunks still exists. Never claim an import, name, or identifier is "
@@ -707,7 +718,16 @@ def build_review_prompt(
     # wording would otherwise bias the model against). NB: `fr` runs on the hot
     # tier too, but it is rubric-governed, so the rubric is its calibration.
     if request.kind not in _ARTIFACT_KINDS:
-        lines += [_REVIEW_DISCIPLINE_INSTRUCTION, ""]
+        if request.kind == "pr_diff":
+            # Clause 5 (partial-view, dog_05937209) is diff-only: doc /
+            # pr_description reviews see the complete text, so the partial-
+            # view framing would misdescribe their input (codex P2, PR #71).
+            lines += [
+                _REVIEW_DISCIPLINE_INSTRUCTION + "\n" + _PARTIAL_VIEW_CLAUSE,
+                "",
+            ]
+        else:
+            lines += [_REVIEW_DISCIPLINE_INSTRUCTION, ""]
         # Concrete anti-examples (fr_reviewer_ff923ebf b) reinforce the prose
         # discipline above by showing the exact false-positive shapes to avoid.
         # Same scope as the discipline (rubric-less hot-tier kinds); artifacts
