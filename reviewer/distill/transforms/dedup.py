@@ -137,6 +137,16 @@ def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
     one deliberate exclusion — the same text re-emitted at a
     different severity is still one finding, and ``_bumped`` keeps
     the highest severity on the survivor.
+
+    Two findings that are byte-identical in EVERY content field —
+    including all-``None`` locations — DO merge, by design. This is
+    the dog_fa0e1a48 shape itself (hot-tier models emit unanchored
+    descriptive nits, repeated verbatim), so exempting locationless
+    findings would un-fix the bug this default exists for. Even when
+    a model "meant" two different spots, a second copy with zero
+    distinguishing content is not separately actionable by any
+    consumer; the repeat count stays auditable on
+    ``dropped_findings``.
     """
     return (
         a.title == b.title
