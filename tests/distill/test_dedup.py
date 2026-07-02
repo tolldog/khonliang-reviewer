@@ -95,6 +95,29 @@ def test_exact_keeps_same_text_at_different_locations():
     assert out is result
 
 
+def test_exact_keeps_copy_carrying_a_suggestion():
+    """A copy that differs in ``suggestion`` or ``category`` is not a
+    pure repeat (PR #70 codex P1): merging it away would drop the
+    concrete suggested fix from GitHub-comment rendering and from
+    ``sign_off_trailer``'s actionability check. Both survive.
+    """
+    plain = _f("concern", "Race in handler", "Lock is taken too late.")
+    with_fix = ReviewFinding(
+        severity="concern",
+        title="Race in handler",
+        body="Lock is taken too late.",
+        suggestion="with self._lock:\n    self._start(agent_id)",
+    )
+    other_category = ReviewFinding(
+        severity="concern",
+        title="Race in handler",
+        body="Lock is taken too late.",
+        category="concurrency",
+    )
+    out = apply_dedup(_result(plain, with_fix, other_category), DistillConfig(dedup="exact"))
+    assert len(out.findings) == 3
+
+
 def test_exact_is_the_default_and_records_drops():
     """The dog_fa0e1a48 shape: one diff, the same byte-identical
     descriptive nit emitted 5 times. The default config (no explicit

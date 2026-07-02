@@ -10,12 +10,14 @@ Strategies, mapped from ``DistillConfig.dedup``:
 
 - ``none``: pass-through. Opt-out for callers that need the raw
   emission stream (e.g. measuring a model's duplicate-emission rate).
-- ``exact``: identical ``(title, body, path, line, section)`` tuple,
-  case-sensitive. Catches literal repeats from a model that emitted
-  the same finding several times in one response (dog_fa0e1a48 saw 5
-  byte-identical copies of one nit). Location is part of the key on
-  purpose: two findings with identical terse text on *different*
-  files/lines are distinct observations, not repeats. This is the
+- ``exact``: byte-identical repeat — every content field matches
+  (``title``, ``body``, ``path``, ``line``, ``section``, ``category``,
+  ``suggestion``; only ``severity`` is excluded, see ``_bumped``).
+  Catches literal repeats from a model that emitted the same finding
+  several times in one response (dog_fa0e1a48 saw 5 byte-identical
+  copies of one nit). Two findings that differ in ANY content field —
+  same text on different lines, same text with/without a concrete
+  suggestion — are distinct observations, not repeats. This is the
   ``DistillConfig.dedup`` default — safe because the collapsed
   duplicates land on ``dropped_findings``, so nothing drops silently.
 - ``title_substring``: one finding's title appears as a substring of
@@ -123,14 +125,18 @@ def _merge(
 
 
 def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
-    """Byte-identical text at the same location.
+    """Byte-identical repeat: every content field matches.
 
-    Location (``path``, ``line``, ``section``) is part of the key:
+    Location (``path``, ``line``, ``section``) is part of the key —
     identical terse text anchored to different files/lines is two
-    distinct observations. ``severity`` is deliberately NOT part of
-    the key — the same text re-emitted at a different severity is
-    still one finding, and ``_bumped`` keeps the highest severity on
-    the survivor.
+    distinct observations. So are ``category`` and ``suggestion``:
+    a copy that carries a concrete suggestion block (or a different
+    category label) is not a pure repeat, and merging it away would
+    drop the suggested fix from GitHub-comment rendering and from
+    ``sign_off_trailer``'s actionability check. ``severity`` is the
+    one deliberate exclusion — the same text re-emitted at a
+    different severity is still one finding, and ``_bumped`` keeps
+    the highest severity on the survivor.
     """
     return (
         a.title == b.title
@@ -138,6 +144,8 @@ def _is_exact_duplicate(a: ReviewFinding, b: ReviewFinding) -> bool:
         and a.path == b.path
         and a.line == b.line
         and a.section == b.section
+        and a.category == b.category
+        and a.suggestion == b.suggestion
     )
 
 
