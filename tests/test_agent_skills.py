@@ -6704,3 +6704,52 @@ async def test_operator_default_provider_opts_out_of_resident_tier(tmp_path):
     assert result["disposition"] == "posted"
     assert ollama.last_request is not None
     assert tabby.last_request is None
+
+
+def test_default_selector_pairs_model_with_configured_backend(tmp_path):
+    """codex round-4 P1: default_provider=ollama with default_model unset
+    must NOT pair ollama with the TabbyAPI-only DEFAULT_REVIEWER_MODEL —
+    the selector's empty-string sentinel lets ollama apply its own
+    provider default instead."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.config.default_backend == "ollama"
+    assert selector.config.default_model == ""
+
+
+async def test_opt_out_reroute_honors_per_backend_default_models(tmp_path):
+    """codex round-4 P2: the opt-out reroute resolves through the
+    selector's default-model rules, so default_models.ollama is honored
+    rather than skipped straight to the provider-level default."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    tabby = _RecordingProvider("tabbyapi", _make_result(backend="tabbyapi"))
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    selector = ProviderSelector(
+        {"tabbyapi": tabby, "ollama": ollama},
+        SelectorConfig(
+            default_backend="tabbyapi",
+            default_model="Qwen3-14B-exl3-6bpw",
+            default_models={"ollama": "glm-4.7-flash"},
+        ),
+    )
+    harness = AgentTestHarness(
+        ReviewerAgent,
+        config_path=str(config_path),
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+    assert ollama.last_request.metadata["model"] == "glm-4.7-flash"

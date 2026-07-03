@@ -2054,8 +2054,14 @@ class ReviewerAgent(BaseAgent):
                         and configured != "tabbyapi"
                         and configured in selector.providers
                     ):
+                        # model=None (not ""): fall through the selector's
+                        # default-resolution rules so a configured
+                        # ``default_models[<backend>]`` / paired
+                        # ``default_model`` is honored on the reroute
+                        # (codex round-4 P2); "" would skip straight to
+                        # the provider-level default.
                         provider, chosen_model = selector.select(
-                            backend=configured, model=""
+                            backend=configured, model=None
                         )
                         selection_reason += (
                             f" → operator default_provider={configured}"
@@ -2078,8 +2084,10 @@ class ReviewerAgent(BaseAgent):
                     and "ollama" in selector.providers
                     and not await provider.is_available()
                 ):
+                    # model=None for the same selector-default fall-through
+                    # as the opt-out branch above (codex round-4 P2).
                     provider, chosen_model = selector.select(
-                        backend="ollama", model=""
+                        backend="ollama", model=None
                     )
                     selection_reason += (
                         " → degraded to ollama (tabbyapi unavailable)"
@@ -4171,13 +4179,25 @@ class ReviewerAgent(BaseAgent):
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()
+        resolved_backend = str(
+            config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
+        )
+        # ``default_model`` is PAIRED with ``default_backend`` (the
+        # selector only consults it when the chosen backend matches).
+        # Fill the constant only when the resolved backend is the
+        # constant's own backend — an operator who sets
+        # ``default_provider: ollama`` without a model must get ollama's
+        # provider-level default, not the TabbyAPI-only model id
+        # (codex round-4 P1). Empty string is the selector's
+        # "let the provider decide" sentinel.
+        configured_model = str(config.get("default_model") or "")
+        if not configured_model and resolved_backend == DEFAULT_REVIEWER_BACKEND:
+            configured_model = DEFAULT_REVIEWER_MODEL
         return ProviderSelector(
             self._ensure_registry().providers,
             SelectorConfig(
-                default_backend=str(
-                    config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
-                ),
-                default_model=str(config.get("default_model") or DEFAULT_REVIEWER_MODEL),
+                default_backend=resolved_backend,
+                default_model=configured_model,
                 default_models=_coerce_default_models(config.get("default_models")),
             ),
         )
