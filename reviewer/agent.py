@@ -2037,26 +2037,29 @@ class ReviewerAgent(BaseAgent):
                     backend=decision.backend, model=decision.model
                 )
                 selection_reason = f"rule-table: {decision.reason}"
-                # Graceful degrade for boxes without the resident engine
-                # (codex P1 on the fr_0e7ccff1 PR): a rule-table decision
-                # for an UNPROVISIONED tabbyapi (no key discoverable → no
-                # engine on this host) would deterministically fail every
-                # default-routed review with ``auth_not_provisioned``.
-                # Re-route to the ollama tier that used to serve these
-                # reviews. Scoped to the rule-table branch only — a caller
-                # who explicitly pins ``backend=tabbyapi`` gets the honest
-                # auth error, not a silent substitution.
+                # Graceful degrade when the resident engine can't serve
+                # (codex round-1/round-2 P1s on the fr_0e7ccff1 PR): a
+                # rule-table decision for a tabbyapi that is UNPROVISIONED
+                # (no key discoverable → no engine on this host) or
+                # UNAVAILABLE (key present but the service is stopped /
+                # unreachable) would deterministically fail every
+                # default-routed review. Re-route to the ollama tier that
+                # used to serve these reviews. The availability probe is a
+                # ~1-2ms loopback GET against the engine's unauthenticated
+                # /health route. Scoped to the rule-table branch only — a
+                # caller who explicitly pins ``backend=tabbyapi`` gets the
+                # honest error, not a silent substitution.
                 if (
                     getattr(provider, "name", "") == "tabbyapi"
-                    and hasattr(provider, "is_provisioned")
-                    and not provider.is_provisioned()
+                    and hasattr(provider, "is_available")
                     and "ollama" in selector.providers
+                    and not await provider.is_available()
                 ):
                     provider, chosen_model = selector.select(
                         backend="ollama", model=""
                     )
                     selection_reason += (
-                        " → degraded to ollama (tabbyapi unprovisioned)"
+                        " → degraded to ollama (tabbyapi unavailable)"
                     )
         except UnknownBackendError as exc:
             return {"error": str(exc)}

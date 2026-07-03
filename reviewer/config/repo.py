@@ -97,6 +97,13 @@ _VENDOR_DEFAULT_STEM = "_default"
 # ``ollama/`` is the natural place to key them.
 _PROVIDER_TO_VENDOR: dict[str, str] = {
     "claude_cli": "anthropic",
+    # The resident TabbyAPI engine serves the same locally-hosted
+    # open-weight family the ollama transport did; repo-side local-tier
+    # overrides are documented under ``.reviewer/models/ollama/``, and
+    # the fr_0e7ccff1 backend consolidation must not silently orphan
+    # them (codex round-2 P2). Renaming the local vendor dir to
+    # something transport-neutral is a possible follow-up.
+    "tabbyapi": "ollama",
 }
 
 

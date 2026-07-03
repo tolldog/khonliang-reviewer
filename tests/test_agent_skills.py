@@ -6621,6 +6621,33 @@ async def test_rule_table_tabbyapi_unprovisioned_degrades_to_ollama():
     assert ollama.last_request is not None
 
 
+async def test_rule_table_tabbyapi_engine_down_degrades_to_ollama():
+    """codex round-2 P1: a resolvable key with a STOPPED engine (health
+    probe fails) degrades exactly like a keyless box — the ollama tier
+    serves the default-routed review instead of a guaranteed
+    backend_error."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    class _DownClient:
+        async def get(self, url, *, timeout=None, headers=None):
+            import httpx
+
+            raise httpx.ConnectError("connection refused")
+
+    down_tabby = TabbyAPIProvider(
+        TabbyAPIProviderConfig(api_key="valid-key"), http_client=_DownClient()
+    )
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": down_tabby})
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+
+
 async def test_caller_pinned_tabbyapi_unprovisioned_stays_honest_error():
     """An EXPLICIT backend=tabbyapi pin must NOT silently substitute a
     different backend — the caller asked for tabbyapi and gets the honest

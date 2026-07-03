@@ -462,3 +462,24 @@ def test_is_provisioned_reflects_key_resolvability():
         api_key_provider=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert failing.is_provisioned() is False
+
+
+async def test_is_available_true_when_health_answers():
+    client = _FakeHttpClient(
+        get_response=_FakeResponse(json_data={"status": "healthy"}, request_method="GET")
+    )
+    provider = _provider(client)
+    assert await provider.is_available() is True
+
+
+async def test_is_available_false_when_engine_down():
+    client = _FakeHttpClient(get_raises=httpx.ConnectError("refused"))
+    provider = _provider(client)
+    assert await provider.is_available() is False
+
+
+async def test_is_available_false_when_keyless_without_probe():
+    # Keyless short-circuits BEFORE the HTTP probe — no engine to ask.
+    client = _FakeHttpClient(get_raises=AssertionError("must not probe"))
+    provider = TabbyAPIProvider(TabbyAPIProviderConfig(), http_client=client)
+    assert await provider.is_available() is False
