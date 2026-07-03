@@ -127,3 +127,17 @@ pricing:
     output_per_mtoken_usd: 0.0
     source_url: https://github.com/features/copilot
     as_of: "2026-04-25"
+
+  # -----------------------------------------------------------------
+  # tabbyapi — the box's resident local GPU engine (ExLlamaV3). Zero
+  # marginal cost per call; rows exist so list_models surfaces the
+  # loaded model and the pricing layer records an explicit 0 rather
+  # than "unknown backend". The model id is whatever TabbyAPI reports
+  # for its loaded quant — update alongside the engine's config.yml.
+  # -----------------------------------------------------------------
+  - backend: tabbyapi
+    model: Qwen3-14B-exl3-6bpw
+    input_per_mtoken_usd: 0.0
+    output_per_mtoken_usd: 0.0
+    source_url: https://github.com/theroyallab/tabbyAPI
+    as_of: "2026-07-02"

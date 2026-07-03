@@ -14,7 +14,7 @@ from reviewer.rules import (
     Rule,
     decide,
 )
-from reviewer.selector import DEFAULT_REVIEWER_MODEL
+from reviewer.selector import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -25,12 +25,10 @@ from reviewer.selector import DEFAULT_REVIEWER_MODEL
 def test_empty_input_hits_fallback():
     decision = decide(PolicyInput())
     assert decision == DEFAULT_FALLBACK
-    assert decision.backend == "ollama"
-    # Fallback tracks ``DEFAULT_REVIEWER_MODEL`` so a swap there shifts
-    # both the SelectorConfig fallback and the rule-table fallback in
-    # one edit. Asserting the constant (not a literal) keeps this test
-    # honest after future promotions.
-    assert decision.model == DEFAULT_REVIEWER_MODEL
+    assert decision.backend == DEFAULT_REVIEWER_BACKEND
+    # Empty sentinel — the resident tier's model id is box-specific and
+    # resolves through the provider default chain (codex round-5).
+    assert decision.model == FAST_TIER_MODEL == ""
 
 
 def test_small_code_diff_hits_fallback():
@@ -38,12 +36,14 @@ def test_small_code_diff_hits_fallback():
     assert decision == DEFAULT_FALLBACK
 
 
-def test_docs_kind_routes_to_qwen_small():
+def test_docs_kind_routes_to_resident_small():
     # fr stays a cheap seed-phase pass; spec/milestone now route to claude.
+    # Since the fr_0e7ccff1 consolidation the cheap local tier IS the
+    # resident GPU model — same model as the fast tier, smaller ctx floor.
     for kind in ("doc", "fr", "pr_description"):
         decision = decide(PolicyInput(kind=kind, diff_line_count=20))
-        assert decision.backend == "ollama"
-        assert decision.model == "qwen2.5-coder:14b"
+        assert decision.backend == DEFAULT_REVIEWER_BACKEND
+        assert decision.model == FAST_TIER_MODEL
         assert decision.context_window_floor == CTX_SMALL
         assert "text-kind" in decision.reason
 
@@ -132,7 +132,7 @@ def test_fast_gate_pins_resident_tier_on_large_diff():
             latency_priority=True,
         )
     )
-    assert decision.backend == "ollama"
+    assert decision.backend == DEFAULT_REVIEWER_BACKEND
     assert decision.model == FAST_TIER_MODEL
     assert decision.context_window_floor == CTX_MEDIUM
     # Same input without the hint still escalates to Claude.
@@ -237,8 +237,8 @@ def test_decisions_are_explainable():
 
 def test_all_default_rule_decisions_have_valid_backends():
     for rule in DEFAULT_RULES:
-        assert rule.decision.backend in {"ollama", "claude_cli"}
-    assert DEFAULT_FALLBACK.backend in {"ollama", "claude_cli"}
+        assert rule.decision.backend in {"ollama", "claude_cli", "tabbyapi"}
+    assert DEFAULT_FALLBACK.backend in {"ollama", "claude_cli", "tabbyapi"}
 
 
 def test_context_window_constants_are_ascending():

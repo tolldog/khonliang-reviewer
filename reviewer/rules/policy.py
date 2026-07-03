@@ -40,15 +40,17 @@ from typing import Any, Callable
 # cycle if this file imported back from selector. Both modules now
 # depend "downward" on ``reviewer.defaults``. PR #40 review pass-4
 # finding 1.
-from reviewer.defaults import DEFAULT_REVIEWER_MODEL
+from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
 
-#: Model the latency-priority ("fast pre-push gate") rule routes to. Aliased
-#: to :data:`DEFAULT_REVIEWER_MODEL` (the fast MoE default, currently
-#: ``deepseek-coder-v2:16b`` at ~334 tok/s warm vs qwen's ~94) because that
-#: is already the fast, VRAM-resident tier. Named separately so the fast-tier
-#: choice can diverge from the global default later (e.g. a pulled 7b) without
-#: touching the rule.
-FAST_TIER_MODEL = DEFAULT_REVIEWER_MODEL
+#: Model the resident-tier rules route to: the EMPTY sentinel. A quant id
+#: like ``Qwen3-14B-exl3-6bpw`` is box-specific (it names whatever the
+#: local engine has loaded), so it does not belong in code-level rule rows
+#: (codex round-5 P1) — ``""`` tells the selector "let the provider apply
+#: its own default", which resolves through the operator-configurable
+#: chain: ``providers.tabbyapi.default_model`` in the local config.yaml →
+#: the packaged :data:`DEFAULT_REVIEWER_MODEL` constant. Named so the
+#: fast-tier choice can diverge later without touching the rules.
+FAST_TIER_MODEL = ""
 
 # One-way dependency: ``policy`` consults the audience-keyed distill table
 # to emit the ``(PolicyDecision, DistillConfig)`` pair from a single call.
@@ -182,10 +184,10 @@ DEFAULT_RULES: list[Rule] = [
         name="fast_tier_gate_to_resident",
         predicate=_fast_tier_gate,
         decision=PolicyDecision(
-            backend="ollama",
+            backend=DEFAULT_REVIEWER_BACKEND,
             model=FAST_TIER_MODEL,
             context_window_floor=CTX_MEDIUM,
-            reason="latency-priority pre-push gate — fast resident ollama tier",
+            reason="latency-priority pre-push gate — resident GPU tier",
         ),
     ),
     # Very large diffs want a long-context model and careful priors.
@@ -225,14 +227,18 @@ DEFAULT_RULES: list[Rule] = [
         ),
     ),
     # Light text kinds (doc / pr_description / fr): short, cheap, qwen is fine.
+    # Light text kinds ride the same resident model as the fast tier since
+    # the fr_0e7ccff1 consolidation: the old qwen2.5-coder:14b pin was a
+    # cheap-local-model carve-out, and the resident GPU model IS the cheap
+    # local tier now (an evicted ollama model would be the slow path).
     Rule(
-        name="docs_kind_to_qwen_small",
+        name="docs_kind_to_resident_small",
         predicate=_docs_kind,
         decision=PolicyDecision(
-            backend="ollama",
-            model="qwen2.5-coder:14b",
+            backend=DEFAULT_REVIEWER_BACKEND,
+            model=FAST_TIER_MODEL,
             context_window_floor=CTX_SMALL,
-            reason="text-kind review (doc/fr/pr_description) — qwen2.5-coder:14b suffices",
+            reason="text-kind review (doc/fr/pr_description) — resident GPU tier suffices",
         ),
     ),
 ]
@@ -243,15 +249,16 @@ DEFAULT_RULES: list[Rule] = [
 #: ``reviewer/defaults.py`` (re-exported from ``reviewer/selector.py``
 #: for backward compat) so a single edit there shifts both the
 #: SelectorConfig fallback AND this rule-table fallback. The
-#: ``docs_kind_to_qwen_small`` rule above intentionally pins
-#: ``qwen2.5-coder:14b`` for short-text reviews — that's a deliberate
-#: small-model carve-out and is not a "default" in the sense this
-#: constant captures.
+#: ``docs_kind_to_resident_small`` rule above routes short-text reviews
+#: to the same resident tier at a smaller context floor — a latency
+#: carve-out, not a "default" in the sense this constant captures.
 DEFAULT_FALLBACK = PolicyDecision(
-    backend="ollama",
-    model=DEFAULT_REVIEWER_MODEL,
+    backend=DEFAULT_REVIEWER_BACKEND,
+    # Empty = provider-default chain (see FAST_TIER_MODEL): the resident
+    # tier's model id is box-specific and lives in local config, not here.
+    model=FAST_TIER_MODEL,
     context_window_floor=CTX_SMALL,
-    reason=f"default fallback — small code-diff review on {DEFAULT_REVIEWER_MODEL}",
+    reason="default fallback — small code-diff review on the resident tier",
 )
 
 

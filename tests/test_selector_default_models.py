@@ -198,14 +198,16 @@ def test_default_models_field_default_is_empty_dict():
     so existing tests / configs that only set ``default_model`` keep
     working without changes (backwards compat).
 
-    Default model is ``deepseek-coder-v2:16b`` (promoted from
-    ``qwen2.5-coder:14b`` on the 2026-04-30 speed sweep — 3.5× faster
-    on the same hardware). Same VRAM tier (~8.9 GB), MoE active path.
+    Defaults track the ``reviewer.defaults`` constants — the resident
+    GPU engine since the fr_0e7ccff1 consolidation (the 2026-04-30
+    deepseek speed-sweep promotion predates TabbyAPI owning the VRAM).
     """
+    from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
+
     cfg = SelectorConfig()
     assert cfg.default_models == {}
-    assert cfg.default_model == "deepseek-coder-v2:16b"
-    assert cfg.default_backend == "ollama"
+    assert cfg.default_model == DEFAULT_REVIEWER_MODEL
+    assert cfg.default_backend == DEFAULT_REVIEWER_BACKEND
 
 
 def test_no_caller_backend_uses_default_backend_with_per_backend_dict():

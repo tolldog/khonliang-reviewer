@@ -567,6 +567,14 @@ def test_provider_to_vendor_identity_for_ollama() -> None:
     assert provider_to_vendor("ollama") == "ollama"
 
 
+def test_provider_to_vendor_maps_tabbyapi_to_ollama_local_dir() -> None:
+    """The resident TabbyAPI engine serves the same locally-hosted model
+    family; repo-side local-tier overrides documented under
+    ``.reviewer/models/ollama/`` must keep applying after the fr_0e7ccff1
+    backend consolidation (codex round-2 P2)."""
+    assert provider_to_vendor("tabbyapi") == "ollama"
+
+
 def test_provider_to_vendor_identity_for_unknown_provider() -> None:
     """Unknown provider names fall through identity.
 

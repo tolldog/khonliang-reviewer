@@ -26,7 +26,7 @@ from khonliang_reviewer import ReviewProvider
 # ``reviewer.rules.policy`` can also import it without creating a
 # selector ↔ rules cycle when the selector eventually wires the rule
 # table in. PR #40 review pass-4 finding 1.
-from reviewer.defaults import DEFAULT_REVIEWER_MODEL
+from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
 
 
 class UnknownBackendError(ValueError):
@@ -61,11 +61,11 @@ class SelectorConfig:
     See ``specs/MS-D/spec.md`` for the design context.
     """
 
-    default_backend: str = "ollama"
-    # 2026-04-30 speed sweep measured deepseek-coder-v2:16b at 334 tok/s
-    # warm vs qwen2.5-coder:14b at 94 tok/s on identical hardware
-    # (RTX 5080, sm_120) — 3.5× faster via MoE active path while sitting
-    # in the same VRAM tier (8.9 GB). Promoted to default.
+    # fr_khonliang-reviewer_0e7ccff1: both default constants moved to the
+    # resident GPU engine (TabbyAPI / Qwen3-14B) — see reviewer/defaults.py
+    # for the consolidation rationale. (The 2026-04-30 speed sweep that
+    # promoted deepseek-coder-v2:16b predates TabbyAPI owning the VRAM.)
+    default_backend: str = DEFAULT_REVIEWER_BACKEND
     default_model: str = DEFAULT_REVIEWER_MODEL
     default_models: dict[str, str] = field(default_factory=dict)
 
@@ -170,6 +170,7 @@ class ProviderSelector:
 
 
 __all__ = [
+    "DEFAULT_REVIEWER_BACKEND",
     "DEFAULT_REVIEWER_MODEL",
     "ProviderSelector",
     "SelectorConfig",

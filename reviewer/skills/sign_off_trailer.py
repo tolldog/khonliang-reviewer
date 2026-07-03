@@ -92,9 +92,11 @@ _REASON_MAX_CHARS = 80
 #: the cross-vendor gate, rather than either blocking the commit or
 #: fabricating a sign-off.
 #:
-#: Scoped to the **local hot-tier** providers only: ollama's
-#: ``backend_timeout`` and claude_cli's ``subprocess_timeout`` (the
-#: hot-tier + escalation pass that the cross-vendor gate backstops). It
+#: Scoped to the **local hot-tier** providers only: the resident-engine
+#: backends' ``backend_timeout`` (tabbyapi — the default hot tier since
+#: the fr_0e7ccff1 consolidation — and ollama, the pre-consolidation
+#: tier that remains registered) and claude_cli's ``subprocess_timeout``
+#: (the hot-tier + escalation pass that the cross-vendor gate backstops). It
 #: must NOT match ``codex_cli`` / ``gh_copilot``, which *also* emit
 #: ``subprocess_timeout`` but ARE the cross-vendor gate — silently
 #: skipping a timed-out authoritative review would let an unreviewed
@@ -105,6 +107,7 @@ _REASON_MAX_CHARS = 80
 _TIMEOUT_SKIP_SIGNALS = frozenset(
     {
         ("ollama", "backend_timeout"),
+        ("tabbyapi", "backend_timeout"),
         ("claude_cli", "subprocess_timeout"),
     }
 )

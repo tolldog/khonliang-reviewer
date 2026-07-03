@@ -75,6 +75,8 @@ from reviewer.providers import (
     GhCopilotProviderConfig,
     OllamaProvider,
     OllamaProviderConfig,
+    TabbyAPIProvider,
+    TabbyAPIProviderConfig,
 )
 from reviewer.providers._prompt import (
     _METADATA_BINARY_QUESTIONS_KEY,
@@ -85,6 +87,7 @@ from reviewer.pricing_seed import load_default_pricing
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import PolicyInput, decide_distill, evaluate
 from reviewer.selector import (
+    DEFAULT_REVIEWER_BACKEND,
     DEFAULT_REVIEWER_MODEL,
     ProviderSelector,
     SelectorConfig,
@@ -2034,6 +2037,61 @@ class ReviewerAgent(BaseAgent):
                     backend=decision.backend, model=decision.model
                 )
                 selection_reason = f"rule-table: {decision.reason}"
+                # Operator opt-out (codex round-3 P1): the rule table's
+                # local-tier rows are code constants, so an operator who
+                # sets ``default_provider`` to a non-tabbyapi backend in
+                # config.yaml — the documented way to opt out of the
+                # resident engine — must win over the constant for
+                # default-routed local reviews. Scoped to tabbyapi
+                # decisions (every tabbyapi row IS a local-tier row);
+                # cloud/claude escalation rows are untouched.
+                if getattr(provider, "name", "") == "tabbyapi":
+                    configured = str(
+                        self._load_config().get("default_provider") or ""
+                    ).strip()
+                    if (
+                        configured
+                        and configured != "tabbyapi"
+                        and configured in selector.providers
+                    ):
+                        # model=None (not ""): fall through the selector's
+                        # default-resolution rules so a configured
+                        # ``default_models[<backend>]`` / paired
+                        # ``default_model`` is honored on the reroute
+                        # (codex round-4 P2); "" would skip straight to
+                        # the provider-level default.
+                        provider, chosen_model = selector.select(
+                            backend=configured, model=None
+                        )
+                        selection_reason += (
+                            f" → operator default_provider={configured}"
+                        )
+                # Graceful degrade when the resident engine can't serve
+                # (codex round-1/round-2 P1s on the fr_0e7ccff1 PR): a
+                # rule-table decision for a tabbyapi that is UNPROVISIONED
+                # (no key discoverable → no engine on this host) or
+                # UNAVAILABLE (key present but the service is stopped /
+                # unreachable) would deterministically fail every
+                # default-routed review. Re-route to the ollama tier that
+                # used to serve these reviews. The availability probe is a
+                # ~1-2ms loopback GET against the engine's unauthenticated
+                # /health route. Scoped to the rule-table branch only — a
+                # caller who explicitly pins ``backend=tabbyapi`` gets the
+                # honest error, not a silent substitution.
+                if (
+                    getattr(provider, "name", "") == "tabbyapi"
+                    and hasattr(provider, "is_available")
+                    and "ollama" in selector.providers
+                    and not await provider.is_available()
+                ):
+                    # model=None for the same selector-default fall-through
+                    # as the opt-out branch above (codex round-4 P2).
+                    provider, chosen_model = selector.select(
+                        backend="ollama", model=None
+                    )
+                    selection_reason += (
+                        " → degraded to ollama (tabbyapi unavailable)"
+                    )
         except UnknownBackendError as exc:
             return {"error": str(exc)}
 
@@ -3932,6 +3990,7 @@ class ReviewerAgent(BaseAgent):
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
 
         # Per-backend declared-models comes from the pricing YAML;
         # operators add a row per (backend, model) they care about,
@@ -3984,19 +4043,13 @@ class ReviewerAgent(BaseAgent):
         )
         # Source Ollama's provider-default model from
         # ``providers.ollama.default_model`` (per-provider config),
-        # falling back to ``DEFAULT_REVIEWER_MODEL`` (defined in
-        # reviewer/defaults.py, re-exported from reviewer/selector.py).
-        # This baseline backs the SelectorConfig + agent-boot fallback
-        # paths and is also referenced by
-        # ``rules.policy.DEFAULT_FALLBACK`` (the rule-table fallback),
-        # so a swap of the constant flips both fallback paths in
-        # lockstep. The ``docs_kind_to_qwen_small`` rule in
-        # ``rules.policy`` deliberately pins ``qwen2.5-coder:14b`` for
-        # short-text reviews (spec/doc/fr/pr_description) — that's an
-        # intentional small-model carve-out, not a fallback, and is
-        # not affected by promotions of this constant. Decoupled from
-        # the global ``config.default_model`` so an operator who sets
-        # ``default_provider: claude_cli`` and ``default_model:
+        # falling back to a pinned ollama-served model. Since the
+        # fr_0e7ccff1 consolidation, ``DEFAULT_REVIEWER_MODEL`` names the
+        # TabbyAPI-resident model — an id ollama does not serve — so the
+        # ollama block keeps its own fallback pin (the pre-consolidation
+        # ecosystem default) instead of the shared constant. Decoupled
+        # from the global ``config.default_model`` so an operator who
+        # sets ``default_provider: claude_cli`` and ``default_model:
         # claude-opus-4-7`` doesn't accidentally inject a Claude model
         # id into Ollama when a caller picks ``backend: ollama``
         # without specifying a model. The selector deliberately
@@ -4004,7 +4057,7 @@ class ReviewerAgent(BaseAgent):
         # ``ProviderSelector.select``); each provider then applies its
         # own config-level default.
         ollama_default = str(
-            ollama_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+            ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
         )
         # Thread per-provider knobs through to the dataclass so the
         # config-layer rung of the resolution order ("caller →
@@ -4073,15 +4126,75 @@ class ReviewerAgent(BaseAgent):
             default_model=ollama_default,
             declared_models=declared_by_backend.get("ollama", []),
         )
+        # TabbyAPI — the resident GPU engine (fr_khonliang-reviewer_0e7ccff1).
+        # ``api_key`` resolution: explicit config wins, else delegate to
+        # credentials discovery (env var → the engine's own api_tokens.yml).
+        # Discovery failure leaves the key empty; the provider then surfaces
+        # ``auth_not_provisioned`` on first use instead of failing boot —
+        # same graceful-degrade shape as the other backends.
+        tabby_default = str(
+            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+        )
+        tabby_api_key_raw = tabbyapi_cfg.get("api_key")
+        tabby_api_key = (
+            tabby_api_key_raw.strip()
+            if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
+            else None
+        )
+        # No static discovery here: the provider re-runs
+        # ``credentials.get_tabbyapi_key`` per request (codex P2 on the
+        # fr_0e7ccff1 PR) so an engine-side key rotation is picked up
+        # without a restart. A config-pinned key still wins inside the
+        # provider's resolution order.
+        from reviewer.credentials import get_tabbyapi_key
+        tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
+        tabby_timeout = (
+            float(tabby_timeout_raw)
+            if isinstance(tabby_timeout_raw, (int, float))
+            and not isinstance(tabby_timeout_raw, bool)
+            and tabby_timeout_raw > 0
+            else None
+        )
+        registry.register(
+            TabbyAPIProvider(
+                TabbyAPIProviderConfig(
+                    base_url=str(
+                        tabbyapi_cfg.get("base_url")
+                        or "http://localhost:5000/v1"
+                    ),
+                    default_model=tabby_default,
+                    **({"api_key": tabby_api_key} if tabby_api_key else {}),
+                    **(
+                        {"timeout_seconds": tabby_timeout}
+                        if tabby_timeout is not None
+                        else {}
+                    ),
+                ),
+                api_key_provider=get_tabbyapi_key,
+            ),
+            default_model=tabby_default,
+            declared_models=declared_by_backend.get("tabbyapi", []),
+        )
         return registry
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()
+        resolved_backend = str(
+            config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
+        )
+        # ``default_model`` stays whatever the operator pinned, else the
+        # empty "let the provider decide" sentinel — for EVERY backend
+        # (codex round-4 P1 + round-5 P2). The provider default is the
+        # single source of truth for an unpinned model id, and it is
+        # itself config-driven (``providers.<backend>.default_model`` →
+        # packaged constant), so nothing here needs to re-pair models
+        # with backends.
+        configured_model = str(config.get("default_model") or "")
         return ProviderSelector(
             self._ensure_registry().providers,
             SelectorConfig(
-                default_backend=str(config.get("default_provider") or "ollama"),
-                default_model=str(config.get("default_model") or DEFAULT_REVIEWER_MODEL),
+                default_backend=resolved_backend,
+                default_model=configured_model,
                 default_models=_coerce_default_models(config.get("default_models")),
             ),
         )

@@ -29,7 +29,12 @@ from reviewer.agent import (
 )
 from reviewer.registry import ProviderRegistry
 from reviewer.rules import FAST_TIER_MODEL
-from reviewer.selector import DEFAULT_REVIEWER_MODEL, ProviderSelector, SelectorConfig
+from reviewer.selector import (
+    DEFAULT_REVIEWER_BACKEND,
+    DEFAULT_REVIEWER_MODEL,
+    ProviderSelector,
+    SelectorConfig,
+)
 from reviewer.storage import open_usage_store
 
 
@@ -80,10 +85,14 @@ def _make_harness(
     """Build an AgentTestHarness with an injected :class:`ProviderSelector`.
 
     The default provider map registers a single fake under ``"ollama"``
-    so the rule table's default fallback (``ollama`` / ``qwen2.5-coder:14b``)
-    resolves cleanly in tests that don't care about provider identity.
-    Tests that want multiple providers pass their own map; tests that
-    want caller-override pass ``backend=...`` explicitly.
+    so caller-pinned ``backend="ollama"`` tests resolve cleanly. The
+    rule table's default backend is ``DEFAULT_REVIEWER_BACKEND``
+    (``tabbyapi`` since the fr_0e7ccff1 consolidation), so when the
+    caller's map doesn't cover that backend the harness ALIASES it onto
+    the map's first fake — tests that don't care about provider
+    identity keep routing to their fake regardless of which backend the
+    rule table names. Tests that DO care about routing register an
+    explicit map covering every backend they expect to be hit.
 
     Tests that exercise ``list_models`` can pass a pre-built
     :class:`ProviderRegistry` to override the auto-derived registry —
@@ -95,6 +104,14 @@ def _make_harness(
     """
     if providers is None:
         providers = {"ollama": _RecordingProvider("ollama", _make_result(backend="ollama", model="qwen2.5-coder:14b"))}
+    if DEFAULT_REVIEWER_BACKEND not in providers and providers:
+        # Alias the rule-table default backend onto the first fake so
+        # default-routed reviews reach a registered provider (see
+        # docstring). dict insertion order makes "first" deterministic.
+        providers = {
+            **providers,
+            DEFAULT_REVIEWER_BACKEND: next(iter(providers.values())),
+        }
     if registry is None:
         registry = ProviderRegistry()
         for name, provider in providers.items():
@@ -163,11 +180,10 @@ def test_skills_parameters_match_public_contract():
 
 
 async def test_review_text_routes_to_rule_table_default_backend():
-    """Small content + pr_diff → rule table picks ollama + the promoted
-    ``DEFAULT_REVIEWER_MODEL`` (fallback). Asserting the constant rather
-    than the literal so future model promotions only need to touch
-    ``reviewer/defaults.py`` (the single source of truth;
-    ``reviewer.selector`` re-exports for backward compat)."""
+    """Small content + pr_diff → rule table picks the resident default
+    backend with the EMPTY model sentinel — the model id is delegated to
+    the provider default chain (codex round-5: box-specific quant names
+    don't belong in code rows)."""
     fake = _RecordingProvider(
         "ollama", _make_result(backend="ollama", model=DEFAULT_REVIEWER_MODEL)
     )
@@ -183,7 +199,7 @@ async def test_review_text_routes_to_rule_table_default_backend():
     assert fake.last_request is not None
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
-    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
+    assert fake.last_request.metadata["model"] == ""  # provider-default sentinel
 
 
 async def test_review_diff_fast_pins_resident_tier_on_large_diff():
@@ -380,7 +396,7 @@ async def test_review_text_merges_caller_metadata_with_model():
     assert fake.last_request.metadata["repo"] == "tolldog/x"
     assert fake.last_request.metadata["pr_number"] == 7
     # rule-table-chosen model injected alongside
-    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
+    assert fake.last_request.metadata["model"] == ""  # provider-default sentinel
 
 
 async def test_review_text_strips_reserved_khonliang_metadata_keys():
@@ -416,7 +432,7 @@ async def test_review_text_strips_reserved_khonliang_metadata_keys():
     # legitimate caller key preserved
     assert md["repo"] == "tolldog/x"
     # rule-table-chosen model still injected
-    assert md["model"] == DEFAULT_REVIEWER_MODEL
+    assert md["model"] == ""  # provider-default sentinel (codex round-5)
     # reserved-prefix keys scrubbed — none of them should survive
     assert "_khonliang_repo_prompts" not in md
     assert "_khonliang_example_format" not in md
@@ -1293,20 +1309,24 @@ async def test_review_text_empty_content_falls_through_to_diff():
 # ---------------------------------------------------------------------------
 
 
-async def test_rule_table_routes_docs_kind_to_ollama():
-    """A doc / fr / pr_description review (no override) → ollama + qwen2.5-coder:14b."""
-    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+async def test_rule_table_routes_docs_kind_to_resident_tier():
+    """A doc / fr / pr_description review (no override) → the resident GPU
+    tier (fr_0e7ccff1 consolidation), not claude. Registers an explicit
+    fake for the default backend so the routing assertion is direct."""
+    resident = _RecordingProvider(
+        DEFAULT_REVIEWER_BACKEND, _make_result(backend=DEFAULT_REVIEWER_BACKEND)
+    )
     claude = _RecordingProvider("claude_cli", _make_result(backend="claude_cli"))
-    harness = _make_harness({"ollama": ollama, "claude_cli": claude})
+    harness = _make_harness({DEFAULT_REVIEWER_BACKEND: resident, "claude_cli": claude})
 
     await harness.call(
         "review_text",
         {"kind": "fr", "content": "# A small FR\n\nContent."},
     )
 
-    assert ollama.last_request is not None
+    assert resident.last_request is not None
     assert claude.last_request is None
-    assert ollama.last_request.metadata["model"] == "qwen2.5-coder:14b"
+    assert resident.last_request.metadata["model"] == FAST_TIER_MODEL
 
 
 async def test_rule_table_routes_design_artifact_to_claude():
@@ -2539,18 +2559,13 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         "codex_cli",
         "gh_copilot",
         "ollama",
+        "tabbyapi",
     }
-    assert selector.config.default_backend == "ollama"
-    # Reference the constant rather than the literal so future model
-    # promotions don't have to touch this assertion. The value the
-    # constant resolves to is the ``SelectorConfig.default_model``
-    # used when the rule table doesn't return an explicit model — the
-    # caller-override path goes through ``decide()`` first, so this
-    # field is the floor an empty-config operator gets, not the
-    # rule-table default that ``handle_review_diff`` typically uses.
-    # ``rules.policy.DEFAULT_FALLBACK`` tracks the same constant so
-    # both fallback paths align by default.
-    assert selector.config.default_model == DEFAULT_REVIEWER_MODEL
+    assert selector.config.default_backend == DEFAULT_REVIEWER_BACKEND
+    # Empty sentinel: an unpinned default_model delegates to the provider
+    # default chain (providers.<backend>.default_model → packaged
+    # constant), the single source of truth since codex round-5.
+    assert selector.config.default_model == ""
 
 
 def test_default_selector_honors_config_yaml(tmp_path):
@@ -2659,9 +2674,12 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
     # Built-in baseline applies; the global default_model 'claude-opus-4-7'
-    # must NOT have leaked into Ollama's provider config. Reference the
-    # constant so future model promotions don't have to touch this assertion.
-    assert ollama_provider.config.default_model == DEFAULT_REVIEWER_MODEL
+    # must NOT have leaked into Ollama's provider config. Since the
+    # fr_0e7ccff1 consolidation the shared DEFAULT_REVIEWER_MODEL names the
+    # TabbyAPI-resident model, so ollama's baseline is its own pinned
+    # ollama-served model (see _build_default_registry) — assert it is
+    # ollama-shaped and specifically NOT the leaked global or the tabby id.
+    assert ollama_provider.config.default_model == "deepseek-coder-v2:16b"
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):
@@ -6571,3 +6589,160 @@ async def test_verdict_probe_strips_backend_specific_metadata(monkeypatch):
     assert "format" not in probe.last_request.metadata
     assert probe.last_request.metadata.get("_khonliang_binary_questions") is True
     assert probe.last_request.metadata.get("model") == "probe-model"
+
+
+# ---------------------------------------------------------------------------
+# Unprovisioned-resident-engine degrade (fr_0e7ccff1, codex P1)
+# ---------------------------------------------------------------------------
+
+
+async def test_rule_table_tabbyapi_unprovisioned_degrades_to_ollama():
+    """On a box without the resident engine (no key discoverable), a
+    rule-table decision for tabbyapi degrades to the registered ollama
+    tier instead of deterministically failing auth_not_provisioned."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    keyless_tabby = TabbyAPIProvider(TabbyAPIProviderConfig())  # no key, no provider
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": keyless_tabby})
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+
+
+async def test_rule_table_tabbyapi_engine_down_degrades_to_ollama():
+    """codex round-2 P1: a resolvable key with a STOPPED engine (health
+    probe fails) degrades exactly like a keyless box — the ollama tier
+    serves the default-routed review instead of a guaranteed
+    backend_error."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    class _DownClient:
+        async def get(self, url, *, timeout=None, headers=None):
+            import httpx
+
+            raise httpx.ConnectError("connection refused")
+
+    down_tabby = TabbyAPIProvider(
+        TabbyAPIProviderConfig(api_key="valid-key"), http_client=_DownClient()
+    )
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": down_tabby})
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+
+
+async def test_caller_pinned_tabbyapi_unprovisioned_stays_honest_error():
+    """An EXPLICIT backend=tabbyapi pin must NOT silently substitute a
+    different backend — the caller asked for tabbyapi and gets the honest
+    auth_not_provisioned error result from the keyless provider."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    class _NoPostClient:
+        async def post(self, url, *, json=None, timeout=None, headers=None):
+            import httpx
+
+            request = httpx.Request("POST", url)
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError("HTTP 401", request=request, response=response)
+
+    keyless_tabby = TabbyAPIProvider(
+        TabbyAPIProviderConfig(), http_client=_NoPostClient()
+    )
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": keyless_tabby})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "diff body", "backend": "tabbyapi"},
+    )
+
+    assert result["disposition"] == "errored"
+    assert result["error_category"] == "auth_not_provisioned"
+    assert ollama.last_request is None
+
+
+async def test_operator_default_provider_opts_out_of_resident_tier(tmp_path):
+    """codex round-3 P1: config default_provider (non-tabbyapi) is the
+    documented opt-out of the resident engine — it must win over the
+    rule table's code-constant backend for default-routed local reviews."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    tabby = _RecordingProvider("tabbyapi", _make_result(backend="tabbyapi"))
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    selector = ProviderSelector(
+        {"tabbyapi": tabby, "ollama": ollama},
+        SelectorConfig(default_backend="ollama", default_model="deepseek-coder-v2:16b"),
+    )
+    harness = AgentTestHarness(
+        ReviewerAgent,
+        config_path=str(config_path),
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+    assert tabby.last_request is None
+
+
+def test_default_selector_pairs_model_with_configured_backend(tmp_path):
+    """codex round-4 P1: default_provider=ollama with default_model unset
+    must NOT pair ollama with the TabbyAPI-only DEFAULT_REVIEWER_MODEL —
+    the selector's empty-string sentinel lets ollama apply its own
+    provider default instead."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.config.default_backend == "ollama"
+    assert selector.config.default_model == ""
+
+
+async def test_opt_out_reroute_honors_per_backend_default_models(tmp_path):
+    """codex round-4 P2: the opt-out reroute resolves through the
+    selector's default-model rules, so default_models.ollama is honored
+    rather than skipped straight to the provider-level default."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    tabby = _RecordingProvider("tabbyapi", _make_result(backend="tabbyapi"))
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    selector = ProviderSelector(
+        {"tabbyapi": tabby, "ollama": ollama},
+        SelectorConfig(
+            default_backend="tabbyapi",
+            default_model="Qwen3-14B-exl3-6bpw",
+            default_models={"ollama": "glm-4.7-flash"},
+        ),
+    )
+    harness = AgentTestHarness(
+        ReviewerAgent,
+        config_path=str(config_path),
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+    assert ollama.last_request.metadata["model"] == "glm-4.7-flash"
