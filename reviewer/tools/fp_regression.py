@@ -30,13 +30,19 @@ single run is noisy — default ``--runs 5`` and the thresholds are rate-based.
 
 CLI::
 
-    python -m reviewer.tools.fp_regression --runs 5   # defaults to qwen2.5-coder:14b
+    python -m reviewer.tools.fp_regression --runs 5   # defaults to the resident hot tier
 
 Exit code is 0 when every fixture passes, 1 otherwise — usable as a gate. The
-default model is **qwen2.5-coder:14b**: the FP-concern behaviour lives on qwen (not
-the conservative deepseek default), and qwen reliably flags the control defect
-(5/5 in measurement), whereas deepseek under-catches it as a style nit and fails
-the control legitimately. See the ``reviewer-fp-calibration-measurement`` memory.
+default backend/model is :data:`reviewer.defaults.DEFAULT_REVIEWER_BACKEND` /
+:data:`reviewer.defaults.DEFAULT_REVIEWER_MODEL` — the ecosystem-wide resident
+hot tier (TabbyAPI/Qwen3-14B-exl3-6bpw as of fr_khonliang-reviewer_0e7ccff1),
+so a bare invocation always exercises whatever the box actually serves in
+production. Pass ``--backend ollama --model qwen2.5-coder:14b`` (or
+``deepseek-coder-v2:16b``) to check an older ollama-hosted model instead. See
+the ``reviewer-fp-calibration-measurement`` memory for the ollama-era
+per-model tradeoffs, and ``hunk-isolation-fp-per-model-fork`` for why
+``fp_hunk_isolation`` currently fails against the new default (dog_c810371c,
+tracked by a follow-up FR, not a bug in this tool).
 
 The pure aggregation/verdict functions (:func:`classify_run`, :func:`evaluate`) are
 model-free and unit-tested; only :func:`run` touches a live provider.
@@ -52,6 +58,8 @@ from importlib import resources
 from typing import Iterable
 
 from khonliang_reviewer import ReviewRequest, ReviewResult
+
+from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
 
 _FIXTURE_PACKAGE = "reviewer.tools.benchmark_data"
 _FP_PREFIX = "fp_"
@@ -375,13 +383,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         prog="python -m reviewer.tools.fp_regression",
         description="Hot-tier false-positive regression check.",
     )
-    # Default to qwen: it is both where the FP-concern behaviour lives AND a
-    # reliable catcher of the control defect (5/5 runs named the resource leak in
-    # measurement). deepseek under-catches real defects — it frames the removed
-    # `with` as a style/whitespace nit, so it fails the control legitimately and
-    # is the wrong model for this gate (see reviewer-fp-calibration-measurement).
-    p.add_argument("--model", default="qwen2.5-coder:14b")
-    p.add_argument("--backend", default="ollama")
+    # Default to the ecosystem-wide resident hot tier (fr_khonliang-reviewer_0e7ccff1
+    # consolidation onto TabbyAPI/Qwen3) rather than a hardcoded ollama model, so
+    # this gate always exercises whatever the box is actually serving in
+    # production without operators remembering to override every invocation.
+    # Known gap: fp_hunk_isolation currently FAILS against this default
+    # (dog_c810371c) — tracked, not silently masked; see the
+    # hunk-isolation-fp-per-model-fork memory and its follow-up FR.
+    p.add_argument("--model", default=DEFAULT_REVIEWER_MODEL)
+    p.add_argument("--backend", default=DEFAULT_REVIEWER_BACKEND)
     p.add_argument("--runs", type=int, default=5)
     p.add_argument(
         "--max-fp-concern-rate",
