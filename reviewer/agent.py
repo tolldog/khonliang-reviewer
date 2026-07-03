@@ -2037,6 +2037,29 @@ class ReviewerAgent(BaseAgent):
                     backend=decision.backend, model=decision.model
                 )
                 selection_reason = f"rule-table: {decision.reason}"
+                # Operator opt-out (codex round-3 P1): the rule table's
+                # local-tier rows are code constants, so an operator who
+                # sets ``default_provider`` to a non-tabbyapi backend in
+                # config.yaml — the documented way to opt out of the
+                # resident engine — must win over the constant for
+                # default-routed local reviews. Scoped to tabbyapi
+                # decisions (every tabbyapi row IS a local-tier row);
+                # cloud/claude escalation rows are untouched.
+                if getattr(provider, "name", "") == "tabbyapi":
+                    configured = str(
+                        self._load_config().get("default_provider") or ""
+                    ).strip()
+                    if (
+                        configured
+                        and configured != "tabbyapi"
+                        and configured in selector.providers
+                    ):
+                        provider, chosen_model = selector.select(
+                            backend=configured, model=""
+                        )
+                        selection_reason += (
+                            f" → operator default_provider={configured}"
+                        )
                 # Graceful degrade when the resident engine can't serve
                 # (codex round-1/round-2 P1s on the fr_0e7ccff1 PR): a
                 # rule-table decision for a tabbyapi that is UNPROVISIONED

@@ -194,6 +194,22 @@ def _check_availability(
         # contract here we assume registered = available.
         return True, ""
 
+    if backend == "tabbyapi":
+        # TabbyAPI REQUIRES a key; reachability stays a network probe
+        # (the provider's is_available()/healthcheck), but "no key
+        # resolvable anywhere" is a cheap local check that makes
+        # ``list_models`` honest on hosts without the resident engine
+        # (codex round-3 P2 — advertising available=true there directs
+        # discovery clients into a guaranteed auth_not_provisioned).
+        is_provisioned = getattr(provider, "is_provisioned", None)
+        if callable(is_provisioned) and not is_provisioned():
+            return False, (
+                "no tabbyapi key resolvable (set TABBY_API_KEY, add "
+                "providers.tabbyapi.api_key, or install the engine's "
+                "api_tokens.yml)"
+            )
+        return True, ""
+
     if backend == "gh_copilot":
         # Mirror the codex pattern: binary on PATH plus either a
         # stored OAuth credential or one of the env-var fallbacks.

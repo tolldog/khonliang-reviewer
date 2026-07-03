@@ -483,3 +483,23 @@ async def test_is_available_false_when_keyless_without_probe():
     client = _FakeHttpClient(get_raises=AssertionError("must not probe"))
     provider = TabbyAPIProvider(TabbyAPIProviderConfig(), http_client=client)
     assert await provider.is_available() is False
+
+
+async def test_is_available_false_when_key_is_stale():
+    """codex round-3 P2: the probe is AUTHENTICATED (/v1/models) so a
+    stale key on a healthy engine reads unavailable and default routing
+    degrades, instead of marching into auth_not_provisioned."""
+    client = _FakeHttpClient(
+        get_response=_FakeResponse(status_code=401, request_method="GET")
+    )
+    provider = _provider(client)  # api_key="test-key" — resolvable but rejected
+    assert await provider.is_available() is False
+
+
+async def test_is_available_probes_models_with_auth_header():
+    client = _FakeHttpClient(
+        get_response=_FakeResponse(json_data={"data": []}, request_method="GET")
+    )
+    provider = _provider(client)
+    assert await provider.is_available() is True
+    assert client.last_get_headers == {"Authorization": "Bearer test-key"}

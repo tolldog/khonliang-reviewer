@@ -172,22 +172,27 @@ class TabbyAPIProvider(ReviewProvider):
         return bool(self._resolve_api_key())
 
     async def is_available(self, timeout_s: float = 2.0) -> bool:
-        """Cheap liveness gate for the rule-table selection path.
+        """Cheap liveness + auth gate for the rule-table selection path.
 
-        False when no key is resolvable (box has no engine) OR the
-        engine's unauthenticated ``/health`` route doesn't answer 2xx
-        within ``timeout_s`` (engine stopped / hung / unreachable —
-        codex round-2 P1: a resolvable key with a stopped service must
-        degrade like a keyless box, not hard-error every default-routed
-        review). The probe is a local-loopback GET (~1-2ms when the
-        engine is up; connection-refused fails in microseconds), so the
-        per-review overhead is negligible next to inference.
+        False when no key is resolvable (box has no engine), the engine
+        is stopped/hung/unreachable (codex round-2 P1), OR the resolved
+        key is stale/rejected (codex round-3 P2 — an authenticated
+        ``/v1/models`` GET validates reachability AND credentials in one
+        probe; the unauthenticated ``/health`` route would pass a
+        misprovisioned host straight into a guaranteed
+        ``auth_not_provisioned`` on the review call). The probe is a
+        local-loopback GET (~1-2ms when the engine is up;
+        connection-refused fails in microseconds), so the per-review
+        overhead is negligible next to inference.
         """
         if not self.is_provisioned():
             return False
-        root = self._base[: -len("/v1")] if self._base.endswith("/v1") else self._base
         try:
-            response = await self._http.get(f"{root}/health", timeout=timeout_s)
+            response = await self._http.get(
+                f"{self._base}/models",
+                timeout=timeout_s,
+                headers=_auth_headers(self._resolve_api_key()),
+            )
             return 200 <= int(response.status_code) < 300
         except Exception as exc:  # noqa: BLE001 — any probe failure means "don't route here"
             logger.debug("tabbyapi availability probe failed: %s", exc)

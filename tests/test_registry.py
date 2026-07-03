@@ -357,3 +357,29 @@ def test_registration_to_dict_preserves_models_as_list():
         "reason": "",
     }
     assert isinstance(d["models"], list)
+
+
+def test_tabbyapi_unprovisioned_reports_unavailable():
+    """codex round-3 P2: list_models must not advertise tabbyapi as
+    available on hosts where no key is resolvable — that directs
+    discovery clients into a guaranteed auth_not_provisioned."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+    from reviewer.registry import ProviderRegistry
+
+    registry = ProviderRegistry()
+    registry.register(TabbyAPIProvider(TabbyAPIProviderConfig()))  # keyless
+    row = registry.list(backend="tabbyapi")[0].to_dict()
+    assert row["available"] is False
+    assert "key" in row["reason"]
+
+
+def test_tabbyapi_provisioned_reports_available():
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+    from reviewer.registry import ProviderRegistry
+
+    registry = ProviderRegistry()
+    registry.register(
+        TabbyAPIProvider(TabbyAPIProviderConfig(api_key="k"))
+    )
+    row = registry.list(backend="tabbyapi")[0].to_dict()
+    assert row["available"] is True

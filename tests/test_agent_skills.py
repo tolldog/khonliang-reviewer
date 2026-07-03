@@ -6676,3 +6676,31 @@ async def test_caller_pinned_tabbyapi_unprovisioned_stays_honest_error():
     assert result["disposition"] == "errored"
     assert result["error_category"] == "auth_not_provisioned"
     assert ollama.last_request is None
+
+
+async def test_operator_default_provider_opts_out_of_resident_tier(tmp_path):
+    """codex round-3 P1: config default_provider (non-tabbyapi) is the
+    documented opt-out of the resident engine — it must win over the
+    rule table's code-constant backend for default-routed local reviews."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("default_provider: ollama\n")
+    tabby = _RecordingProvider("tabbyapi", _make_result(backend="tabbyapi"))
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    selector = ProviderSelector(
+        {"tabbyapi": tabby, "ollama": ollama},
+        SelectorConfig(default_backend="ollama", default_model="deepseek-coder-v2:16b"),
+    )
+    harness = AgentTestHarness(
+        ReviewerAgent,
+        config_path=str(config_path),
+        selector=selector,
+        usage_store=open_usage_store(":memory:"),
+    )
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+    assert tabby.last_request is None
