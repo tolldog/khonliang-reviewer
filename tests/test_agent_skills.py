@@ -6167,6 +6167,66 @@ async def test_verdict_probe_unknown_backend_errors_before_provider_call():
     assert fake.last_request is None
 
 
+async def test_verdict_probe_self_comparison_errors_before_provider_call():
+    """fr_khonliang-reviewer_fb86a297: a probe resolving to the SAME
+    (backend, model) as the primary review always fully agrees with
+    itself — reject it before spending a real second-pass call, same
+    eager-validation style as the other verdict_probe checks."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "backend": "ollama",
+            "model": "qwen2.5-coder:14b",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert "error" in result
+    assert "verdict_probe" in result["error"]
+    assert "same" in result["error"].lower()
+    assert fake.last_request is None
+
+
+async def test_verdict_probe_same_backend_different_model_is_allowed(monkeypatch):
+    """Same-backend-different-model is a legitimate probe (e.g. two ollama
+    models) — only an EXACT (backend, model) match is rejected. Both passes
+    hit the same fake provider instance (one backend registered), so the
+    probe pass is the SECOND call recorded on it — assert on the request
+    metadata to confirm the probe actually ran with its own model id."""
+    fake = _RecordingProvider(
+        "ollama",
+        _verdict_result(
+            backend="ollama",
+            model="qwen2.5-coder:14b",
+            verdicts=_full_verdicts(lambda d: True),
+        ),
+    )
+    harness = _make_harness({"ollama": fake})
+    _fake_store(monkeypatch, harness)
+
+    out = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "backend": "ollama",
+            "model": "qwen2.5-coder:14b",
+            "scoring_mode": "binary_questions",
+            "verdict_probe": "ollama:deepseek-coder-v2:16b",
+        },
+    )
+
+    assert not out.get("error")
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("model") == "deepseek-coder-v2:16b"
+
+
 async def test_verdict_probe_requires_binary_mode_active():
     """verdict_probe without binary mode active (holistic, or a non-diff
     kind) is a structured error — the caller asked for a verdict comparison
