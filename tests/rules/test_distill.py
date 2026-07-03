@@ -66,7 +66,10 @@ def test_policy_input_audience_defaults_to_agent_consumption():
 
 def test_evaluate_returns_provider_and_distill_pair():
     pol, dis = evaluate(PolicyInput(kind="pr_diff", diff_line_count=50))
-    assert pol.backend and pol.model            # provider half present
+    # Provider half present. model may be the EMPTY provider-default
+    # sentinel on resident-tier rows (codex round-5) — assert the field
+    # is a str, not truthiness.
+    assert pol.backend and isinstance(pol.model, str)
     assert dis.audience == "agent_consumption"  # distill half = default audience
     assert dis.max_findings is None             # no shaping for the default
 

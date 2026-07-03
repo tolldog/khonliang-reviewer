@@ -180,11 +180,10 @@ def test_skills_parameters_match_public_contract():
 
 
 async def test_review_text_routes_to_rule_table_default_backend():
-    """Small content + pr_diff → rule table picks ollama + the promoted
-    ``DEFAULT_REVIEWER_MODEL`` (fallback). Asserting the constant rather
-    than the literal so future model promotions only need to touch
-    ``reviewer/defaults.py`` (the single source of truth;
-    ``reviewer.selector`` re-exports for backward compat)."""
+    """Small content + pr_diff → rule table picks the resident default
+    backend with the EMPTY model sentinel — the model id is delegated to
+    the provider default chain (codex round-5: box-specific quant names
+    don't belong in code rows)."""
     fake = _RecordingProvider(
         "ollama", _make_result(backend="ollama", model=DEFAULT_REVIEWER_MODEL)
     )
@@ -200,7 +199,7 @@ async def test_review_text_routes_to_rule_table_default_backend():
     assert fake.last_request is not None
     assert fake.last_request.kind == "pr_diff"
     assert fake.last_request.content == "diff body"
-    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
+    assert fake.last_request.metadata["model"] == ""  # provider-default sentinel
 
 
 async def test_review_diff_fast_pins_resident_tier_on_large_diff():
@@ -397,7 +396,7 @@ async def test_review_text_merges_caller_metadata_with_model():
     assert fake.last_request.metadata["repo"] == "tolldog/x"
     assert fake.last_request.metadata["pr_number"] == 7
     # rule-table-chosen model injected alongside
-    assert fake.last_request.metadata["model"] == DEFAULT_REVIEWER_MODEL
+    assert fake.last_request.metadata["model"] == ""  # provider-default sentinel
 
 
 async def test_review_text_strips_reserved_khonliang_metadata_keys():
@@ -433,7 +432,7 @@ async def test_review_text_strips_reserved_khonliang_metadata_keys():
     # legitimate caller key preserved
     assert md["repo"] == "tolldog/x"
     # rule-table-chosen model still injected
-    assert md["model"] == DEFAULT_REVIEWER_MODEL
+    assert md["model"] == ""  # provider-default sentinel (codex round-5)
     # reserved-prefix keys scrubbed — none of them should survive
     assert "_khonliang_repo_prompts" not in md
     assert "_khonliang_example_format" not in md
@@ -2563,16 +2562,10 @@ def test_default_selector_constructs_all_providers_from_empty_config(tmp_path):
         "tabbyapi",
     }
     assert selector.config.default_backend == DEFAULT_REVIEWER_BACKEND
-    # Reference the constant rather than the literal so future model
-    # promotions don't have to touch this assertion. The value the
-    # constant resolves to is the ``SelectorConfig.default_model``
-    # used when the rule table doesn't return an explicit model — the
-    # caller-override path goes through ``decide()`` first, so this
-    # field is the floor an empty-config operator gets, not the
-    # rule-table default that ``handle_review_diff`` typically uses.
-    # ``rules.policy.DEFAULT_FALLBACK`` tracks the same constant so
-    # both fallback paths align by default.
-    assert selector.config.default_model == DEFAULT_REVIEWER_MODEL
+    # Empty sentinel: an unpinned default_model delegates to the provider
+    # default chain (providers.<backend>.default_model → packaged
+    # constant), the single source of truth since codex round-5.
+    assert selector.config.default_model == ""
 
 
 def test_default_selector_honors_config_yaml(tmp_path):

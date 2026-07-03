@@ -4182,17 +4182,14 @@ class ReviewerAgent(BaseAgent):
         resolved_backend = str(
             config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
         )
-        # ``default_model`` is PAIRED with ``default_backend`` (the
-        # selector only consults it when the chosen backend matches).
-        # Fill the constant only when the resolved backend is the
-        # constant's own backend — an operator who sets
-        # ``default_provider: ollama`` without a model must get ollama's
-        # provider-level default, not the TabbyAPI-only model id
-        # (codex round-4 P1). Empty string is the selector's
-        # "let the provider decide" sentinel.
+        # ``default_model`` stays whatever the operator pinned, else the
+        # empty "let the provider decide" sentinel — for EVERY backend
+        # (codex round-4 P1 + round-5 P2). The provider default is the
+        # single source of truth for an unpinned model id, and it is
+        # itself config-driven (``providers.<backend>.default_model`` →
+        # packaged constant), so nothing here needs to re-pair models
+        # with backends.
         configured_model = str(config.get("default_model") or "")
-        if not configured_model and resolved_backend == DEFAULT_REVIEWER_BACKEND:
-            configured_model = DEFAULT_REVIEWER_MODEL
         return ProviderSelector(
             self._ensure_registry().providers,
             SelectorConfig(

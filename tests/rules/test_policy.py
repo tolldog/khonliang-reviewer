@@ -26,11 +26,9 @@ def test_empty_input_hits_fallback():
     decision = decide(PolicyInput())
     assert decision == DEFAULT_FALLBACK
     assert decision.backend == DEFAULT_REVIEWER_BACKEND
-    # Fallback tracks ``DEFAULT_REVIEWER_MODEL`` so a swap there shifts
-    # both the SelectorConfig fallback and the rule-table fallback in
-    # one edit. Asserting the constant (not a literal) keeps this test
-    # honest after future promotions.
-    assert decision.model == DEFAULT_REVIEWER_MODEL
+    # Empty sentinel — the resident tier's model id is box-specific and
+    # resolves through the provider default chain (codex round-5).
+    assert decision.model == FAST_TIER_MODEL == ""
 
 
 def test_small_code_diff_hits_fallback():

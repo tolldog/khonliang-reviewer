@@ -42,12 +42,15 @@ from typing import Any, Callable
 # finding 1.
 from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
 
-#: Model the latency-priority ("fast pre-push gate") rule routes to. Aliased
-#: to :data:`DEFAULT_REVIEWER_MODEL` — since the fr_0e7ccff1 consolidation
-#: that is the TabbyAPI-resident GPU model (Qwen3-14B exl3), i.e. the fast,
-#: VRAM-resident tier by construction. Named separately so the fast-tier
-#: choice can diverge from the global default later without touching the rule.
-FAST_TIER_MODEL = DEFAULT_REVIEWER_MODEL
+#: Model the resident-tier rules route to: the EMPTY sentinel. A quant id
+#: like ``Qwen3-14B-exl3-6bpw`` is box-specific (it names whatever the
+#: local engine has loaded), so it does not belong in code-level rule rows
+#: (codex round-5 P1) — ``""`` tells the selector "let the provider apply
+#: its own default", which resolves through the operator-configurable
+#: chain: ``providers.tabbyapi.default_model`` in the local config.yaml →
+#: the packaged :data:`DEFAULT_REVIEWER_MODEL` constant. Named so the
+#: fast-tier choice can diverge later without touching the rules.
+FAST_TIER_MODEL = ""
 
 # One-way dependency: ``policy`` consults the audience-keyed distill table
 # to emit the ``(PolicyDecision, DistillConfig)`` pair from a single call.
@@ -251,9 +254,11 @@ DEFAULT_RULES: list[Rule] = [
 #: carve-out, not a "default" in the sense this constant captures.
 DEFAULT_FALLBACK = PolicyDecision(
     backend=DEFAULT_REVIEWER_BACKEND,
-    model=DEFAULT_REVIEWER_MODEL,
+    # Empty = provider-default chain (see FAST_TIER_MODEL): the resident
+    # tier's model id is box-specific and lives in local config, not here.
+    model=FAST_TIER_MODEL,
     context_window_floor=CTX_SMALL,
-    reason=f"default fallback — small code-diff review on {DEFAULT_REVIEWER_MODEL}",
+    reason="default fallback — small code-diff review on the resident tier",
 )
 
 

@@ -153,4 +153,4 @@ async def test_profile_flows_into_policy_input():
     # promoted constant so a swap of DEFAULT_REVIEWER_MODEL doesn't
     # require touching this assertion.
     assert decision.backend == DEFAULT_REVIEWER_BACKEND
-    assert decision.model == DEFAULT_REVIEWER_MODEL
+    assert decision.model == ""  # provider-default sentinel (codex round-5)
