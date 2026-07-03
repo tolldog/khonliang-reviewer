@@ -2037,6 +2037,27 @@ class ReviewerAgent(BaseAgent):
                     backend=decision.backend, model=decision.model
                 )
                 selection_reason = f"rule-table: {decision.reason}"
+                # Graceful degrade for boxes without the resident engine
+                # (codex P1 on the fr_0e7ccff1 PR): a rule-table decision
+                # for an UNPROVISIONED tabbyapi (no key discoverable → no
+                # engine on this host) would deterministically fail every
+                # default-routed review with ``auth_not_provisioned``.
+                # Re-route to the ollama tier that used to serve these
+                # reviews. Scoped to the rule-table branch only — a caller
+                # who explicitly pins ``backend=tabbyapi`` gets the honest
+                # auth error, not a silent substitution.
+                if (
+                    getattr(provider, "name", "") == "tabbyapi"
+                    and hasattr(provider, "is_provisioned")
+                    and not provider.is_provisioned()
+                    and "ollama" in selector.providers
+                ):
+                    provider, chosen_model = selector.select(
+                        backend="ollama", model=""
+                    )
+                    selection_reason += (
+                        " → degraded to ollama (tabbyapi unprovisioned)"
+                    )
         except UnknownBackendError as exc:
             return {"error": str(exc)}
 
@@ -4086,14 +4107,12 @@ class ReviewerAgent(BaseAgent):
             if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
             else None
         )
-        if tabby_api_key is None:
-            try:
-                from reviewer.credentials import get_tabbyapi_key
-
-                tabby_api_key = get_tabbyapi_key()
-            except Exception as exc:  # noqa: BLE001 — discovery is best-effort
-                logger.debug("tabbyapi key discovery failed: %s", exc)
-                tabby_api_key = None
+        # No static discovery here: the provider re-runs
+        # ``credentials.get_tabbyapi_key`` per request (codex P2 on the
+        # fr_0e7ccff1 PR) so an engine-side key rotation is picked up
+        # without a restart. A config-pinned key still wins inside the
+        # provider's resolution order.
+        from reviewer.credentials import get_tabbyapi_key
         tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
         tabby_timeout = (
             float(tabby_timeout_raw)
@@ -4116,7 +4135,8 @@ class ReviewerAgent(BaseAgent):
                         if tabby_timeout is not None
                         else {}
                     ),
-                )
+                ),
+                api_key_provider=get_tabbyapi_key,
             ),
             default_model=tabby_default,
             declared_models=declared_by_backend.get("tabbyapi", []),

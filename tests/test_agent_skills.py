@@ -6596,3 +6596,56 @@ async def test_verdict_probe_strips_backend_specific_metadata(monkeypatch):
     assert "format" not in probe.last_request.metadata
     assert probe.last_request.metadata.get("_khonliang_binary_questions") is True
     assert probe.last_request.metadata.get("model") == "probe-model"
+
+
+# ---------------------------------------------------------------------------
+# Unprovisioned-resident-engine degrade (fr_0e7ccff1, codex P1)
+# ---------------------------------------------------------------------------
+
+
+async def test_rule_table_tabbyapi_unprovisioned_degrades_to_ollama():
+    """On a box without the resident engine (no key discoverable), a
+    rule-table decision for tabbyapi degrades to the registered ollama
+    tier instead of deterministically failing auth_not_provisioned."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    keyless_tabby = TabbyAPIProvider(TabbyAPIProviderConfig())  # no key, no provider
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": keyless_tabby})
+
+    result = await harness.call(
+        "review_text", {"kind": "pr_diff", "content": "diff body"}
+    )
+
+    assert result["disposition"] == "posted"
+    assert ollama.last_request is not None
+
+
+async def test_caller_pinned_tabbyapi_unprovisioned_stays_honest_error():
+    """An EXPLICIT backend=tabbyapi pin must NOT silently substitute a
+    different backend — the caller asked for tabbyapi and gets the honest
+    auth_not_provisioned error result from the keyless provider."""
+    from reviewer.providers.tabbyapi import TabbyAPIProvider, TabbyAPIProviderConfig
+
+    class _NoPostClient:
+        async def post(self, url, *, json=None, timeout=None, headers=None):
+            import httpx
+
+            request = httpx.Request("POST", url)
+            response = httpx.Response(401, request=request)
+            raise httpx.HTTPStatusError("HTTP 401", request=request, response=response)
+
+    keyless_tabby = TabbyAPIProvider(
+        TabbyAPIProviderConfig(), http_client=_NoPostClient()
+    )
+    ollama = _RecordingProvider("ollama", _make_result(backend="ollama"))
+    harness = _make_harness({"ollama": ollama, "tabbyapi": keyless_tabby})
+
+    result = await harness.call(
+        "review_text",
+        {"kind": "pr_diff", "content": "diff body", "backend": "tabbyapi"},
+    )
+
+    assert result["disposition"] == "errored"
+    assert result["error_category"] == "auth_not_provisioned"
+    assert ollama.last_request is None

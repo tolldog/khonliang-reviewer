@@ -127,15 +127,19 @@ class _FakeHttpClient:
         self.last_post_url: str | None = None
         self.last_post_json: dict[str, Any] | None = None
 
-    async def post(self, url: str, *, json: Any = None, timeout: Any = None):
+    async def post(
+        self, url: str, *, json: Any = None, timeout: Any = None, headers: Any = None
+    ):
         self.post_calls += 1
         self.last_post_url = url
         self.last_post_json = json
+        self.last_post_headers = headers
         if self._post_raises is not None:
             raise self._post_raises
         return self._post_response or _FakeResponse(json_data={})
 
-    async def get(self, url: str, *, timeout: Any = None):
+    async def get(self, url: str, *, timeout: Any = None, headers: Any = None):
+        self.last_get_headers = headers
         if self._get_raises is not None:
             raise self._get_raises
         return self._get_response or _FakeResponse(
@@ -403,3 +407,58 @@ async def test_healthcheck_unreachable_raises_base_error():
     client = _FakeHttpClient(get_raises=httpx.ConnectError("refused"))
     with pytest.raises(TabbyAPIHealthcheckError):
         await _provider(client).healthcheck()
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution (codex P1/P2 on the fr_0e7ccff1 PR)
+# ---------------------------------------------------------------------------
+
+
+async def test_api_key_provider_consulted_per_request():
+    """Key discovery re-runs on every request so engine-side rotation is
+    picked up without a restart — the credentials-module contract."""
+    keys = iter(["key-one", "key-two"])
+    client = _FakeHttpClient(
+        post_response=_FakeResponse(json_data=_openai_response(SUCCESS_CONTENT))
+    )
+    provider = TabbyAPIProvider(
+        TabbyAPIProviderConfig(default_model="Qwen3-14B-exl3-6bpw"),
+        http_client=client,
+        api_key_provider=lambda: next(keys),
+    )
+    await provider.review(_request())
+    assert client.last_post_headers == {"Authorization": "Bearer key-one"}
+    await provider.review(_request())
+    assert client.last_post_headers == {"Authorization": "Bearer key-two"}
+
+
+async def test_config_pinned_key_wins_over_provider():
+    client = _FakeHttpClient(
+        post_response=_FakeResponse(json_data=_openai_response(SUCCESS_CONTENT))
+    )
+    provider = TabbyAPIProvider(
+        TabbyAPIProviderConfig(api_key="pinned", default_model="m"),
+        http_client=client,
+        api_key_provider=lambda: "discovered",
+    )
+    await provider.review(_request())
+    assert client.last_post_headers == {"Authorization": "Bearer pinned"}
+
+
+def test_is_provisioned_reflects_key_resolvability():
+    keyless = TabbyAPIProvider(
+        TabbyAPIProviderConfig(), http_client=_FakeHttpClient()
+    )
+    assert keyless.is_provisioned() is False
+    discovered = TabbyAPIProvider(
+        TabbyAPIProviderConfig(),
+        http_client=_FakeHttpClient(),
+        api_key_provider=lambda: "k",
+    )
+    assert discovered.is_provisioned() is True
+    failing = TabbyAPIProvider(
+        TabbyAPIProviderConfig(),
+        http_client=_FakeHttpClient(),
+        api_key_provider=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert failing.is_provisioned() is False

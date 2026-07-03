@@ -450,6 +450,9 @@ def test_local_hot_tier_timeout_maps_to_review_skipped_not_raise():
     blocking the commit. Scoped to (backend, category) pairs."""
     cases = [
         ("ollama", "backend_timeout", "ollama request timed out after 540.0s"),
+        # tabbyapi is the default hot tier since fr_0e7ccff1; its timeout
+        # (one attempt, no retry) degrades the same way (codex P1).
+        ("tabbyapi", "backend_timeout", "tabbyapi request timed out after 180.0s"),
         ("claude_cli", "subprocess_timeout", "claude -p timed out after 300.0s"),
     ]
     for backend, category, msg in cases:

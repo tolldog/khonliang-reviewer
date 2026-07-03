@@ -41,6 +41,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -86,10 +87,11 @@ class TabbyAPIProviderConfig:
     #: unlike ollama there is no native/compat split to work around.
     base_url: str = "http://localhost:5000/v1"
     #: Sent as ``Authorization: Bearer <api_key>``. TabbyAPI *requires*
-    #: a key (401 without one). Empty means "not provisioned" — the
-    #: registry layer discovers a real key via
-    #: :func:`reviewer.credentials.get_tabbyapi_key` before construction;
-    #: an empty key surfaces as ``auth_not_provisioned`` on first use
+    #: a key (401 without one). An explicit value here is an operator
+    #: pin; when empty the provider consults its ``api_key_provider``
+    #: callable (the agent wires ``credentials.get_tabbyapi_key``) on
+    #: EVERY request, so engine-side key rotation is picked up without a
+    #: restart. With neither, requests surface ``auth_not_provisioned``
     #: rather than crashing at boot.
     api_key: str = ""
     #: The model id TabbyAPI reports for its loaded model (e.g.
@@ -125,16 +127,49 @@ class TabbyAPIProvider(ReviewProvider):
         config: TabbyAPIProviderConfig | None = None,
         *,
         http_client: Any | None = None,
+        api_key_provider: Callable[[], str | None] | None = None,
     ):
         self.config = config or TabbyAPIProviderConfig()
         self._base = self.config.base_url.strip().rstrip("/")
+        #: Re-run credential discovery on every request (PR codex P2):
+        #: an explicit ``config.api_key`` pin always wins, otherwise this
+        #: callable (the agent passes ``credentials.get_tabbyapi_key``) is
+        #: consulted per call so an engine-side key rotation is picked up
+        #: without a process restart — the contract the credentials
+        #: module documents. Auth headers are therefore built per request
+        #: rather than baked into the client at construction.
+        self._api_key_provider = api_key_provider
         #: Injectable for tests (a fake exposing async ``post``/``get``
         #: returning objects with ``status_code`` / ``json()`` /
         #: ``raise_for_status()``); production builds a real httpx client.
         self._http = http_client or httpx.AsyncClient(
             timeout=self.config.timeout_seconds,
-            headers=_auth_headers(self.config.api_key),
         )
+
+    def _resolve_api_key(self) -> str:
+        """Config-pinned key wins; else discover fresh via the provider."""
+        pinned = self.config.api_key
+        if isinstance(pinned, str) and pinned.strip():
+            return pinned.strip()
+        if self._api_key_provider is not None:
+            try:
+                discovered = self._api_key_provider()
+            except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+                logger.debug("tabbyapi key discovery failed: %s", exc)
+                return ""
+            if isinstance(discovered, str) and discovered.strip():
+                return discovered.strip()
+        return ""
+
+    def is_provisioned(self) -> bool:
+        """True when a usable API key is currently resolvable.
+
+        The rule-table selection path uses this to degrade gracefully on
+        boxes without the resident engine (no key, no engine) instead of
+        deterministically failing every default-routed review with
+        ``auth_not_provisioned``.
+        """
+        return bool(self._resolve_api_key())
 
     async def healthcheck(self) -> None:
         """Verify the endpoint is reachable and credentials are accepted.
@@ -144,7 +179,10 @@ class TabbyAPIProvider(ReviewProvider):
         ollama healthcheck so agent boot handles all backends alike.
         """
         try:
-            response = await self._http.get(f"{self._base}/models")
+            response = await self._http.get(
+                f"{self._base}/models",
+                headers=_auth_headers(self._resolve_api_key()),
+            )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
@@ -202,6 +240,7 @@ class TabbyAPIProvider(ReviewProvider):
                 f"{self._base}/chat/completions",
                 json=payload,
                 timeout=self.config.timeout_seconds,
+                headers=_auth_headers(self._resolve_api_key()),
             )
             http_response.raise_for_status()
             response = http_response.json()
