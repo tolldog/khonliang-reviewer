@@ -30,13 +30,29 @@ single run is noisy — default ``--runs 5`` and the thresholds are rate-based.
 
 CLI::
 
-    python -m reviewer.tools.fp_regression --runs 5   # defaults to qwen2.5-coder:14b
+    python -m reviewer.tools.fp_regression --runs 5   # defaults to the resident hot tier
 
-Exit code is 0 when every fixture passes, 1 otherwise — usable as a gate. The
-default model is **qwen2.5-coder:14b**: the FP-concern behaviour lives on qwen (not
-the conservative deepseek default), and qwen reliably flags the control defect
-(5/5 in measurement), whereas deepseek under-catches it as a style nit and fails
-the control legitimately. See the ``reviewer-fp-calibration-measurement`` memory.
+Exit code is 0 when every fixture passes, 1 otherwise — usable as a gate. Both
+the default BACKEND and default MODEL are resolved via
+:func:`_resolve_provider_and_model`, which calls
+:meth:`ProviderSelector.select` — the SAME precedence every other reviewer
+call uses for an unspecified backend/model: an operator's local
+``config.yaml`` (``default_provider:`` for backend; top-level
+``default_models[backend]`` then the legacy paired ``default_model`` for
+model) wins when present, falling back to
+:data:`reviewer.defaults.DEFAULT_REVIEWER_BACKEND` /
+:data:`reviewer.defaults.DEFAULT_REVIEWER_MODEL` (TabbyAPI /
+Qwen3-14B-exl3-6bpw, the ecosystem-wide resident hot tier as of
+fr_khonliang-reviewer_0e7ccff1) only when config doesn't override either.
+So a bare invocation exercises whatever the box actually serves in
+production, config override included, not always the literal packaged
+constants. Pass ``--backend ollama --model
+qwen2.5-coder:14b`` (or ``deepseek-coder-v2:16b``) to check an older
+ollama-hosted model instead. See the ``reviewer-fp-calibration-measurement``
+memory for the ollama-era per-model tradeoffs, and
+``hunk-isolation-fp-per-model-fork`` for why ``fp_hunk_isolation`` currently
+fails against the new default (dog_c810371c, tracked by a follow-up FR, not a
+bug in this tool).
 
 The pure aggregation/verdict functions (:func:`classify_run`, :func:`evaluate`) are
 model-free and unit-tested; only :func:`run` touches a live provider.
@@ -320,6 +336,72 @@ def evaluate(
     return ok, lines
 
 
+def _resolve_provider_and_model(backend: str, model: str, config_path: str = ""):
+    """Resolve ``(provider, effective_model)`` via ``ProviderSelector.select``
+    — the SAME precedence a live review uses: per-backend
+    ``default_models[backend]`` first, then the legacy paired
+    ``default_model`` (when ``backend`` matches ``default_backend``), then
+    the provider's own configured default (codex + Copilot PR #73 review,
+    round 4: an earlier hand-rolled ``provider.config.default_model`` lookup
+    bypassed ``default_models`` entirely — a documented, higher-precedence
+    config layer than the provider block — so an operator's top-level
+    ``default_models: {tabbyapi: ...}`` override was silently ignored).
+
+    ``backend`` empty/falsy is passed straight through to ``select()``,
+    which itself falls through to ``config.default_backend`` (codex PR #73
+    review round 4 P2): a non-empty CLI default here would override an
+    operator's ``default_provider:`` config opt-out the same way a
+    non-empty ``--model`` default previously overrode ``default_models``.
+
+    Both ``backend`` and ``model`` are stripped before being treated as an
+    explicit override (Copilot PR #73 review rounds 3 and 6): a
+    whitespace-only value is passed to the selector as ``None`` so its own
+    default-resolution rules apply, rather than a stray-whitespace
+    ``--backend`` (shell quoting, env injection) raising
+    ``UnknownBackendError`` instead of falling back like an omitted one
+    would. Model-stripping mirrors ``tabbyapi``'s and ``ollama``'s own
+    ``_resolve_model`` (``if override.strip():``) — NOT every provider
+    (Copilot PR #73 review round 5): ``codex_cli`` and ``gh_copilot`` check
+    truthiness only, no strip, but that's a difference this tool's own
+    whitespace handling doesn't need to replicate — it only needs to agree
+    with the two backends it actually targets (tabbyapi hot tier, ollama
+    fallback).
+    """
+    from reviewer.agent import ReviewerAgent  # cold-path import
+    from reviewer.selector import UnknownBackendError
+
+    agent = ReviewerAgent(
+        agent_id="fp-regression",
+        bus_url="http://fp-regression.invalid",  # never invoked
+        config_path=config_path,
+    )
+    stripped_backend = backend.strip() if isinstance(backend, str) else backend
+    stripped_model = model.strip() if isinstance(model, str) else model
+    try:
+        provider, resolved_model = agent._ensure_selector().select(
+            backend=stripped_backend or None, model=stripped_model or None
+        )
+    except UnknownBackendError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not resolved_model:
+        # The selector's own "" sentinel means "let the provider decide" —
+        # true at request time (tabbyapi/ollama's own ``_resolve_model``
+        # reads ``self.config.default_model`` when metadata carries ""),
+        # but for DISPLAY purposes here we want that same value now rather
+        # than showing an empty model id. For those two backends,
+        # ``provider.config.default_model`` is always resolved to a
+        # concrete string at agent boot (``_build_default_registry``); for
+        # ``codex_cli``/``gh_copilot``/``claude_cli`` an empty
+        # ``default_model`` is a legitimate "let the CLI/binary pick its
+        # own default" state (Copilot PR #73 review round 5), so this can
+        # still return "" for those — display-only, not a functional bug,
+        # since this tool only ever targets tabbyapi/ollama.
+        resolved_model = getattr(
+            getattr(provider, "config", None), "default_model", ""
+        )
+    return provider, resolved_model
+
+
 async def run(
     *,
     model: str,
@@ -328,20 +410,12 @@ async def run(
     config_path: str = "",
     provider=None,
 ) -> list[CaseReport]:
-    """Execute the check live. ``provider`` may be injected for tests; otherwise
-    the canonical registry is built via ``ReviewerAgent`` (same path the bus uses).
+    """Execute the check live. ``provider`` may be injected for tests — in
+    that case ``model`` is used verbatim; otherwise both are resolved
+    together via :func:`_resolve_provider_and_model` (same path the bus uses).
     """
     if provider is None:
-        from reviewer.agent import ReviewerAgent  # cold-path import
-
-        agent = ReviewerAgent(
-            agent_id="fp-regression",
-            bus_url="http://fp-regression.invalid",  # never invoked
-            config_path=config_path,
-        )
-        provider = agent._ensure_registry().get_provider(backend)
-    if provider is None:
-        raise SystemExit(f"backend {backend!r} not registered")
+        provider, model = _resolve_provider_and_model(backend, model, config_path)
 
     reports: list[CaseReport] = []
     for case in load_fp_cases():
@@ -375,13 +449,37 @@ def _build_argparser() -> argparse.ArgumentParser:
         prog="python -m reviewer.tools.fp_regression",
         description="Hot-tier false-positive regression check.",
     )
-    # Default to qwen: it is both where the FP-concern behaviour lives AND a
-    # reliable catcher of the control defect (5/5 runs named the resource leak in
-    # measurement). deepseek under-catches real defects — it frames the removed
-    # `with` as a style/whitespace nit, so it fails the control legitimately and
-    # is the wrong model for this gate (see reviewer-fp-calibration-measurement).
-    p.add_argument("--model", default="qwen2.5-coder:14b")
-    p.add_argument("--backend", default="ollama")
+    # Default to the ecosystem-wide resident hot tier (fr_khonliang-reviewer_0e7ccff1
+    # consolidation onto TabbyAPI/Qwen3) rather than a hardcoded ollama model, so
+    # this gate always exercises whatever the box is actually serving in
+    # production without operators remembering to override every invocation.
+    # Known gap: fp_hunk_isolation currently FAILS against this default
+    # (dog_c810371c) — tracked, not silently masked; see the
+    # hunk-isolation-fp-per-model-fork memory and its follow-up FR.
+    #
+    # ``--model`` defaults to "" (the provider-default sentinel), NOT the
+    # ``DEFAULT_REVIEWER_MODEL`` constant directly (codex + Copilot PR #73
+    # review): a non-empty CLI default would always win over an operator's
+    # ``default_models`` / ``providers.<backend>.default_model`` config
+    # override (``_resolve_model`` treats any non-empty ``metadata["model"]``
+    # as an override), so a box serving a different resident quant would
+    # still get requests for the packaged constant and TabbyAPI would reject
+    # them. Leaving it empty lets :func:`_resolve_provider_and_model` apply
+    # the selector's own precedence, falling back to ``DEFAULT_REVIEWER_MODEL``
+    # only when config doesn't override it either.
+    #
+    # ``--backend`` defaults to "" for the SAME reason (codex PR #73 review
+    # round 4 P2), not the ``DEFAULT_REVIEWER_BACKEND`` constant directly: a
+    # non-empty CLI default would bypass ``ProviderSelector.select()``'s own
+    # ``backend or config.default_backend`` fallback, so an operator's
+    # documented ``default_provider: ollama`` opt-out (the same escape
+    # hatch ``reviewer/agent.py`` honors when rerouting resident-tier
+    # decisions away from an unavailable TabbyAPI) would never apply here —
+    # the gate would keep hammering TabbyAPI even on a box explicitly
+    # configured to skip it. ``_resolve_provider_and_model`` displays
+    # whatever backend the selector actually resolves via ``provider.name``.
+    p.add_argument("--model", default="")
+    p.add_argument("--backend", default="")
     p.add_argument("--runs", type=int, default=5)
     p.add_argument(
         "--max-fp-concern-rate",
@@ -396,18 +494,43 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=0.6,
         help="min fraction of (non-errored) control runs that must flag the defect",
     )
-    p.add_argument("--config", default="", help="path to reviewer config.yaml")
+    # Defaults to "config.yaml" (relative to cwd) — the same convention
+    # reviewer.agent.main() uses for its own --config default — NOT "" (codex
+    # PR #73 P2): ReviewerAgent._load_config short-circuits to {} for an
+    # empty path, so a "" default would silently skip the operator's local
+    # config.yaml entirely, meaning a box with a providers.<backend>.
+    # default_model override for its actual resident quant would never see
+    # it even though --model's own empty-sentinel default (above) exists
+    # specifically to let that override win. An explicit --config "" still
+    # opts out for callers who want the packaged-only config. A missing
+    # config.yaml (the common case when no local override exists) is
+    # tolerated — falls back to {} — but logs a warning rather than
+    # silently no-opping (Copilot PR #73 review round 5).
+    p.add_argument(
+        "--config", default="config.yaml", help="path to reviewer config.yaml"
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
+    # Resolve the provider + effective model once, up front, via the same
+    # ProviderSelector precedence a live review uses — both to display the
+    # real resolved backend/model and to hand the provider to ``run``
+    # directly, avoiding a second selector build. ``provider.name`` (not
+    # ``args.backend``, which may be the "" unset sentinel) is the resolved
+    # backend for display and for ``run``'s own ``backend`` kwarg.
+    provider, effective_model = _resolve_provider_and_model(
+        args.backend, args.model, args.config
+    )
+    effective_backend = provider.name
     reports = asyncio.run(
         run(
-            model=args.model,
-            backend=args.backend,
+            model=effective_model,
+            backend=effective_backend,
             runs=args.runs,
             config_path=args.config,
+            provider=provider,
         )
     )
     ok, lines = evaluate(
@@ -415,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         max_fp_concern_rate=args.max_fp_concern_rate,
         min_control_hit_rate=args.min_control_hit_rate,
     )
-    print(f"# FP-regression: {args.backend}/{args.model}, N={args.runs}")
+    print(f"# FP-regression: {effective_backend}/{effective_model}, N={args.runs}")
     for line in lines:
         print(line)
     print("RESULT:", "PASS" if ok else "FAIL")

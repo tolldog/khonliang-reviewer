@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from khonliang_reviewer import ReviewFinding, ReviewResult
 
 from reviewer.tools.fp_regression import (
     CaseReport,
+    _resolve_provider_and_model,
     classify_run,
     evaluate,
     load_fp_cases,
@@ -341,6 +344,104 @@ def test_control_keywords_reject_unrelated_wording():
 
 def _f2(title, body):
     return ReviewFinding(severity="comment", title=title, body=body)  # type: ignore[arg-type]
+
+
+# -- _resolve_provider_and_model -----------------------------------------
+
+
+def test_resolve_provider_and_model_explicit_model_wins(tmp_path):
+    provider, model = _resolve_provider_and_model(
+        "ollama", "explicit-model", config_path=""
+    )
+    assert model == "explicit-model"
+    assert provider is not None
+
+
+def test_resolve_provider_and_model_honors_default_provider_opt_out(tmp_path):
+    """codex PR #73 review round 4 P2: an operator's default_provider:
+    opt-out (the same escape hatch reviewer/agent.py honors when rerouting
+    resident-tier decisions away from an unavailable TabbyAPI) must apply
+    when --backend is left unset — a non-empty CLI default here would
+    bypass ProviderSelector.select()'s own backend-fallback the same way
+    a non-empty --model default previously bypassed default_models."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("default_provider: ollama\n")
+    provider, _ = _resolve_provider_and_model("", "", config_path=str(config_file))
+    assert provider.name == "ollama"
+
+
+def test_resolve_provider_and_model_honors_top_level_default_models(tmp_path):
+    """codex + Copilot PR #73 review round 4: default_models[backend] is a
+    documented, higher-precedence config layer than
+    providers.<backend>.default_model — resolution must go through
+    ProviderSelector.select, not a hand-rolled provider.config lookup that
+    bypasses it."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\n"
+        "default_models:\n"
+        "  ollama: from-default-models-map\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: from-provider-block\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "", config_path=str(config_file)
+    )
+    assert model == "from-default-models-map"
+
+
+def test_resolve_provider_and_model_falls_back_to_provider_block(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: from-provider-block\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "", config_path=str(config_file)
+    )
+    assert model == "from-provider-block"
+
+
+def test_resolve_provider_and_model_treats_whitespace_only_as_unset(tmp_path):
+    """Copilot PR #73 review rounds 3+5: ollama's own _resolve_model treats
+    a whitespace-only override as unset (``if override.strip():``) — this
+    must agree for the backends this tool actually targets (tabbyapi,
+    ollama), or a caller passing "   " would get it echoed back as a real
+    model id while the provider actually falls back to its default. (NOT
+    every provider strips — codex_cli/gh_copilot check truthiness only —
+    but this tool doesn't need to replicate that.)"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\ndefault_models:\n  ollama: from-config\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "   ", config_path=str(config_file)
+    )
+    assert model == "from-config"
+
+
+def test_resolve_provider_and_model_backend_whitespace_only_treated_as_unset(
+    tmp_path,
+):
+    """Copilot PR #73 review round 6: a whitespace-only or stray-whitespace
+    --backend (shell quoting, env injection) must fall back to
+    config.default_provider like an OMITTED backend would, not raise
+    UnknownBackendError by being treated as a literal (bogus) backend
+    name."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("default_provider: ollama\n")
+    provider, _ = _resolve_provider_and_model(
+        "   ", "", config_path=str(config_file)
+    )
+    assert provider.name == "ollama"
+
+
+def test_resolve_provider_and_model_unknown_backend_raises_systemexit():
+    with pytest.raises(SystemExit):
+        _resolve_provider_and_model("not-a-real-backend", "", config_path="")
 
 
 # -- run() with an injected fake provider (no live model) --------------
