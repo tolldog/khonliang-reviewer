@@ -2,7 +2,7 @@
 
 **Milestone:** `ms_reviewer_e3f751cd`
 **Target:** `reviewer`
-**Status:** proposed
+**Status:** completed
 **FRs:**
 - `fr_reviewer_de1694a8` — Uniform distill-before-handoff pipeline driven by rule-table DistillConfig (anchor)
 - `fr_reviewer_cb081fa8` — Best-of-N local consensus + three-tier evaluator gate

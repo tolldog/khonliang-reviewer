@@ -2,7 +2,7 @@
 
 **Milestone:** `ms_reviewer_44949efb`
 **Target:** `reviewer`
-**Status:** proposed
+**Status:** completed
 **FRs:**
 - `fr_reviewer_1c25c615` — `SelectorConfig` per-backend default models
 - `fr_reviewer_2c751c3b` — `num_ctx` / context-window as reviewer provider knob

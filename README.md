@@ -5,8 +5,8 @@ Bus-native reviewer agent for the khonliang ecosystem.
 The reviewer role is broader than code review: it evaluates PR diffs today and
 extends to specs, FRs, docs, and other content via the library's kind-
 extensible contract. Concrete review providers (Ollama, Claude-via-CLI,
-Codex-via-CLI, GitHub-Copilot-via-CLI, future GPT/Gemini direct) live in
-this repo; shared primitives live in `khonliang-reviewer-lib`.
+Codex-via-CLI, GitHub-Copilot-via-CLI, TabbyAPI, future GPT/Gemini direct)
+live in this repo; shared primitives live in `khonliang-reviewer-lib`.
 
 ## Current Role
 
@@ -157,10 +157,18 @@ selection resolves in this order:
 3. Config-level `default_provider` / `default_model` — the ultimate
    fallback.
 
-The `model` argument is honored on all four backends:
+The `model` argument is honored on all five backends:
 
 - **Ollama** uses `model` directly in the `chat.completions.create`
   call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
+- **TabbyAPI** (the resident hot-tier engine, `reviewer/providers/tabbyapi.py`)
+  uses `model` directly against its OpenAI-compatible `/v1/chat/completions`
+  endpoint — same shape as Ollama. Note: this per-call `(backend, model)`
+  selection is expected to be superseded by a dispatcher-owned skill-request
+  model (the caller asks for a capability, not a specific backend/model) once
+  that lands — see the `dispatcher-will-own-tabbyapi` project memory. Don't
+  invest further docs/plumbing in this section beyond factual accuracy until
+  that direction is confirmed.
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).
