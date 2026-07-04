@@ -2,7 +2,11 @@
 
 **Milestone:** `ms_reviewer_e3f751cd`
 **Target:** `reviewer`
-**Status:** completed
+**Status:** in_progress (fr_reviewer_de1694a8 + fr_reviewer_cb081fa8 merged;
+fr_reviewer_afd4bab1's seed-corpus deliverable is unverified in this repo —
+codex flagged that no `.reviewer/` directory exists here despite the FR
+reading "merged". Confirm where the seed corpus actually landed before
+closing this milestone.)
 **FRs:**
 - `fr_reviewer_de1694a8` — Uniform distill-before-handoff pipeline driven by rule-table DistillConfig (anchor)
 - `fr_reviewer_cb081fa8` — Best-of-N local consensus + three-tier evaluator gate
