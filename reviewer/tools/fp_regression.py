@@ -353,15 +353,19 @@ def _resolve_provider_and_model(backend: str, model: str, config_path: str = "")
     operator's ``default_provider:`` config opt-out the same way a
     non-empty ``--model`` default previously overrode ``default_models``.
 
-    ``model`` is stripped before being treated as an explicit override
-    (Copilot PR #73 review round 3): a whitespace-only value is passed to
-    the selector as ``None`` so its own default-resolution rules apply.
-    This mirrors ``tabbyapi``'s and ``ollama``'s own ``_resolve_model``
-    (``if override.strip():``) — NOT every provider (Copilot PR #73 review
-    round 5): ``codex_cli`` and ``gh_copilot`` check truthiness only, no
-    strip, but that's a difference this tool's own whitespace handling
-    doesn't need to replicate — it only needs to agree with the two
-    backends it actually targets (tabbyapi hot tier, ollama fallback).
+    Both ``backend`` and ``model`` are stripped before being treated as an
+    explicit override (Copilot PR #73 review rounds 3 and 6): a
+    whitespace-only value is passed to the selector as ``None`` so its own
+    default-resolution rules apply, rather than a stray-whitespace
+    ``--backend`` (shell quoting, env injection) raising
+    ``UnknownBackendError`` instead of falling back like an omitted one
+    would. Model-stripping mirrors ``tabbyapi``'s and ``ollama``'s own
+    ``_resolve_model`` (``if override.strip():``) — NOT every provider
+    (Copilot PR #73 review round 5): ``codex_cli`` and ``gh_copilot`` check
+    truthiness only, no strip, but that's a difference this tool's own
+    whitespace handling doesn't need to replicate — it only needs to agree
+    with the two backends it actually targets (tabbyapi hot tier, ollama
+    fallback).
     """
     from reviewer.agent import ReviewerAgent  # cold-path import
     from reviewer.selector import UnknownBackendError
@@ -371,10 +375,11 @@ def _resolve_provider_and_model(backend: str, model: str, config_path: str = "")
         bus_url="http://fp-regression.invalid",  # never invoked
         config_path=config_path,
     )
-    stripped = model.strip() if isinstance(model, str) else model
+    stripped_backend = backend.strip() if isinstance(backend, str) else backend
+    stripped_model = model.strip() if isinstance(model, str) else model
     try:
         provider, resolved_model = agent._ensure_selector().select(
-            backend=backend or None, model=stripped or None
+            backend=stripped_backend or None, model=stripped_model or None
         )
     except UnknownBackendError as exc:
         raise SystemExit(str(exc)) from exc

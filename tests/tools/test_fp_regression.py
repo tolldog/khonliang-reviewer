@@ -423,6 +423,22 @@ def test_resolve_provider_and_model_treats_whitespace_only_as_unset(tmp_path):
     assert model == "from-config"
 
 
+def test_resolve_provider_and_model_backend_whitespace_only_treated_as_unset(
+    tmp_path,
+):
+    """Copilot PR #73 review round 6: a whitespace-only or stray-whitespace
+    --backend (shell quoting, env injection) must fall back to
+    config.default_provider like an OMITTED backend would, not raise
+    UnknownBackendError by being treated as a literal (bogus) backend
+    name."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("default_provider: ollama\n")
+    provider, _ = _resolve_provider_and_model(
+        "   ", "", config_path=str(config_file)
+    )
+    assert provider.name == "ollama"
+
+
 def test_resolve_provider_and_model_unknown_backend_raises_systemexit():
     with pytest.raises(SystemExit):
         _resolve_provider_and_model("not-a-real-backend", "", config_path="")
