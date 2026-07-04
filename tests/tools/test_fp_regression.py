@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from khonliang_reviewer import ReviewFinding, ReviewResult
 
 from reviewer.tools.fp_regression import (
     CaseReport,
-    _effective_model,
+    _resolve_provider_and_model,
     classify_run,
     evaluate,
     load_fp_cases,
@@ -344,38 +346,70 @@ def _f2(title, body):
     return ReviewFinding(severity="comment", title=title, body=body)  # type: ignore[arg-type]
 
 
-# -- _effective_model ---------------------------------------------------
+# -- _resolve_provider_and_model -----------------------------------------
 
 
-class _FakeConfig:
-    default_model = "config-default-model"
+def test_resolve_provider_and_model_explicit_model_wins(tmp_path):
+    provider, model = _resolve_provider_and_model(
+        "ollama", "explicit-model", config_path=""
+    )
+    assert model == "explicit-model"
+    assert provider is not None
 
 
-class _FakeProviderWithConfig:
-    config = _FakeConfig()
+def test_resolve_provider_and_model_honors_top_level_default_models(tmp_path):
+    """codex + Copilot PR #73 review round 4: default_models[backend] is a
+    documented, higher-precedence config layer than
+    providers.<backend>.default_model — resolution must go through
+    ProviderSelector.select, not a hand-rolled provider.config lookup that
+    bypasses it."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\n"
+        "default_models:\n"
+        "  ollama: from-default-models-map\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: from-provider-block\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "", config_path=str(config_file)
+    )
+    assert model == "from-default-models-map"
 
 
-def test_effective_model_uses_explicit_model_when_non_empty():
-    assert _effective_model(_FakeProviderWithConfig(), "explicit-model") == "explicit-model"
+def test_resolve_provider_and_model_falls_back_to_provider_block(tmp_path):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\n"
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: from-provider-block\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "", config_path=str(config_file)
+    )
+    assert model == "from-provider-block"
 
 
-def test_effective_model_falls_back_to_provider_config_default_for_empty_sentinel():
-    assert _effective_model(_FakeProviderWithConfig(), "") == "config-default-model"
-
-
-def test_effective_model_treats_whitespace_only_as_unset():
+def test_resolve_provider_and_model_treats_whitespace_only_as_unset(tmp_path):
     """Copilot PR #73 review round 3: providers' own _resolve_model treats a
     whitespace-only override as unset (``if override.strip():``) — this
-    function must agree, or it would display/pass through "   " as a real
-    model id while the provider actually falls back to its default."""
-    assert _effective_model(_FakeProviderWithConfig(), "   ") == "config-default-model"
+    must agree, or a caller passing "   " would get it echoed back as a
+    real model id while the provider actually falls back to its default."""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "default_provider: ollama\ndefault_models:\n  ollama: from-config\n"
+    )
+    _, model = _resolve_provider_and_model(
+        "ollama", "   ", config_path=str(config_file)
+    )
+    assert model == "from-config"
 
 
-def test_effective_model_no_config_attribute_returns_empty():
-    class _NoConfigProvider:
-        pass
-
-    assert _effective_model(_NoConfigProvider(), "") == ""
+def test_resolve_provider_and_model_unknown_backend_raises_systemexit():
+    with pytest.raises(SystemExit):
+        _resolve_provider_and_model("not-a-real-backend", "", config_path="")
 
 
 # -- run() with an injected fake provider (no live model) --------------

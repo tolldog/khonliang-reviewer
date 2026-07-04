@@ -35,19 +35,22 @@ CLI::
 Exit code is 0 when every fixture passes, 1 otherwise — usable as a gate. The
 default backend is :data:`reviewer.defaults.DEFAULT_REVIEWER_BACKEND` — the
 ecosystem-wide resident hot tier (TabbyAPI as of
-fr_khonliang-reviewer_0e7ccff1). The default MODEL is resolved the same way
-every other reviewer call resolves an unspecified model: an operator's local
-``config.yaml`` (``providers.<backend>.default_model`` / ``default_models``)
-wins when present, falling back to
+fr_khonliang-reviewer_0e7ccff1). The default MODEL is resolved via
+:func:`_resolve_provider_and_model`, which calls
+:meth:`ProviderSelector.select` — the SAME precedence every other reviewer
+call uses for an unspecified model: an operator's local ``config.yaml``
+(top-level ``default_models[backend]``, then the legacy paired
+``default_model``) wins when present, falling back to
 :data:`reviewer.defaults.DEFAULT_REVIEWER_MODEL` (Qwen3-14B-exl3-6bpw) only
-when config doesn't override it — see :func:`_effective_model`. So a bare
-invocation exercises whatever the box actually serves in production, config
-override included, not always the literal packaged constant. Pass ``--backend
-ollama --model qwen2.5-coder:14b`` (or ``deepseek-coder-v2:16b``) to check an
-older ollama-hosted model instead. See the ``reviewer-fp-calibration-measurement``
-memory for the ollama-era per-model tradeoffs, and ``hunk-isolation-fp-per-model-fork``
-for why ``fp_hunk_isolation`` currently fails against the new default
-(dog_c810371c, tracked by a follow-up FR, not a bug in this tool).
+when config doesn't override it either. So a bare invocation exercises
+whatever the box actually serves in production, config override included,
+not always the literal packaged constant. Pass ``--backend ollama --model
+qwen2.5-coder:14b`` (or ``deepseek-coder-v2:16b``) to check an older
+ollama-hosted model instead. See the ``reviewer-fp-calibration-measurement``
+memory for the ollama-era per-model tradeoffs, and
+``hunk-isolation-fp-per-model-fork`` for why ``fp_hunk_isolation`` currently
+fails against the new default (dog_c810371c, tracked by a follow-up FR, not a
+bug in this tool).
 
 The pure aggregation/verdict functions (:func:`classify_run`, :func:`evaluate`) are
 model-free and unit-tested; only :func:`run` touches a live provider.
@@ -333,45 +336,51 @@ def evaluate(
     return ok, lines
 
 
-def _build_provider(backend: str, config_path: str):
-    """Build the canonical provider for ``backend`` via ``ReviewerAgent``.
+def _resolve_provider_and_model(backend: str, model: str, config_path: str = ""):
+    """Resolve ``(provider, effective_model)`` via ``ProviderSelector.select``
+    — the SAME precedence a live review uses: per-backend
+    ``default_models[backend]`` first, then the legacy paired
+    ``default_model`` (when ``backend`` matches ``default_backend``), then
+    the provider's own configured default (codex + Copilot PR #73 review,
+    round 4: an earlier hand-rolled ``provider.config.default_model`` lookup
+    bypassed ``default_models`` entirely — a documented, higher-precedence
+    config layer than the provider block — so an operator's top-level
+    ``default_models: {tabbyapi: ...}`` override was silently ignored).
 
-    Extracted so both :func:`run` and :func:`main` can resolve a provider
-    once — ``main`` needs it up front to compute the effective display
-    model (see :func:`_effective_model`) before the sweep starts.
+    ``model`` is stripped before being treated as an explicit override
+    (Copilot PR #73 review round 3): a whitespace-only value is passed to
+    the selector as ``None`` so its own default-resolution rules apply,
+    matching every provider's ``_resolve_model`` (``if override.strip():``).
     """
     from reviewer.agent import ReviewerAgent  # cold-path import
+    from reviewer.selector import UnknownBackendError
 
     agent = ReviewerAgent(
         agent_id="fp-regression",
         bus_url="http://fp-regression.invalid",  # never invoked
         config_path=config_path,
     )
-    provider = agent._ensure_registry().get_provider(backend)
-    if provider is None:
-        raise SystemExit(f"backend {backend!r} not registered")
-    return provider
-
-
-def _effective_model(provider, model: str) -> str:
-    """Resolve ``model`` for display, falling back to the provider's own
-    configured default when ``model`` is the "" sentinel (codex/Copilot PR
-    #73 review: the CLI default must not shadow an operator's
-    ``providers.<backend>.default_model`` override with the packaged
-    ``DEFAULT_REVIEWER_MODEL`` constant — see :func:`_build_argparser`).
-
-    ``model`` is stripped before the truthiness check (Copilot PR #73
-    review round 3): providers' own ``_resolve_model`` treats a
-    whitespace-only override as unset (``if override.strip():``), so a
-    bare ``model.strip()``-less check here would display/pass through
-    ``"   "`` as if it were a real model id while every provider actually
-    falls back to its configured default — an inconsistency between what
-    this function reports and what the provider will do.
-    """
     stripped = model.strip() if isinstance(model, str) else model
-    return stripped or getattr(
-        getattr(provider, "config", None), "default_model", ""
-    )
+    try:
+        provider, resolved_model = agent._ensure_selector().select(
+            backend=backend, model=stripped or None
+        )
+    except UnknownBackendError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not resolved_model:
+        # The selector's own "" sentinel means "let the provider decide" —
+        # true at request time (every provider's ``_resolve_model`` reads
+        # ``self.config.default_model`` when metadata carries ""), but for
+        # DISPLAY purposes here we want that same value now rather than
+        # showing an empty model id. ``provider.config.default_model`` is
+        # itself already resolved from ``providers.<backend>.default_model``
+        # or the packaged ``DEFAULT_REVIEWER_MODEL`` constant at agent boot
+        # (``ReviewerAgent._build_default_registry``), so it is never
+        # empty for a real registered provider.
+        resolved_model = getattr(
+            getattr(provider, "config", None), "default_model", ""
+        )
+    return provider, resolved_model
 
 
 async def run(
@@ -382,11 +391,12 @@ async def run(
     config_path: str = "",
     provider=None,
 ) -> list[CaseReport]:
-    """Execute the check live. ``provider`` may be injected for tests; otherwise
-    the canonical registry is built via ``ReviewerAgent`` (same path the bus uses).
+    """Execute the check live. ``provider`` may be injected for tests — in
+    that case ``model`` is used verbatim; otherwise both are resolved
+    together via :func:`_resolve_provider_and_model` (same path the bus uses).
     """
     if provider is None:
-        provider = _build_provider(backend, config_path)
+        provider, model = _resolve_provider_and_model(backend, model, config_path)
 
     reports: list[CaseReport] = []
     for case in load_fp_cases():
@@ -431,13 +441,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     # ``--model`` defaults to "" (the provider-default sentinel), NOT the
     # ``DEFAULT_REVIEWER_MODEL`` constant directly (codex + Copilot PR #73
     # review): a non-empty CLI default would always win over an operator's
-    # ``providers.<backend>.default_model`` config override (``_resolve_model``
-    # treats any non-empty ``metadata["model"]`` as an override), so a box
-    # serving a different resident quant would still get requests for the
-    # packaged constant and TabbyAPI would reject them. Leaving it empty lets
-    # the provider's own configured default win, falling back to
-    # ``DEFAULT_REVIEWER_MODEL`` only when config doesn't override it either
-    # (see :func:`_effective_model`, used for display in :func:`main`).
+    # ``default_models`` / ``providers.<backend>.default_model`` config
+    # override (``_resolve_model`` treats any non-empty ``metadata["model"]``
+    # as an override), so a box serving a different resident quant would
+    # still get requests for the packaged constant and TabbyAPI would reject
+    # them. Leaving it empty lets :func:`_resolve_provider_and_model` apply
+    # the selector's own precedence, falling back to ``DEFAULT_REVIEWER_MODEL``
+    # only when config doesn't override it either.
     p.add_argument("--model", default="")
     p.add_argument("--backend", default=DEFAULT_REVIEWER_BACKEND)
     p.add_argument("--runs", type=int, default=5)
@@ -472,12 +482,13 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
-    # Build the provider once, up front — both to resolve the effective
-    # display model (falling back to the operator's configured
-    # ``providers.<backend>.default_model`` when ``--model`` is unset) and
-    # to hand it to ``run`` directly, avoiding a second registry build.
-    provider = _build_provider(args.backend, args.config)
-    effective_model = _effective_model(provider, args.model)
+    # Resolve the provider + effective model once, up front, via the same
+    # ProviderSelector precedence a live review uses — both to display the
+    # real resolved model and to hand the provider to ``run`` directly,
+    # avoiding a second selector build.
+    provider, effective_model = _resolve_provider_and_model(
+        args.backend, args.model, args.config
+    )
     reports = asyncio.run(
         run(
             model=effective_model,
