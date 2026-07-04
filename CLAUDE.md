@@ -20,24 +20,31 @@ When working here:
 
 ## Backends
 
-The reviewer ships with two first-class backends:
+The reviewer ships with five first-class backends (`reviewer/providers/`):
+Ollama, TabbyAPI (the resident hot-tier engine, `reviewer.defaults.DEFAULT_REVIEWER_BACKEND`),
+Claude-via-CLI, Codex-via-CLI, and GitHub-Copilot-via-CLI. See `README.md`
+for provisioning/setup per backend. Two notes worth keeping here rather
+than in the README:
 
-1. **Ollama** via `httpx` against the **native** `/api/chat` endpoint
-   (`http://localhost:11434/api/chat`). Configs still set `base_url` to
-   the OpenAI-compat `/v1` base for back-compat; the provider strips the
-   `/v1` suffix to reach the native surface. The native endpoint is
-   required because the `/v1` OpenAI-compat shim *silently drops*
-   `options.num_ctx`, truncating every large review at the 4096-token
-   default (`bug_reviewer_832a909b`); the native endpoint honors it.
-2. **Claude-via-CLI** via subprocess around `claude -p --output-format=json`,
-   consuming the Claude Pro/Max subscription quota via
-   `CLAUDE_CODE_OAUTH_TOKEN` (provisioned per-machine via `claude setup-token`).
+- **Ollama** talks to the **native** `/api/chat` endpoint
+  (`http://localhost:11434/api/chat`), not the OpenAI-compat `/v1` shim —
+  the shim *silently drops* `options.num_ctx`, truncating every large
+  review at the 4096-token default (`bug_reviewer_832a909b`); the native
+  endpoint honors it. Configs still set `base_url` to the `/v1` base for
+  back-compat; the provider strips the `/v1` suffix itself.
+- **Claude-via-CLI** is a deliberate exception to the usual
+  SDK-over-subprocess preference: the Anthropic SDK does not accept
+  subscription OAuth tokens, and using them from third-party SDKs
+  violates the 2026 Consumer TOS. `claude -p` is the only sanctioned path
+  for subscription-backed Claude usage (`CLAUDE_CODE_OAUTH_TOKEN`,
+  provisioned per-machine via `claude setup-token`).
 
-The Claude subprocess is a deliberate exception to the usual
-SDK-over-subprocess preference: the Anthropic SDK does not accept
-subscription OAuth tokens, and using them from third-party SDKs violates
-the 2026 Consumer TOS. `claude -p` is the only sanctioned path for
-subscription-backed Claude usage.
+**Forward note:** per-call `(backend, model)` selection is expected to be
+superseded by a dispatcher-owned skill-request model (the caller asks for
+a capability, dispatcher picks the engine) once that work lands — see the
+`dispatcher-will-own-tabbyapi` project memory. Don't invest further in
+backend-selection plumbing/docs beyond factual accuracy until that
+direction is confirmed.
 
 ## Credentials
 
