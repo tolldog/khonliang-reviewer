@@ -59,7 +59,7 @@ from typing import Iterable
 
 from khonliang_reviewer import ReviewRequest, ReviewResult
 
-from reviewer.defaults import DEFAULT_REVIEWER_BACKEND, DEFAULT_REVIEWER_MODEL
+from reviewer.defaults import DEFAULT_REVIEWER_BACKEND
 
 _FIXTURE_PACKAGE = "reviewer.tools.benchmark_data"
 _FP_PREFIX = "fp_"
@@ -438,7 +438,19 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=0.6,
         help="min fraction of (non-errored) control runs that must flag the defect",
     )
-    p.add_argument("--config", default="", help="path to reviewer config.yaml")
+    # Defaults to "config.yaml" (relative to cwd) — the same convention
+    # reviewer.agent.main() uses for its own --config default — NOT "" (codex
+    # PR #73 P2): ReviewerAgent._load_config short-circuits to {} for an
+    # empty path, so a "" default would silently skip the operator's local
+    # config.yaml entirely, meaning a box with a providers.<backend>.
+    # default_model override for its actual resident quant would never see
+    # it even though --model's own empty-sentinel default (above) exists
+    # specifically to let that override win. An explicit --config "" still
+    # opts out for callers who want the packaged-only config (missing-file
+    # is a tolerated no-op per _load_config's own contract).
+    p.add_argument(
+        "--config", default="config.yaml", help="path to reviewer config.yaml"
+    )
     return p
 
 
