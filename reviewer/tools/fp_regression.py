@@ -328,6 +328,36 @@ def evaluate(
     return ok, lines
 
 
+def _build_provider(backend: str, config_path: str):
+    """Build the canonical provider for ``backend`` via ``ReviewerAgent``.
+
+    Extracted so both :func:`run` and :func:`main` can resolve a provider
+    once — ``main`` needs it up front to compute the effective display
+    model (see :func:`_effective_model`) before the sweep starts.
+    """
+    from reviewer.agent import ReviewerAgent  # cold-path import
+
+    agent = ReviewerAgent(
+        agent_id="fp-regression",
+        bus_url="http://fp-regression.invalid",  # never invoked
+        config_path=config_path,
+    )
+    provider = agent._ensure_registry().get_provider(backend)
+    if provider is None:
+        raise SystemExit(f"backend {backend!r} not registered")
+    return provider
+
+
+def _effective_model(provider, model: str) -> str:
+    """Resolve ``model`` for display, falling back to the provider's own
+    configured default when ``model`` is the "" sentinel (codex/Copilot PR
+    #73 review: the CLI default must not shadow an operator's
+    ``providers.<backend>.default_model`` override with the packaged
+    ``DEFAULT_REVIEWER_MODEL`` constant — see :func:`_build_argparser`).
+    """
+    return model or getattr(getattr(provider, "config", None), "default_model", "")
+
+
 async def run(
     *,
     model: str,
@@ -340,16 +370,7 @@ async def run(
     the canonical registry is built via ``ReviewerAgent`` (same path the bus uses).
     """
     if provider is None:
-        from reviewer.agent import ReviewerAgent  # cold-path import
-
-        agent = ReviewerAgent(
-            agent_id="fp-regression",
-            bus_url="http://fp-regression.invalid",  # never invoked
-            config_path=config_path,
-        )
-        provider = agent._ensure_registry().get_provider(backend)
-    if provider is None:
-        raise SystemExit(f"backend {backend!r} not registered")
+        provider = _build_provider(backend, config_path)
 
     reports: list[CaseReport] = []
     for case in load_fp_cases():
@@ -390,7 +411,18 @@ def _build_argparser() -> argparse.ArgumentParser:
     # Known gap: fp_hunk_isolation currently FAILS against this default
     # (dog_c810371c) — tracked, not silently masked; see the
     # hunk-isolation-fp-per-model-fork memory and its follow-up FR.
-    p.add_argument("--model", default=DEFAULT_REVIEWER_MODEL)
+    #
+    # ``--model`` defaults to "" (the provider-default sentinel), NOT the
+    # ``DEFAULT_REVIEWER_MODEL`` constant directly (codex + Copilot PR #73
+    # review): a non-empty CLI default would always win over an operator's
+    # ``providers.<backend>.default_model`` config override (``_resolve_model``
+    # treats any non-empty ``metadata["model"]`` as an override), so a box
+    # serving a different resident quant would still get requests for the
+    # packaged constant and TabbyAPI would reject them. Leaving it empty lets
+    # the provider's own configured default win, falling back to
+    # ``DEFAULT_REVIEWER_MODEL`` only when config doesn't override it either
+    # (see :func:`_effective_model`, used for display in :func:`main`).
+    p.add_argument("--model", default="")
     p.add_argument("--backend", default=DEFAULT_REVIEWER_BACKEND)
     p.add_argument("--runs", type=int, default=5)
     p.add_argument(
@@ -412,12 +444,19 @@ def _build_argparser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
+    # Build the provider once, up front — both to resolve the effective
+    # display model (falling back to the operator's configured
+    # ``providers.<backend>.default_model`` when ``--model`` is unset) and
+    # to hand it to ``run`` directly, avoiding a second registry build.
+    provider = _build_provider(args.backend, args.config)
+    effective_model = _effective_model(provider, args.model)
     reports = asyncio.run(
         run(
-            model=args.model,
+            model=effective_model,
             backend=args.backend,
             runs=args.runs,
             config_path=args.config,
+            provider=provider,
         )
     )
     ok, lines = evaluate(
@@ -425,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
         max_fp_concern_rate=args.max_fp_concern_rate,
         min_control_hit_rate=args.min_control_hit_rate,
     )
-    print(f"# FP-regression: {args.backend}/{args.model}, N={args.runs}")
+    print(f"# FP-regression: {args.backend}/{effective_model}, N={args.runs}")
     for line in lines:
         print(line)
     print("RESULT:", "PASS" if ok else "FAIL")
