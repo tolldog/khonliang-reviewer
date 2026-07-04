@@ -6193,6 +6193,34 @@ async def test_verdict_probe_self_comparison_errors_before_provider_call():
     assert fake.last_request is None
 
 
+async def test_verdict_probe_self_comparison_check_ordered_after_binary_mode():
+    """Copilot PR #75 review: binary-mode/consensus rejections must surface
+    BEFORE the self-comparison check — a caller who is not even in binary
+    mode gets the more fundamental error, not 'same model', even when their
+    probe spec happens to also match the primary."""
+    fake = _RecordingProvider("ollama", _make_result())
+    harness = _make_harness({"ollama": fake})
+
+    result = await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "backend": "ollama",
+            "model": "qwen2.5-coder:14b",
+            # scoring_mode omitted -> holistic, not binary -> the "requires
+            # binary_questions" rejection should fire, NOT self-comparison,
+            # even though this spec matches the primary exactly.
+            "verdict_probe": "ollama:qwen2.5-coder:14b",
+        },
+    )
+
+    assert "error" in result
+    assert "binary_questions" in result["error"]
+    assert "same" not in result["error"].lower()
+    assert fake.last_request is None
+
+
 async def test_verdict_probe_same_backend_different_model_is_allowed(monkeypatch):
     """Same-backend-different-model is a legitimate probe (e.g. two ollama
     models) — only an EXACT (backend, model) match is rejected. Both passes

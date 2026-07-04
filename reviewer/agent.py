@@ -2280,18 +2280,42 @@ class ReviewerAgent(BaseAgent):
                         f"{sorted(self._ensure_selector().providers)}"
                     )
                 }
+            if not (binary_questions and kind == "pr_diff"):
+                return {
+                    "error": (
+                        "verdict_probe requires scoring_mode="
+                        "'binary_questions' AND kind='pr_diff' — the only "
+                        "combination that produces verdicts to compare "
+                        f"(got scoring_mode={scoring_mode!r}, kind={kind!r})."
+                    )
+                }
+            if consensus_runs > 1:
+                return {
+                    "error": (
+                        "verdict_probe with consensus_runs>1 is not "
+                        "supported: there is no single primary verdict set "
+                        "to compare the probe pass against. Use "
+                        "consensus_runs=1."
+                    )
+                }
             # Reject a probe that would compare a model against itself
             # (fr_khonliang-reviewer_fb86a297's "also fold in" item):
             # self-comparison always fully agrees, so it burns a whole
             # second pass (real compute — ``_run_verdict_probe`` records
             # usage even on skip) for a disagreement artifact that can
-            # never disagree. Resolve BOTH sides' effective model — the
-            # primary's ``chosen_model`` can itself be the "" provider-
-            # default sentinel (fr_khonliang-reviewer_0e7ccff1's resident-
-            # tier rule rows), so compare against what the provider will
-            # ACTUALLY use, not the literal sentinel. Both resolutions go
-            # through ``ProviderSelector.select``, a pure dict lookup with
-            # no provider I/O, so this check costs nothing extra.
+            # never disagree. Ordered AFTER the binary-mode/consensus
+            # checks above (Copilot PR #75 review): those name a more
+            # fundamental reason the probe is invalid, and should surface
+            # first even when the caller's spec happens to also match the
+            # primary — self-comparison is only a meaningful rejection once
+            # every other precondition for a probe pass is already met.
+            # Resolve BOTH sides' effective model — the primary's
+            # ``chosen_model`` can itself be the "" provider-default
+            # sentinel (fr_khonliang-reviewer_0e7ccff1's resident-tier rule
+            # rows), so compare against what the provider will ACTUALLY
+            # use, not the literal sentinel. Both resolutions go through
+            # ``ProviderSelector.select``, a pure dict lookup with no
+            # provider I/O, so this check costs nothing extra.
             primary_effective_model = chosen_model or getattr(
                 getattr(provider, "config", None), "default_model", ""
             )
@@ -2317,24 +2341,6 @@ class ReviewerAgent(BaseAgent):
                         "— a model always agrees with itself, so this "
                         "probe can never produce a disagreement artifact. "
                         "Pick a different backend/model."
-                    )
-                }
-            if not (binary_questions and kind == "pr_diff"):
-                return {
-                    "error": (
-                        "verdict_probe requires scoring_mode="
-                        "'binary_questions' AND kind='pr_diff' — the only "
-                        "combination that produces verdicts to compare "
-                        f"(got scoring_mode={scoring_mode!r}, kind={kind!r})."
-                    )
-                }
-            if consensus_runs > 1:
-                return {
-                    "error": (
-                        "verdict_probe with consensus_runs>1 is not "
-                        "supported: there is no single primary verdict set "
-                        "to compare the probe pass against. Use "
-                        "consensus_runs=1."
                     )
                 }
 
