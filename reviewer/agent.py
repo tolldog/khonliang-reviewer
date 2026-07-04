@@ -2283,7 +2283,9 @@ class ReviewerAgent(BaseAgent):
         )
         if verdict_probe_active:
             try:
-                probe_backend, _ = _parse_verdict_probe_spec(verdict_probe_arg)
+                probe_backend, probe_model_arg = _parse_verdict_probe_spec(
+                    verdict_probe_arg
+                )
             except VerdictProbeError as exc:
                 return {"error": str(exc)}
             if probe_backend not in self._ensure_selector().providers:
@@ -2310,6 +2312,51 @@ class ReviewerAgent(BaseAgent):
                         "supported: there is no single primary verdict set "
                         "to compare the probe pass against. Use "
                         "consensus_runs=1."
+                    )
+                }
+            # Reject a probe that would compare a model against itself
+            # (fr_khonliang-reviewer_fb86a297's "also fold in" item):
+            # self-comparison always fully agrees, so it burns a whole
+            # second pass (real compute — ``_run_verdict_probe`` records
+            # usage even on skip) for a disagreement artifact that can
+            # never disagree. Ordered AFTER the binary-mode/consensus
+            # checks above (Copilot PR #75 review): those name a more
+            # fundamental reason the probe is invalid, and should surface
+            # first even when the caller's spec happens to also match the
+            # primary — self-comparison is only a meaningful rejection once
+            # every other precondition for a probe pass is already met.
+            # Resolve BOTH sides' effective model — the primary's
+            # ``chosen_model`` can itself be the "" provider-default
+            # sentinel (fr_khonliang-reviewer_0e7ccff1's resident-tier rule
+            # rows), so compare against what the provider will ACTUALLY
+            # use, not the literal sentinel. Both resolutions go through
+            # ``ProviderSelector.select``, a pure dict lookup with no
+            # provider I/O, so this check costs nothing extra.
+            primary_effective_model = chosen_model or getattr(
+                getattr(provider, "config", None), "default_model", ""
+            )
+            probe_provider_preview, probe_model_preview = (
+                self._ensure_selector().select(
+                    backend=probe_backend, model=probe_model_arg
+                )
+            )
+            probe_effective_model = probe_model_preview or getattr(
+                getattr(probe_provider_preview, "config", None),
+                "default_model",
+                "",
+            )
+            if (
+                probe_provider_preview.name == provider.name
+                and probe_effective_model == primary_effective_model
+            ):
+                return {
+                    "error": (
+                        f"verdict_probe={verdict_probe_arg!r} resolves to "
+                        f"the same (backend, model) as the primary review "
+                        f"({provider.name!r}, {primary_effective_model!r}) "
+                        "— a model always agrees with itself, so this "
+                        "probe can never produce a disagreement artifact. "
+                        "Pick a different backend/model."
                     )
                 }
 
