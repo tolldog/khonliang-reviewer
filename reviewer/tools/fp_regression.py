@@ -33,16 +33,21 @@ CLI::
     python -m reviewer.tools.fp_regression --runs 5   # defaults to the resident hot tier
 
 Exit code is 0 when every fixture passes, 1 otherwise — usable as a gate. The
-default backend/model is :data:`reviewer.defaults.DEFAULT_REVIEWER_BACKEND` /
-:data:`reviewer.defaults.DEFAULT_REVIEWER_MODEL` — the ecosystem-wide resident
-hot tier (TabbyAPI/Qwen3-14B-exl3-6bpw as of fr_khonliang-reviewer_0e7ccff1),
-so a bare invocation always exercises whatever the box actually serves in
-production. Pass ``--backend ollama --model qwen2.5-coder:14b`` (or
-``deepseek-coder-v2:16b``) to check an older ollama-hosted model instead. See
-the ``reviewer-fp-calibration-measurement`` memory for the ollama-era
-per-model tradeoffs, and ``hunk-isolation-fp-per-model-fork`` for why
-``fp_hunk_isolation`` currently fails against the new default (dog_c810371c,
-tracked by a follow-up FR, not a bug in this tool).
+default backend is :data:`reviewer.defaults.DEFAULT_REVIEWER_BACKEND` — the
+ecosystem-wide resident hot tier (TabbyAPI as of
+fr_khonliang-reviewer_0e7ccff1). The default MODEL is resolved the same way
+every other reviewer call resolves an unspecified model: an operator's local
+``config.yaml`` (``providers.<backend>.default_model`` / ``default_models``)
+wins when present, falling back to
+:data:`reviewer.defaults.DEFAULT_REVIEWER_MODEL` (Qwen3-14B-exl3-6bpw) only
+when config doesn't override it — see :func:`_effective_model`. So a bare
+invocation exercises whatever the box actually serves in production, config
+override included, not always the literal packaged constant. Pass ``--backend
+ollama --model qwen2.5-coder:14b`` (or ``deepseek-coder-v2:16b``) to check an
+older ollama-hosted model instead. See the ``reviewer-fp-calibration-measurement``
+memory for the ollama-era per-model tradeoffs, and ``hunk-isolation-fp-per-model-fork``
+for why ``fp_hunk_isolation`` currently fails against the new default
+(dog_c810371c, tracked by a follow-up FR, not a bug in this tool).
 
 The pure aggregation/verdict functions (:func:`classify_run`, :func:`evaluate`) are
 model-free and unit-tested; only :func:`run` touches a live provider.
@@ -354,8 +359,19 @@ def _effective_model(provider, model: str) -> str:
     #73 review: the CLI default must not shadow an operator's
     ``providers.<backend>.default_model`` override with the packaged
     ``DEFAULT_REVIEWER_MODEL`` constant — see :func:`_build_argparser`).
+
+    ``model`` is stripped before the truthiness check (Copilot PR #73
+    review round 3): providers' own ``_resolve_model`` treats a
+    whitespace-only override as unset (``if override.strip():``), so a
+    bare ``model.strip()``-less check here would display/pass through
+    ``"   "`` as if it were a real model id while every provider actually
+    falls back to its configured default — an inconsistency between what
+    this function reports and what the provider will do.
     """
-    return model or getattr(getattr(provider, "config", None), "default_model", "")
+    stripped = model.strip() if isinstance(model, str) else model
+    return stripped or getattr(
+        getattr(provider, "config", None), "default_model", ""
+    )
 
 
 async def run(

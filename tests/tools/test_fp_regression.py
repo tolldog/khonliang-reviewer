@@ -6,6 +6,7 @@ from khonliang_reviewer import ReviewFinding, ReviewResult
 
 from reviewer.tools.fp_regression import (
     CaseReport,
+    _effective_model,
     classify_run,
     evaluate,
     load_fp_cases,
@@ -341,6 +342,40 @@ def test_control_keywords_reject_unrelated_wording():
 
 def _f2(title, body):
     return ReviewFinding(severity="comment", title=title, body=body)  # type: ignore[arg-type]
+
+
+# -- _effective_model ---------------------------------------------------
+
+
+class _FakeConfig:
+    default_model = "config-default-model"
+
+
+class _FakeProviderWithConfig:
+    config = _FakeConfig()
+
+
+def test_effective_model_uses_explicit_model_when_non_empty():
+    assert _effective_model(_FakeProviderWithConfig(), "explicit-model") == "explicit-model"
+
+
+def test_effective_model_falls_back_to_provider_config_default_for_empty_sentinel():
+    assert _effective_model(_FakeProviderWithConfig(), "") == "config-default-model"
+
+
+def test_effective_model_treats_whitespace_only_as_unset():
+    """Copilot PR #73 review round 3: providers' own _resolve_model treats a
+    whitespace-only override as unset (``if override.strip():``) — this
+    function must agree, or it would display/pass through "   " as a real
+    model id while the provider actually falls back to its default."""
+    assert _effective_model(_FakeProviderWithConfig(), "   ") == "config-default-model"
+
+
+def test_effective_model_no_config_attribute_returns_empty():
+    class _NoConfigProvider:
+        pass
+
+    assert _effective_model(_NoConfigProvider(), "") == ""
 
 
 # -- run() with an injected fake provider (no live model) --------------
