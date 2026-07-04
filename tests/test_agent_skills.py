@@ -562,6 +562,113 @@ async def test_review_text_skips_repo_config_when_context_hints_absent(monkeypat
     assert call_count == 0
 
 
+async def test_review_text_resolves_effective_model_for_repo_config_lookup(
+    monkeypatch,
+):
+    """fr_khonliang-reviewer_388c943a: a resident-tier rule-table decision
+    yields ``chosen_model == ""`` (the "let the provider apply its own
+    default" sentinel, fr_khonliang-reviewer_0e7ccff1) — the repo
+    ``.reviewer/models/<vendor>/<model>.yaml`` lookup must key on the model
+    the provider will ACTUALLY use (``provider.config.default_model``), not
+    the literal empty string, or a model-specific override file can never
+    match on a default-routed review (dormant codex round-6 P2 on PR #72).
+    """
+    from reviewer import agent as agent_mod
+    from reviewer.config.repo import RepoConfig
+
+    monkeypatch.setattr(
+        agent_mod,
+        "load_repo_config",
+        lambda repo_root, *, base_sha: RepoConfig(base_sha=base_sha),
+    )
+    monkeypatch.setattr(
+        agent_mod, "_load_repo_prompts_from_context", lambda _ctx: None
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _spy(cfg, *, kind, vendor, model):
+        captured["model"] = model
+        return None
+
+    monkeypatch.setattr(agent_mod, "_resolve_example_format_from_config", _spy)
+
+    class _FakeConfig:
+        default_model = "Qwen3-14B-exl3-6bpw"
+
+    class _TabbyFake(_RecordingProvider):
+        def __init__(self):
+            super().__init__("tabbyapi", _make_result(backend="tabbyapi"))
+            self.config = _FakeConfig()
+
+    harness = _make_harness({"tabbyapi": _TabbyFake()})
+
+    # No backend/model override → rule table's DEFAULT_FALLBACK, which
+    # routes to the resident tier with the "" provider-default sentinel.
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "context": {"repo_root": "/tmp/fake-repo", "base_sha": "deadbeef"},
+        },
+    )
+
+    assert captured["model"] == "Qwen3-14B-exl3-6bpw"
+
+
+async def test_review_text_caller_model_override_wins_over_provider_default(
+    monkeypatch,
+):
+    """Companion to the sentinel-resolution test above: when the caller
+    supplies an explicit non-empty ``model``, that value — not
+    ``provider.config.default_model`` — is what the repo config lookup
+    must key on.
+    """
+    from reviewer import agent as agent_mod
+    from reviewer.config.repo import RepoConfig
+
+    monkeypatch.setattr(
+        agent_mod,
+        "load_repo_config",
+        lambda repo_root, *, base_sha: RepoConfig(base_sha=base_sha),
+    )
+    monkeypatch.setattr(
+        agent_mod, "_load_repo_prompts_from_context", lambda _ctx: None
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _spy(cfg, *, kind, vendor, model):
+        captured["model"] = model
+        return None
+
+    monkeypatch.setattr(agent_mod, "_resolve_example_format_from_config", _spy)
+
+    class _FakeConfig:
+        default_model = "Qwen3-14B-exl3-6bpw"
+
+    class _TabbyFake(_RecordingProvider):
+        def __init__(self):
+            super().__init__("tabbyapi", _make_result(backend="tabbyapi"))
+            self.config = _FakeConfig()
+
+    harness = _make_harness({"tabbyapi": _TabbyFake()})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "backend": "tabbyapi",
+            "model": "some-other-quant",
+            "context": {"repo_root": "/tmp/fake-repo", "base_sha": "deadbeef"},
+        },
+    )
+
+    assert captured["model"] == "some-other-quant"
+
+
 # ---------------------------------------------------------------------------
 # review_text error paths
 # ---------------------------------------------------------------------------

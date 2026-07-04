@@ -2167,11 +2167,27 @@ class ReviewerAgent(BaseAgent):
         # actually reaches Claude-backed reviews. Without this step the
         # resolver looks under ``claude_cli/`` (which will never exist)
         # and silently falls back to the markdown default.
+        #
+        # ``chosen_model`` can be the "" sentinel (resident-tier rule rows,
+        # fr_khonliang-reviewer_0e7ccff1) meaning "let the provider apply
+        # its own default" — each provider's own ``_resolve_model`` reads
+        # ``self.config.default_model`` in that case. A repo config lookup
+        # keyed on the LITERAL "" would only ever match a
+        # ``.reviewer/models/<vendor>/<model>.yaml`` file also named "",
+        # which cannot exist, so model-specific overrides silently never
+        # apply on default-routed reviews (codex round-6 P2,
+        # fr_khonliang-reviewer_388c943a). Resolve the same effective id the
+        # provider will actually use before the lookup; the sentinel itself
+        # is left untouched on ``metadata["model"]`` below — providers still
+        # do their own resolution on the wire.
+        effective_model = chosen_model or getattr(
+            getattr(provider, "config", None), "default_model", ""
+        )
         example_format = _resolve_example_format_from_config(
             repo_cfg,
             kind=kind,
             vendor=provider_to_vendor(provider.name),
-            model=chosen_model,
+            model=effective_model,
         )
         if repo_prompts is not None:
             metadata[_METADATA_REPO_PROMPTS_KEY] = repo_prompts
