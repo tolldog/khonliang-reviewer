@@ -2,13 +2,11 @@
 
 **Milestone:** `ms_reviewer_44949efb`
 **Target:** `reviewer`
-**Status:** in_progress (4/5 FRs cleanly merged; fr_reviewer_2c751c3b's
-Acceptance #2 — `.reviewer/models/ollama/<model>.yaml: num_ctx` per-model
-override — was never wired despite the FR reading "merged". Verified in
-code: num_ctx resolution is only request.metadata override →
-providers.ollama.num_ctx global config → auto-bump heuristic; no per-model
-YAML path exists. Close this milestone once that gap is closed or the
-criterion is descoped.)
+**Status:** completed (fr_reviewer_2c751c3b's Acceptance #2 —
+`.reviewer/models/ollama/<model>.yaml: num_ctx` per-model override — was
+found unwired despite the FR reading "merged"; closed via PR #77 with
+`_resolve_num_ctx_from_config`, mirroring `_resolve_example_format_from_config`.
+All 5 FRs now genuinely complete.)
 **FRs:**
 - `fr_reviewer_1c25c615` — `SelectorConfig` per-backend default models
 - `fr_reviewer_2c751c3b` — `num_ctx` / context-window as reviewer provider knob
