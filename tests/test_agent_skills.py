@@ -669,6 +669,96 @@ async def test_review_text_caller_model_override_wins_over_provider_default(
     assert captured["model"] == "some-other-quant"
 
 
+async def test_review_text_resolves_num_ctx_from_repo_model_config(monkeypatch):
+    """MS-D fr_reviewer_2c751c3b Acceptance #2: a repo-side
+    ``.reviewer/models/<vendor>/<model>.yaml: num_ctx`` override must reach
+    the provider's request metadata when the caller didn't pass an explicit
+    ``num_ctx`` skill-arg. This closes the gap codex found in PR #76 —
+    the FR read 'merged' but no code path ever read this key."""
+    from reviewer import agent as agent_mod
+    from reviewer.config.repo import RepoConfig
+
+    real_cfg = RepoConfig(
+        base_sha="deadbeef",
+        model_yamls={("ollama", "Qwen3-14B-exl3-6bpw"): {"num_ctx": 24576}},
+    )
+    monkeypatch.setattr(
+        agent_mod,
+        "load_repo_config",
+        lambda repo_root, *, base_sha: real_cfg,
+    )
+    monkeypatch.setattr(
+        agent_mod, "_load_repo_prompts_from_context", lambda _ctx: None
+    )
+
+    class _FakeConfig:
+        default_model = "Qwen3-14B-exl3-6bpw"
+
+    class _TabbyFake(_RecordingProvider):
+        def __init__(self):
+            super().__init__("tabbyapi", _make_result(backend="tabbyapi"))
+            self.config = _FakeConfig()
+
+    fake = _TabbyFake()
+    harness = _make_harness({"tabbyapi": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "context": {"repo_root": "/tmp/fake-repo", "base_sha": "deadbeef"},
+        },
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("num_ctx") == 24576
+
+
+async def test_review_text_caller_num_ctx_wins_over_repo_config(monkeypatch):
+    """Caller-supplied num_ctx skill-arg stays the highest-precedence
+    layer — a repo config override must not clobber it."""
+    from reviewer import agent as agent_mod
+    from reviewer.config.repo import RepoConfig
+
+    real_cfg = RepoConfig(
+        base_sha="deadbeef",
+        model_yamls={("ollama", "Qwen3-14B-exl3-6bpw"): {"num_ctx": 24576}},
+    )
+    monkeypatch.setattr(
+        agent_mod,
+        "load_repo_config",
+        lambda repo_root, *, base_sha: real_cfg,
+    )
+    monkeypatch.setattr(
+        agent_mod, "_load_repo_prompts_from_context", lambda _ctx: None
+    )
+
+    class _FakeConfig:
+        default_model = "Qwen3-14B-exl3-6bpw"
+
+    class _TabbyFake(_RecordingProvider):
+        def __init__(self):
+            super().__init__("tabbyapi", _make_result(backend="tabbyapi"))
+            self.config = _FakeConfig()
+
+    fake = _TabbyFake()
+    harness = _make_harness({"tabbyapi": fake})
+
+    await harness.call(
+        "review_text",
+        {
+            "kind": "pr_diff",
+            "content": "x",
+            "num_ctx": 8192,
+            "context": {"repo_root": "/tmp/fake-repo", "base_sha": "deadbeef"},
+        },
+    )
+
+    assert fake.last_request is not None
+    assert fake.last_request.metadata.get("num_ctx") == 8192
+
+
 # ---------------------------------------------------------------------------
 # review_text error paths
 # ---------------------------------------------------------------------------

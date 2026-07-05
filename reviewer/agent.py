@@ -1127,6 +1127,35 @@ def _resolve_example_format_from_config(
     return None
 
 
+def _resolve_num_ctx_from_config(
+    cfg: RepoConfig | None,
+    *,
+    kind: str,
+    vendor: str,
+    model: str,
+) -> int | None:
+    """Consult ``.reviewer/models/<vendor>/<model>.yaml`` for ``num_ctx``.
+
+    Closes MS-D's fr_reviewer_2c751c3b Acceptance #2, which shipped
+    everything except this: the FR's own text names per-model
+    ``.reviewer/models/ollama/<model>.yaml: num_ctx`` as a way to hold
+    context-window size constant for measurement runs, but until now
+    nothing ever read it — ``num_ctx`` resolution was only
+    ``request.metadata`` (caller override) -> ``providers.ollama.num_ctx``
+    (global operator config) -> the auto-bump heuristic. Same contract
+    and precedence position as :func:`_resolve_example_format_from_config`
+    (accepts a pre-loaded :class:`RepoConfig`, returns ``None`` on any
+    absence/wrong-type case so the caller falls through to the next layer).
+    """
+    if cfg is None:
+        return None
+    resolved = cfg.resolve(kind=kind, vendor=vendor, model=model)
+    value = resolved.get("num_ctx")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def _resolve_repo_severity_floor(cfg: RepoConfig | None) -> str | None:
     """Best-effort read of ``review.severity_floor`` from ``.reviewer/config.yaml``.
 
@@ -2189,6 +2218,22 @@ class ReviewerAgent(BaseAgent):
             vendor=provider_to_vendor(provider.name),
             model=effective_model,
         )
+        # Per-model num_ctx (MS-D fr_reviewer_2c751c3b Acceptance #2): only
+        # fills in when the caller didn't already pass an explicit
+        # num_ctx skill-arg (metadata["num_ctx"] set above) — caller
+        # override remains the highest-precedence layer, same as
+        # example_format's caller-vs-repo relationship. Falls through to
+        # the provider's own providers.<backend>.num_ctx / auto-bump
+        # heuristic when the repo carries no override either.
+        if "num_ctx" not in metadata:
+            repo_num_ctx = _resolve_num_ctx_from_config(
+                repo_cfg,
+                kind=kind,
+                vendor=provider_to_vendor(provider.name),
+                model=effective_model,
+            )
+            if repo_num_ctx is not None:
+                metadata["num_ctx"] = repo_num_ctx
         if repo_prompts is not None:
             metadata[_METADATA_REPO_PROMPTS_KEY] = repo_prompts
         if example_format is not None:
