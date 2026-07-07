@@ -2970,6 +2970,14 @@ def test_dispatcher_deadline_s_threads_from_config_yaml(tmp_path):
     selector = agent._ensure_selector()
     assert selector.providers["ollama"].config.deadline_s == 90
     assert selector.providers["tabbyapi"].config.deadline_s == 90
+    # codex review finding (round 5): DispatcherClient's own httpx
+    # transport timeout defaults to 30s, unrelated to deadline_s -- a
+    # single request can legitimately take up to deadline_s while the
+    # dispatcher queues/admits/swaps a model, so the transport timeout
+    # must be at least as generous or it fires mid-request and gets
+    # treated as a retryable transport error.
+    assert selector.providers["ollama"]._client._http.timeout.connect == 90
+    assert selector.providers["tabbyapi"]._client._http.timeout.connect == 90
 
 
 def test_dispatcher_deadline_s_absent_keeps_default(tmp_path):
@@ -2982,6 +2990,9 @@ def test_dispatcher_deadline_s_absent_keeps_default(tmp_path):
     )
     selector = agent._ensure_selector()
     assert selector.providers["ollama"].config.deadline_s == 240.0
+    # Same fix, default-deadline path: httpx transport timeout must
+    # still match (240s), not the DispatcherClient's own 30s default.
+    assert selector.providers["ollama"]._client._http.timeout.connect == 240.0
 
 
 def test_dispatcher_malformed_deadline_s_collapses_to_default(tmp_path):

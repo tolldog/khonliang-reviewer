@@ -4339,9 +4339,6 @@ class ReviewerAgent(BaseAgent):
         dispatcher_base_url = str(
             dispatcher_cfg.get("base_url") or "http://localhost:8790"
         )
-        dispatcher_client = DispatcherClient(
-            base_url=dispatcher_base_url, caller="khonliang-reviewer",
-        )
         dispatcher_deadline_raw = dispatcher_cfg.get("deadline_s")
         dispatcher_deadline = (
             float(dispatcher_deadline_raw)
@@ -4354,6 +4351,26 @@ class ReviewerAgent(BaseAgent):
             {"deadline_s": dispatcher_deadline}
             if dispatcher_deadline is not None
             else {}
+        )
+        # codex review finding (round 5): DispatcherClient defaults its
+        # own httpx transport timeout to 30s, unrelated to deadline_s
+        # (the wall-clock budget dispatcher_lib's own retry loop holds
+        # across attempts) -- a single POST /v1/submit call can
+        # legitimately take up to deadline_s while the dispatcher
+        # queues/admits/swaps a model, so a 30s transport timeout would
+        # fire mid-request on anything longer, get treated as a
+        # retryable transport error, and spin through retries instead
+        # of ever completing. Must be at least as generous as the
+        # configured (or default) deadline_s.
+        effective_deadline_s = (
+            dispatcher_deadline
+            if dispatcher_deadline is not None
+            else DispatcherProviderConfig().deadline_s
+        )
+        dispatcher_client = DispatcherClient(
+            base_url=dispatcher_base_url,
+            caller="khonliang-reviewer",
+            timeout=effective_deadline_s,
         )
         registry.register(
             DispatcherProvider(
