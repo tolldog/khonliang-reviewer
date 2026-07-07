@@ -44,6 +44,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from dispatcher_lib import (
     Busy,
     Cancelled,
@@ -70,6 +71,13 @@ from reviewer.providers._prompt import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Maps this repo's legacy backend names to the dispatcher's own
+#: engine-kind string (``dispatcher/agent.py``'s ``kind: ollama`` /
+#: ``kind: tabby`` config values) -- used by
+#: :meth:`DispatcherProvider.is_available` to find the right entry in
+#: ``GET /v1/engines``'s inventory.
+_NAME_TO_ENGINE_KIND = {"tabbyapi": "tabby", "ollama": "ollama"}
 
 
 @dataclass
@@ -108,6 +116,55 @@ class DispatcherProvider(ReviewProvider):
         #: Injectable for tests; production builds a real client.
         self._client = client or DispatcherClient(
             base_url=self.config.base_url, caller="khonliang-reviewer",
+        )
+
+    async def is_available(self, timeout_s: float = 2.0) -> bool:
+        """Cheap liveness probe -- restores the duck-typed hook
+        ``TabbyAPIProvider``/``OllamaProvider`` used to expose (codex
+        review finding: two existing call sites depend on it via
+        ``hasattr``/``callable`` rather than an abstract method, so
+        silently dropping it broke them without a type error).
+        ``reviewer.agent``'s rule-table degrade-path calls this to
+        reroute a ``tabbyapi`` pick to ``ollama`` when the resident
+        engine can't serve; ``ProviderRegistry._check_availability``
+        would call the sync analogue (``is_provisioned``) for the
+        cheap ``list_models`` probe -- NOT implemented here, since
+        there's no local, network-free signal to check anymore (the
+        api-key-presence check it used to run doesn't apply once the
+        dispatcher owns credentials). That cheap probe intentionally
+        degrades to "assume available" for ``tabbyapi`` now, same
+        posture ``ollama`` already has in that function.
+
+        Queries the dispatcher's ``GET /v1/engines`` and reports True
+        iff at least one engine of this provider's mapped kind
+        (``tabbyapi`` -> dispatcher engine kind ``"tabby"``; ``ollama``
+        -> ``"ollama"``) is currently available. Any transport/parse
+        failure (dispatcher unreachable, malformed body) reports
+        False -- same "don't route here" posture the old providers'
+        probes used.
+        """
+        engine_kind = _NAME_TO_ENGINE_KIND.get(self.name, self.name)
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as http:
+                response = await http.get(
+                    f"{self.config.base_url.rstrip('/')}/v1/engines"
+                )
+                response.raise_for_status()
+                body = response.json()
+        except Exception as exc:  # noqa: BLE001 — any probe failure means "don't route here"
+            logger.debug(
+                "dispatcher availability probe failed for %s: %s",
+                self.name, exc,
+            )
+            return False
+        engines = body.get("engines") if isinstance(body, dict) else None
+        if not isinstance(engines, list):
+            return False
+        return any(
+            isinstance(e, dict)
+            and e.get("engine") == engine_kind
+            and e.get("available")
+            for e in engines
         )
 
     async def review(self, request: ReviewRequest) -> ReviewResult:

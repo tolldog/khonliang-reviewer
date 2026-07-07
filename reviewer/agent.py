@@ -77,6 +77,10 @@ from reviewer.providers import (
     DispatcherProviderConfig,
     GhCopilotProvider,
     GhCopilotProviderConfig,
+    OllamaProvider,
+    OllamaProviderConfig,
+    TabbyAPIProvider,
+    TabbyAPIProviderConfig,
 )
 from reviewer.providers._prompt import (
     _METADATA_BINARY_QUESTIONS_KEY,
@@ -4083,23 +4087,23 @@ class ReviewerAgent(BaseAgent):
             self._cached_registry = self._build_default_registry()
         return self._cached_registry
 
-    def _build_default_registry(self) -> ProviderRegistry:
-        """Construct the canonical ProviderRegistry from agent config.
-
-        Reads ``providers.<backend>`` blocks from the agent config and
-        ``default_pricing.yaml`` rows for declared-model lists, then
-        registers ClaudeCli / CodexCli / Ollama providers under their
-        canonical backend names. Registration order is insertion
-        order; ``list_models`` returns providers in that order.
+    def _external_providers_setup(
+        self,
+    ) -> tuple[ProviderRegistry, dict[str, Any], dict[str, list[str]]]:
+        """Shared setup for both registry-construction paths: a fresh
+        registry with claude_cli/codex_cli/gh_copilot already
+        registered (identical for both, since only ollama/tabbyapi
+        diverge between the live gatewayed path and the offline
+        direct-engine path -- fr_reviewer_50a5b842 codex review
+        finding), plus the raw ``providers.<backend>`` config dict and
+        the declared-models-by-backend map both callers still need for
+        their own ollama/tabbyapi registration.
         """
         config = self._load_config()
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
-        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
-        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
-        dispatcher_cfg = _as_dict(providers_cfg.get("dispatcher"))
 
         # Per-backend declared-models comes from the pricing YAML;
         # operators add a row per (backend, model) they care about,
@@ -4150,6 +4154,130 @@ class ReviewerAgent(BaseAgent):
             default_model=copilot_default,
             declared_models=declared_by_backend.get("gh_copilot", []),
         )
+        return registry, providers_cfg, declared_by_backend
+
+    def _build_direct_engine_registry(self) -> ProviderRegistry:
+        """Registry variant with ollama/tabbyapi wired to their DIRECT
+        HTTP providers (bypassing the dispatcher gateway entirely).
+
+        For the offline comparison tools (``reviewer/tools/benchmark_sweep.py``,
+        ``reviewer/tools/fp_regression.py``) ONLY — fr_reviewer_50a5b842
+        codex review finding: those tools exist to measure controlled
+        A/B engine behavior, and routing them through
+        ``_build_default_registry``'s dispatcher-gatewayed providers
+        would silently change what they benchmark. The live bus-skill
+        path (``_ensure_registry``/``_build_default_registry``) must
+        NOT call this — it's the one path this FR explicitly reroutes.
+        """
+        registry, providers_cfg, declared_by_backend = self._external_providers_setup()
+        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
+
+        ollama_default = str(
+            ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
+        )
+        ollama_format_raw = ollama_cfg.get("format")
+        ollama_format = (
+            ollama_format_raw
+            if isinstance(ollama_format_raw, str) and ollama_format_raw
+            else None
+        )
+        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
+        ollama_num_ctx = (
+            ollama_num_ctx_raw
+            if isinstance(ollama_num_ctx_raw, int)
+            and not isinstance(ollama_num_ctx_raw, bool)
+            and ollama_num_ctx_raw > 0
+            else None
+        )
+        ollama_api_key_raw = ollama_cfg.get("api_key")
+        ollama_api_key = (
+            ollama_api_key_raw.strip()
+            if isinstance(ollama_api_key_raw, str) and ollama_api_key_raw.strip()
+            else None
+        )
+        ollama_retry_raw = ollama_cfg.get("retry_on_timeout")
+        ollama_retry_on_timeout = (
+            ollama_retry_raw if isinstance(ollama_retry_raw, bool) else None
+        )
+        registry.register(
+            OllamaProvider(
+                OllamaProviderConfig(
+                    base_url=str(
+                        ollama_cfg.get("base_url")
+                        or "http://localhost:11434/v1"
+                    ),
+                    default_model=ollama_default,
+                    num_ctx=ollama_num_ctx,
+                    format=ollama_format,
+                    **(
+                        {"retry_on_timeout": ollama_retry_on_timeout}
+                        if ollama_retry_on_timeout is not None
+                        else {}
+                    ),
+                    **({"api_key": ollama_api_key} if ollama_api_key else {}),
+                )
+            ),
+            default_model=ollama_default,
+            declared_models=declared_by_backend.get("ollama", []),
+        )
+        tabby_default = str(
+            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+        )
+        tabby_api_key_raw = tabbyapi_cfg.get("api_key")
+        tabby_api_key = (
+            tabby_api_key_raw.strip()
+            if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
+            else None
+        )
+        from reviewer.credentials import get_tabbyapi_key
+        tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
+        tabby_timeout = (
+            float(tabby_timeout_raw)
+            if isinstance(tabby_timeout_raw, (int, float))
+            and not isinstance(tabby_timeout_raw, bool)
+            and tabby_timeout_raw > 0
+            else None
+        )
+        registry.register(
+            TabbyAPIProvider(
+                TabbyAPIProviderConfig(
+                    base_url=str(
+                        tabbyapi_cfg.get("base_url")
+                        or "http://localhost:5000/v1"
+                    ),
+                    default_model=tabby_default,
+                    **({"api_key": tabby_api_key} if tabby_api_key else {}),
+                    **(
+                        {"timeout_seconds": tabby_timeout}
+                        if tabby_timeout is not None
+                        else {}
+                    ),
+                ),
+                api_key_provider=get_tabbyapi_key,
+            ),
+            default_model=tabby_default,
+            declared_models=declared_by_backend.get("tabbyapi", []),
+        )
+        return registry
+
+    def _build_default_registry(self) -> ProviderRegistry:
+        """Construct the canonical, LIVE ProviderRegistry from agent
+        config -- the one ``_ensure_registry``/bus skills use.
+
+        Registers ClaudeCli / CodexCli / GhCopilot under their
+        canonical backend names (shared with
+        :meth:`_build_direct_engine_registry` via
+        :meth:`_external_providers_setup`), then ollama/tabbyapi as
+        dispatcher-gatewayed ``DispatcherProvider`` instances.
+        Registration order is insertion order; ``list_models`` returns
+        providers in that order.
+        """
+        registry, providers_cfg, declared_by_backend = self._external_providers_setup()
+        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
+        dispatcher_cfg = _as_dict(providers_cfg.get("dispatcher"))
+
         # fr_reviewer_50a5b842: "internal" LLM access (tabbyapi + ollama
         # -- the self-hosted stack that competes for the shared local
         # GPU / runs through our own ollama daemon) is gatewayed through
@@ -4210,6 +4338,28 @@ class ReviewerAgent(BaseAgent):
             declared_models=declared_by_backend.get("tabbyapi", []),
         )
         return registry
+
+    def _build_direct_engine_selector(self) -> ProviderSelector:
+        """Selector variant over :meth:`_build_direct_engine_registry`
+        -- for the offline comparison tools (fr_reviewer_50a5b842
+        codex review finding), mirroring :meth:`_build_default_selector`
+        exactly except for which registry backs it. Not cached (unlike
+        ``_ensure_selector``): these tools construct one short-lived
+        ``ReviewerAgent`` per invocation, so there's no repeated-call
+        cost to amortize."""
+        config = self._load_config()
+        resolved_backend = str(
+            config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
+        )
+        configured_model = str(config.get("default_model") or "")
+        return ProviderSelector(
+            self._build_direct_engine_registry().providers,
+            SelectorConfig(
+                default_backend=resolved_backend,
+                default_model=configured_model,
+                default_models=_coerce_default_models(config.get("default_models")),
+            ),
+        )
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()

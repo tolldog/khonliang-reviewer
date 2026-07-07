@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 import pytest
 from dispatcher_lib import (
     Busy,
@@ -217,3 +218,102 @@ def test_config_defaults() -> None:
     config = DispatcherProviderConfig()
     assert config.base_url == "http://localhost:8790"
     assert config.deadline_s == 240.0
+
+
+class _FakeHttpxResponse:
+    def __init__(self, *, status_code: int = 200, json_data: Any = None) -> None:
+        self.status_code = status_code
+        self._json_data = json_data
+
+    def raise_for_status(self) -> None:
+        if not (200 <= self.status_code < 300):
+            request = httpx.Request("GET", "http://test/v1/engines")
+            raise httpx.HTTPStatusError(
+                "error", request=request,
+                response=httpx.Response(self.status_code, request=request),
+            )
+
+    def json(self) -> Any:
+        return self._json_data
+
+
+class _FakeAsyncHttpxClient:
+    def __init__(self, response: _FakeHttpxResponse | Exception) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> "_FakeAsyncHttpxClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        pass
+
+    async def get(self, url: str) -> _FakeHttpxResponse:
+        if isinstance(self._response, Exception):
+            raise self._response
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_is_available_true_when_engine_kind_available(monkeypatch) -> None:
+    response = _FakeHttpxResponse(json_data={
+        "engines": [
+            {"engine": "tabby", "available": True},
+            {"engine": "ollama", "available": False},
+        ]
+    })
+    monkeypatch.setattr(
+        "reviewer.providers.dispatcher_provider.httpx.AsyncClient",
+        lambda **_: _FakeAsyncHttpxClient(response),
+    )
+    provider = DispatcherProvider("tabbyapi", client=_FakeDispatcherClient(_success_handle()))
+
+    assert await provider.is_available() is True
+
+
+@pytest.mark.asyncio
+async def test_is_available_false_when_engine_kind_unavailable(monkeypatch) -> None:
+    response = _FakeHttpxResponse(json_data={
+        "engines": [{"engine": "tabby", "available": False}]
+    })
+    monkeypatch.setattr(
+        "reviewer.providers.dispatcher_provider.httpx.AsyncClient",
+        lambda **_: _FakeAsyncHttpxClient(response),
+    )
+    provider = DispatcherProvider("tabbyapi", client=_FakeDispatcherClient(_success_handle()))
+
+    assert await provider.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_is_available_false_when_engine_kind_absent(monkeypatch) -> None:
+    response = _FakeHttpxResponse(json_data={"engines": [{"engine": "ollama", "available": True}]})
+    monkeypatch.setattr(
+        "reviewer.providers.dispatcher_provider.httpx.AsyncClient",
+        lambda **_: _FakeAsyncHttpxClient(response),
+    )
+    provider = DispatcherProvider("tabbyapi", client=_FakeDispatcherClient(_success_handle()))
+
+    assert await provider.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_is_available_false_on_transport_error(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "reviewer.providers.dispatcher_provider.httpx.AsyncClient",
+        lambda **_: _FakeAsyncHttpxClient(httpx.ConnectError("refused")),
+    )
+    provider = DispatcherProvider("ollama", client=_FakeDispatcherClient(_success_handle()))
+
+    assert await provider.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_is_available_false_on_malformed_body(monkeypatch) -> None:
+    response = _FakeHttpxResponse(json_data={"not_engines": []})
+    monkeypatch.setattr(
+        "reviewer.providers.dispatcher_provider.httpx.AsyncClient",
+        lambda **_: _FakeAsyncHttpxClient(response),
+    )
+    provider = DispatcherProvider("ollama", client=_FakeDispatcherClient(_success_handle()))
+
+    assert await provider.is_available() is False

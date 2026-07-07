@@ -511,7 +511,12 @@ async def run(
             bus_url="http://benchmark.invalid",  # never invoked
             config_path=config_path,
         )
-        registry = agent._ensure_registry()
+        # fr_reviewer_50a5b842: this tool exists to measure controlled
+        # A/B engine behavior -- it must keep hitting ollama/tabbyapi
+        # DIRECTLY, not through the dispatcher gateway the live bus
+        # skills now use (_ensure_registry would silently change what
+        # gets benchmarked).
+        registry = agent._build_direct_engine_registry()
 
     pairs = _filter_registry(registry, backends=backends, models=models)
     rows: list[_BenchmarkRow] = []

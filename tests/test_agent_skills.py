@@ -6967,3 +6967,71 @@ async def test_opt_out_reroute_honors_per_backend_default_models(tmp_path):
     assert result["disposition"] == "posted"
     assert ollama.last_request is not None
     assert ollama.last_request.metadata["model"] == "glm-4.7-flash"
+
+
+def test_build_direct_engine_registry_uses_real_ollama_tabby_providers(tmp_path):
+    """fr_reviewer_50a5b842 codex review finding: the offline
+    comparison tools (benchmark_sweep, fp_regression) must keep
+    hitting ollama/tabbyapi DIRECTLY, bypassing the dispatcher gateway
+    the live bus-skill path now uses."""
+    from reviewer.providers.ollama import OllamaProvider
+    from reviewer.providers.tabbyapi import TabbyAPIProvider
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    registry = agent._build_direct_engine_registry()
+    assert isinstance(registry.providers["ollama"], OllamaProvider)
+    assert isinstance(registry.providers["tabbyapi"], TabbyAPIProvider)
+    assert registry.providers["ollama"].config.default_model == "glm-4.7-flash"
+
+
+def test_build_direct_engine_registry_still_registers_external_providers(tmp_path):
+    """External providers (claude_cli/codex_cli/gh_copilot) are shared
+    between both registry variants -- only ollama/tabbyapi diverge."""
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    registry = agent._build_direct_engine_registry()
+    assert set(registry.providers) == {
+        "claude_cli", "codex_cli", "gh_copilot", "ollama", "tabbyapi",
+    }
+
+
+def test_ensure_registry_still_uses_dispatcher_provider(tmp_path):
+    """The LIVE path (bus skills) must still go through the gateway --
+    only the offline-tools path (_build_direct_engine_registry) bypasses
+    it."""
+    from reviewer.providers.dispatcher_provider import DispatcherProvider
+
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    registry = agent._ensure_registry()
+    assert isinstance(registry.providers["ollama"], DispatcherProvider)
+    assert isinstance(registry.providers["tabbyapi"], DispatcherProvider)
+
+
+def test_build_direct_engine_selector_selects_direct_providers(tmp_path):
+    from reviewer.providers.tabbyapi import TabbyAPIProvider
+
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    selector = agent._build_direct_engine_selector()
+    provider, _ = selector.select(backend="tabbyapi", model=None)
+    assert isinstance(provider, TabbyAPIProvider)
