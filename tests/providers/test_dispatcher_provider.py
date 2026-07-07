@@ -425,3 +425,28 @@ async def test_tabbyapi_disable_thinking_false_omits_chat_template_kwargs() -> N
     await provider.review(_request())
 
     assert client.calls[0]["task"].options == {"max_tokens": 2048}
+
+
+class _RaisingDispatcherClient:
+    """Simulates DispatcherClient.run() itself raising (dispatcher
+    unreachable/stopped, or any unexpected client-side error) rather
+    than returning a Handle -- codex review finding, round 4."""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.base_url = "http://test:8790"
+
+    def run(self, **kwargs: Any) -> Handle:
+        raise self.exc
+
+
+@pytest.mark.asyncio
+async def test_review_client_run_raising_is_errored_not_propagated() -> None:
+    client = _RaisingDispatcherClient(ConnectionError("dispatcher unreachable"))
+    provider = DispatcherProvider("tabbyapi", client=client)
+
+    result = await provider.review(_request())
+
+    assert result.disposition == "errored"
+    assert result.error_category == "backend_error"
+    assert "dispatcher unreachable" in result.error

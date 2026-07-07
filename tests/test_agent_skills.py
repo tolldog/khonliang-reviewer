@@ -7061,3 +7061,40 @@ def test_build_direct_engine_selector_selects_direct_providers(tmp_path):
     selector = agent._build_direct_engine_selector()
     provider, _ = selector.select(backend="tabbyapi", model=None)
     assert isinstance(provider, TabbyAPIProvider)
+
+
+def test_dispatcher_explicit_empty_default_model_enables_skill_routing(tmp_path):
+    """codex review finding (round 4): an explicit
+    providers.ollama.default_model: "" must be respected verbatim (the
+    one way to opt a gatewayed backend fully into the dispatcher's
+    skill_policy.yaml routing) -- NOT silently overridden by the
+    hardcoded backward-compat fallback, which would make skill=
+    routing unreachable from config entirely."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: \"\"\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.default_model == ""
+
+
+def test_dispatcher_default_model_absent_key_still_gets_fallback(tmp_path):
+    """Backward compat: omitting providers.ollama.default_model
+    entirely (not setting it to "") still gets the hardcoded default,
+    same as every pre-existing deploy."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("providers:\n  ollama: {}\n")
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.default_model == "deepseek-coder-v2:16b"

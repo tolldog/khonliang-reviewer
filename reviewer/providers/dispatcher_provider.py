@@ -308,7 +308,26 @@ class DispatcherProvider(ReviewProvider):
         # deadline_s seconds, freezing every other concurrent review /
         # bus handler this agent is running. Run it in a thread so only
         # this one review's coroutine waits.
-        handle = await asyncio.to_thread(lambda: self._client.run(**run_kwargs))
+        try:
+            handle = await asyncio.to_thread(lambda: self._client.run(**run_kwargs))
+        except Exception as exc:  # noqa: BLE001 — codex review finding (round 4):
+            # run() itself can raise for failures the typed Handle
+            # contract doesn't cover (dispatcher unreachable/stopped, a
+            # malformed success response body dispatcher_lib doesn't
+            # defensively parse, any other unexpected client error) --
+            # letting that propagate turns a normal backend outage into
+            # a hard failure for every live review instead of the
+            # errored ReviewResult every other failure path here
+            # returns.
+            return _errored(
+                request,
+                error=f"dispatcher client error: {exc}",
+                error_category="backend_error",
+                model=model_override or "",
+                backend=self.name,
+                started_wall=started_wall,
+                duration_ms=_elapsed_ms(started_mono),
+            )
         try:
             result = handle.result()
         except TaskInvalid as exc:

@@ -4299,11 +4299,29 @@ class ReviewerAgent(BaseAgent):
         # handed to the dispatcher's skill resolver to redecide across
         # both internal engines. See DispatcherProviderConfig.default_model's
         # own docstring for the full reasoning.
-        ollama_default = str(
-            ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
+        #
+        # codex review finding (round 4): using `or` here made it
+        # impossible to configure an intentionally EMPTY
+        # providers.<backend>.default_model -- the one way an operator
+        # opts a gatewayed backend fully into the dispatcher's
+        # skill_policy.yaml routing (see DispatcherProviderConfig.default_model).
+        # An `or` fallback treats explicit "" the same as the key being
+        # absent entirely, silently forcing the hardcoded fallback
+        # model and making skill=request.kind unreachable from config.
+        # Distinguish "key absent" (`None` -- apply the backward-compat
+        # fallback) from "key present, possibly empty" (respect it
+        # verbatim, including "").
+        ollama_default_raw = ollama_cfg.get("default_model")
+        ollama_default = (
+            str(ollama_default_raw)
+            if ollama_default_raw is not None
+            else "deepseek-coder-v2:16b"
         )
-        tabby_default = str(
-            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+        tabby_default_raw = tabbyapi_cfg.get("default_model")
+        tabby_default = (
+            str(tabby_default_raw)
+            if tabby_default_raw is not None
+            else DEFAULT_REVIEWER_MODEL
         )
         # codex review finding (round 3): forwarded generation options
         # were dropped entirely on the gatewayed path. num_ctx is the
