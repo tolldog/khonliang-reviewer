@@ -2868,15 +2868,20 @@ def test_ollama_default_model_decoupled_from_global_default(tmp_path):
         bus_url="http://mock",
         config_path=str(config_path),
     )
-    selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
+    registry = agent._ensure_registry()
     # Built-in baseline applies; the global default_model 'claude-opus-4-7'
-    # must NOT have leaked into Ollama's provider config. Since the
+    # must NOT have leaked into Ollama's registered default. Since the
     # fr_0e7ccff1 consolidation the shared DEFAULT_REVIEWER_MODEL names the
     # TabbyAPI-resident model, so ollama's baseline is its own pinned
     # ollama-served model (see _build_default_registry) — assert it is
     # ollama-shaped and specifically NOT the leaked global or the tabby id.
-    assert ollama_provider.config.default_model == "deepseek-coder-v2:16b"
+    # fr_reviewer_50a5b842: both ollama/tabbyapi now register a
+    # DispatcherProvider instance; default_model lives on the REGISTRY
+    # (list_models metadata) rather than the provider's own config,
+    # since DispatcherProvider doesn't consume it internally (an unset
+    # request.metadata["model"] goes through skill=request.kind instead).
+    [reg] = registry.list("ollama")
+    assert reg.default_model == "deepseek-coder-v2:16b"
 
 
 def test_ollama_default_model_honors_per_provider_config(tmp_path):
@@ -2895,23 +2900,20 @@ def test_ollama_default_model_honors_per_provider_config(tmp_path):
         bus_url="http://mock",
         config_path=str(config_path),
     )
-    selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.default_model == "glm-4.7-flash"
+    registry = agent._ensure_registry()
+    [reg] = registry.list("ollama")
+    assert reg.default_model == "glm-4.7-flash"
 
 
-def test_ollama_format_threads_from_config_yaml_to_provider(tmp_path):
-    """Operator sets ``providers.ollama.format: json`` in config.yaml →
-    it must land on ``OllamaProviderConfig.format`` so the resolution
-    order's config rung is actually reachable end-to-end. Without this
-    threading the advertised "caller → config → None" fall-through
-    skips the operator default, which Copilot R1 on PR #36 flagged.
-    """
+def test_dispatcher_base_url_threads_from_config_yaml(tmp_path):
+    """fr_reviewer_50a5b842: operator sets ``providers.dispatcher.base_url``
+    in config.yaml -> both the ollama and tabbyapi registry entries
+    (now DispatcherProvider instances) share a client pointed at it."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "providers:\n"
-        "  ollama:\n"
-        "    format: json\n"
+        "  dispatcher:\n"
+        "    base_url: http://example:8790\n"
     )
     agent = ReviewerAgent(
         agent_id="reviewer-test",
@@ -2920,59 +2922,24 @@ def test_ollama_format_threads_from_config_yaml_to_provider(tmp_path):
     )
     selector = agent._ensure_selector()
     ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.format == "json"
+    tabby_provider = selector.providers["tabbyapi"]
+    assert ollama_provider.name == "ollama"
+    assert tabby_provider.name == "tabbyapi"
+    assert ollama_provider._client.base_url == "http://example:8790"
+    assert tabby_provider._client.base_url == "http://example:8790"
+    # codex review finding (round 2): DispatcherProvider.is_available()
+    # reads self.config.base_url, NOT the shared client's -- both must
+    # be threaded, or the availability/degrade probe hits the wrong host.
+    assert ollama_provider.config.base_url == "http://example:8790"
+    assert tabby_provider.config.base_url == "http://example:8790"
 
 
-def test_ollama_num_ctx_threads_from_config_yaml_to_provider(tmp_path):
-    """Same end-to-end guard for ``num_ctx`` — the previous PR added
-    the dataclass field but the agent loader didn't actually pass it
-    through, so the config-layer rung of the num_ctx resolution order
-    was unreachable from ``config.yaml`` until this fix.
-    """
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "providers:\n"
-        "  ollama:\n"
-        "    num_ctx: 16384\n"
-    )
-    agent = ReviewerAgent(
-        agent_id="reviewer-test",
-        bus_url="http://mock",
-        config_path=str(config_path),
-    )
-    selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.num_ctx == 16384
-
-
-def test_ollama_api_key_threads_from_config_yaml_to_provider(tmp_path):
-    """Operator sets ``providers.ollama.api_key`` in config.yaml → it
-    must land on ``OllamaProviderConfig.api_key`` so an auth-required
-    Ollama endpoint is fixable purely via config (the provider sends it
-    as ``Authorization: Bearer``). Without this threading the api_key
-    docstring's promise is unreachable — Copilot flagged it on PR #42.
-    """
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        "providers:\n"
-        "  ollama:\n"
-        "    api_key: secret-token\n"
-    )
-    agent = ReviewerAgent(
-        agent_id="reviewer-test",
-        bus_url="http://mock",
-        config_path=str(config_path),
-    )
-    selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.api_key == "secret-token"
-
-
-def test_ollama_api_key_absent_keeps_placeholder_default(tmp_path):
-    """When config omits api_key the dataclass default placeholder is
-    preserved (not clobbered to None) — local Ollama keeps working and
-    the threading only overrides when an operator actually sets a key.
-    """
+def test_dispatcher_default_model_reachable_via_provider_config(tmp_path):
+    """codex review finding (round 2): review_text derives the
+    effective model for repo config lookups from
+    provider.config.default_model when chosen_model == "" -- this
+    must stay reachable on the gatewayed DispatcherProvider, not just
+    as registry/list_models metadata."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "providers:\n"
@@ -2985,20 +2952,15 @@ def test_ollama_api_key_absent_keeps_placeholder_default(tmp_path):
         config_path=str(config_path),
     )
     selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.api_key == "ollama"
+    assert selector.providers["ollama"].config.default_model == "glm-4.7-flash"
 
 
-def test_ollama_format_absent_in_config_falls_back_to_none(tmp_path):
-    """When config.yaml omits ``providers.ollama.format`` entirely the
-    dataclass field stays ``None`` — the unconstrained default. Pre-FR
-    behavior preserved for deployments that don't opt in.
-    """
+def test_dispatcher_deadline_s_threads_from_config_yaml(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "providers:\n"
-        "  ollama:\n"
-        "    base_url: http://example:11434/v1\n"
+        "  dispatcher:\n"
+        "    deadline_s: 90\n"
     )
     agent = ReviewerAgent(
         agent_id="reviewer-test",
@@ -3006,26 +2968,39 @@ def test_ollama_format_absent_in_config_falls_back_to_none(tmp_path):
         config_path=str(config_path),
     )
     selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.format is None
-    assert ollama_provider.config.num_ctx is None
+    assert selector.providers["ollama"].config.deadline_s == 90
+    assert selector.providers["tabbyapi"].config.deadline_s == 90
+    # codex review finding (round 5): DispatcherClient's own httpx
+    # transport timeout defaults to 30s, unrelated to deadline_s -- a
+    # single request can legitimately take up to deadline_s while the
+    # dispatcher queues/admits/swaps a model, so the transport timeout
+    # must be at least as generous or it fires mid-request and gets
+    # treated as a retryable transport error.
+    assert selector.providers["ollama"]._client._http.timeout.connect == 90
+    assert selector.providers["tabbyapi"]._client._http.timeout.connect == 90
 
 
-def test_ollama_malformed_config_values_collapse_to_none(tmp_path):
-    """Belt-and-suspenders: a YAML payload with non-string ``format``
-    (e.g. an int dropped in by mistake) or non-positive ``num_ctx``
-    must not crash the registry boot path. The loader collapses
-    malformed values to ``None`` so the provider's own resolution
-    helper applies the fall-through behavior. Provider-side tests
-    already cover the layered resolution; this test pins the
-    boot-time tolerance.
-    """
+def test_dispatcher_deadline_s_absent_keeps_default(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("providers:\n  dispatcher: {}\n")
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.deadline_s == 240.0
+    # Same fix, default-deadline path: httpx transport timeout must
+    # still match (240s), not the DispatcherClient's own 30s default.
+    assert selector.providers["ollama"]._client._http.timeout.connect == 240.0
+
+
+def test_dispatcher_malformed_deadline_s_collapses_to_default(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "providers:\n"
-        "  ollama:\n"
-        "    format: 42\n"
-        "    num_ctx: -1\n"
+        "  dispatcher:\n"
+        "    deadline_s: -1\n"
     )
     agent = ReviewerAgent(
         agent_id="reviewer-test",
@@ -3033,9 +3008,7 @@ def test_ollama_malformed_config_values_collapse_to_none(tmp_path):
         config_path=str(config_path),
     )
     selector = agent._ensure_selector()
-    ollama_provider = selector.providers["ollama"]
-    assert ollama_provider.config.format is None
-    assert ollama_provider.config.num_ctx is None
+    assert selector.providers["ollama"].config.deadline_s == 240.0
 
 
 def test_selector_does_not_apply_default_model_to_non_default_backend():
@@ -7031,3 +7004,108 @@ async def test_opt_out_reroute_honors_per_backend_default_models(tmp_path):
     assert result["disposition"] == "posted"
     assert ollama.last_request is not None
     assert ollama.last_request.metadata["model"] == "glm-4.7-flash"
+
+
+def test_build_direct_engine_registry_uses_real_ollama_tabby_providers(tmp_path):
+    """fr_reviewer_50a5b842 codex review finding: the offline
+    comparison tools (benchmark_sweep, fp_regression) must keep
+    hitting ollama/tabbyapi DIRECTLY, bypassing the dispatcher gateway
+    the live bus-skill path now uses."""
+    from reviewer.providers.ollama import OllamaProvider
+    from reviewer.providers.tabbyapi import TabbyAPIProvider
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    registry = agent._build_direct_engine_registry()
+    assert isinstance(registry.providers["ollama"], OllamaProvider)
+    assert isinstance(registry.providers["tabbyapi"], TabbyAPIProvider)
+    assert registry.providers["ollama"].config.default_model == "glm-4.7-flash"
+
+
+def test_build_direct_engine_registry_still_registers_external_providers(tmp_path):
+    """External providers (claude_cli/codex_cli/gh_copilot) are shared
+    between both registry variants -- only ollama/tabbyapi diverge."""
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    registry = agent._build_direct_engine_registry()
+    assert set(registry.providers) == {
+        "claude_cli", "codex_cli", "gh_copilot", "ollama", "tabbyapi",
+    }
+
+
+def test_ensure_registry_still_uses_dispatcher_provider(tmp_path):
+    """The LIVE path (bus skills) must still go through the gateway --
+    only the offline-tools path (_build_direct_engine_registry) bypasses
+    it."""
+    from reviewer.providers.dispatcher_provider import DispatcherProvider
+
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    registry = agent._ensure_registry()
+    assert isinstance(registry.providers["ollama"], DispatcherProvider)
+    assert isinstance(registry.providers["tabbyapi"], DispatcherProvider)
+
+
+def test_build_direct_engine_selector_selects_direct_providers(tmp_path):
+    from reviewer.providers.tabbyapi import TabbyAPIProvider
+
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path="",
+    )
+    selector = agent._build_direct_engine_selector()
+    provider, _ = selector.select(backend="tabbyapi", model=None)
+    assert isinstance(provider, TabbyAPIProvider)
+
+
+def test_dispatcher_explicit_empty_default_model_enables_skill_routing(tmp_path):
+    """codex review finding (round 4): an explicit
+    providers.ollama.default_model: "" must be respected verbatim (the
+    one way to opt a gatewayed backend fully into the dispatcher's
+    skill_policy.yaml routing) -- NOT silently overridden by the
+    hardcoded backward-compat fallback, which would make skill=
+    routing unreachable from config entirely."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: \"\"\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.default_model == ""
+
+
+def test_dispatcher_default_model_absent_key_still_gets_fallback(tmp_path):
+    """Backward compat: omitting providers.ollama.default_model
+    entirely (not setting it to "") still gets the hardcoded default,
+    same as every pre-existing deploy."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("providers:\n  ollama: {}\n")
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.default_model == "deepseek-coder-v2:16b"

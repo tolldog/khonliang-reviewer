@@ -18,6 +18,10 @@ from reviewer.providers.codex_cli import (
     CodexCliProvider,
     CodexCliProviderConfig,
 )
+from reviewer.providers.dispatcher_provider import (
+    DispatcherProvider,
+    DispatcherProviderConfig,
+)
 from reviewer.providers.gh_copilot import (
     GhCopilotAuthError,
     GhCopilotProvider,
@@ -45,6 +49,8 @@ __all__ = [
     "CodexCliAuthError",
     "CodexCliProvider",
     "CodexCliProviderConfig",
+    "DispatcherProvider",
+    "DispatcherProviderConfig",
     "GhCopilotAuthError",
     "GhCopilotProvider",
     "GhCopilotProviderConfig",

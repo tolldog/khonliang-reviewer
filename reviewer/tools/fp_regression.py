@@ -378,7 +378,11 @@ def _resolve_provider_and_model(backend: str, model: str, config_path: str = "")
     stripped_backend = backend.strip() if isinstance(backend, str) else backend
     stripped_model = model.strip() if isinstance(model, str) else model
     try:
-        provider, resolved_model = agent._ensure_selector().select(
+        # fr_reviewer_50a5b842: this tool exists to measure controlled
+        # A/B engine behavior against ollama/tabbyapi DIRECTLY, not
+        # through the dispatcher gateway the live bus skills now use
+        # (codex review finding).
+        provider, resolved_model = agent._build_direct_engine_selector().select(
             backend=stripped_backend or None, model=stripped_model or None
         )
     except UnknownBackendError as exc:
@@ -387,18 +391,22 @@ def _resolve_provider_and_model(backend: str, model: str, config_path: str = "")
         # The selector's own "" sentinel means "let the provider decide" —
         # true at request time (tabbyapi/ollama's own ``_resolve_model``
         # reads ``self.config.default_model`` when metadata carries ""),
-        # but for DISPLAY purposes here we want that same value now rather
-        # than showing an empty model id. For those two backends,
-        # ``provider.config.default_model`` is always resolved to a
-        # concrete string at agent boot (``_build_default_registry``); for
-        # ``codex_cli``/``gh_copilot``/``claude_cli`` an empty
+        # but for DISPLAY purposes here we want that same value now
+        # rather than showing an empty model id. fr_reviewer_50a5b842:
+        # this tool deliberately uses ``_build_direct_engine_registry``/
+        # ``_build_direct_engine_selector`` (OllamaProvider/
+        # TabbyAPIProvider, talking straight to the engines) rather than
+        # the live gatewayed registry, so ``provider.config.default_model``
+        # would also work here directly -- reading it via the registry
+        # instead keeps this fallback source-agnostic (same code path
+        # regardless of which registry variant produced ``provider``).
+        # For ``codex_cli``/``gh_copilot``/``claude_cli`` an empty
         # ``default_model`` is a legitimate "let the CLI/binary pick its
         # own default" state (Copilot PR #73 review round 5), so this can
         # still return "" for those — display-only, not a functional bug,
         # since this tool only ever targets tabbyapi/ollama.
-        resolved_model = getattr(
-            getattr(provider, "config", None), "default_model", ""
-        )
+        [reg] = agent._build_direct_engine_registry().list(provider.name)
+        resolved_model = reg.default_model
     return provider, resolved_model
 
 

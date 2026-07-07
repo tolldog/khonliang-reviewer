@@ -65,12 +65,16 @@ from reviewer.config.repo import (
     load as load_repo_config,
     provider_to_vendor,
 )
+from dispatcher_lib import DispatcherClient
+
 from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
     CodexCliProvider,
     CodexCliProviderConfig,
+    DispatcherProvider,
+    DispatcherProviderConfig,
     GhCopilotProvider,
     GhCopilotProviderConfig,
     OllamaProvider,
@@ -4083,22 +4087,23 @@ class ReviewerAgent(BaseAgent):
             self._cached_registry = self._build_default_registry()
         return self._cached_registry
 
-    def _build_default_registry(self) -> ProviderRegistry:
-        """Construct the canonical ProviderRegistry from agent config.
-
-        Reads ``providers.<backend>`` blocks from the agent config and
-        ``default_pricing.yaml`` rows for declared-model lists, then
-        registers ClaudeCli / CodexCli / Ollama providers under their
-        canonical backend names. Registration order is insertion
-        order; ``list_models`` returns providers in that order.
+    def _external_providers_setup(
+        self,
+    ) -> tuple[ProviderRegistry, dict[str, Any], dict[str, list[str]]]:
+        """Shared setup for both registry-construction paths: a fresh
+        registry with claude_cli/codex_cli/gh_copilot already
+        registered (identical for both, since only ollama/tabbyapi
+        diverge between the live gatewayed path and the offline
+        direct-engine path -- fr_reviewer_50a5b842 codex review
+        finding), plus the raw ``providers.<backend>`` config dict and
+        the declared-models-by-backend map both callers still need for
+        their own ollama/tabbyapi registration.
         """
         config = self._load_config()
         providers_cfg = _as_dict(config.get("providers"))
         claude_cfg = _as_dict(providers_cfg.get("claude_cli"))
         codex_cfg = _as_dict(providers_cfg.get("codex_cli"))
         copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
-        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
-        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
 
         # Per-backend declared-models comes from the pricing YAML;
         # operators add a row per (backend, model) they care about,
@@ -4149,35 +4154,28 @@ class ReviewerAgent(BaseAgent):
             default_model=copilot_default,
             declared_models=declared_by_backend.get("gh_copilot", []),
         )
-        # Source Ollama's provider-default model from
-        # ``providers.ollama.default_model`` (per-provider config),
-        # falling back to a pinned ollama-served model. Since the
-        # fr_0e7ccff1 consolidation, ``DEFAULT_REVIEWER_MODEL`` names the
-        # TabbyAPI-resident model — an id ollama does not serve — so the
-        # ollama block keeps its own fallback pin (the pre-consolidation
-        # ecosystem default) instead of the shared constant. Decoupled
-        # from the global ``config.default_model`` so an operator who
-        # sets ``default_provider: claude_cli`` and ``default_model:
-        # claude-opus-4-7`` doesn't accidentally inject a Claude model
-        # id into Ollama when a caller picks ``backend: ollama``
-        # without specifying a model. The selector deliberately
-        # returns ``""`` for non-default-backend selections (see
-        # ``ProviderSelector.select``); each provider then applies its
-        # own config-level default.
+        return registry, providers_cfg, declared_by_backend
+
+    def _build_direct_engine_registry(self) -> ProviderRegistry:
+        """Registry variant with ollama/tabbyapi wired to their DIRECT
+        HTTP providers (bypassing the dispatcher gateway entirely).
+
+        For the offline comparison tools (``reviewer/tools/benchmark_sweep.py``,
+        ``reviewer/tools/fp_regression.py``) ONLY — fr_reviewer_50a5b842
+        codex review finding: those tools exist to measure controlled
+        A/B engine behavior, and routing them through
+        ``_build_default_registry``'s dispatcher-gatewayed providers
+        would silently change what they benchmark. The live bus-skill
+        path (``_ensure_registry``/``_build_default_registry``) must
+        NOT call this — it's the one path this FR explicitly reroutes.
+        """
+        registry, providers_cfg, declared_by_backend = self._external_providers_setup()
+        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
+
         ollama_default = str(
             ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
         )
-        # Thread per-provider knobs through to the dataclass so the
-        # config-layer rung of the resolution order ("caller →
-        # config → None" / "caller → config → auto-bump") is
-        # actually reachable from ``config.yaml``. Without this,
-        # the advertised 3-/4-layer resolution skips the operator
-        # default and goes straight from caller to None / auto-bump.
-        # Treat-malformed-as-absent: a YAML payload with a non-string
-        # ``format`` or non-positive ``num_ctx`` collapses to None
-        # rather than crashing the provider boot path; the value
-        # types are validated again inside the resolution helpers,
-        # so this is belt-and-suspenders.
         ollama_format_raw = ollama_cfg.get("format")
         ollama_format = (
             ollama_format_raw
@@ -4192,23 +4190,12 @@ class ReviewerAgent(BaseAgent):
             and ollama_num_ctx_raw > 0
             else None
         )
-        # ``api_key`` is sent as ``Authorization: Bearer`` on native
-        # requests; thread it from config so an auth-required Ollama
-        # endpoint is fixable purely via ``config.yaml`` (otherwise the
-        # docstring's promise is unreachable). Treat-malformed-as-absent;
-        # only pass it through when set so the dataclass default
-        # (``"ollama"`` placeholder) still applies when config omits it.
         ollama_api_key_raw = ollama_cfg.get("api_key")
         ollama_api_key = (
             ollama_api_key_raw.strip()
             if isinstance(ollama_api_key_raw, str) and ollama_api_key_raw.strip()
             else None
         )
-        # Cold-start timeout retry (fr_khonliang-reviewer_26734e09): on by
-        # default; only accept an explicit bool from config so a malformed
-        # value keeps the dataclass default (retry enabled) rather than
-        # silently disabling the resilience. Pass through only when set so
-        # the default lives in one place (the dataclass).
         ollama_retry_raw = ollama_cfg.get("retry_on_timeout")
         ollama_retry_on_timeout = (
             ollama_retry_raw if isinstance(ollama_retry_raw, bool) else None
@@ -4234,12 +4221,6 @@ class ReviewerAgent(BaseAgent):
             default_model=ollama_default,
             declared_models=declared_by_backend.get("ollama", []),
         )
-        # TabbyAPI — the resident GPU engine (fr_khonliang-reviewer_0e7ccff1).
-        # ``api_key`` resolution: explicit config wins, else delegate to
-        # credentials discovery (env var → the engine's own api_tokens.yml).
-        # Discovery failure leaves the key empty; the provider then surfaces
-        # ``auth_not_provisioned`` on first use instead of failing boot —
-        # same graceful-degrade shape as the other backends.
         tabby_default = str(
             tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
         )
@@ -4249,11 +4230,6 @@ class ReviewerAgent(BaseAgent):
             if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
             else None
         )
-        # No static discovery here: the provider re-runs
-        # ``credentials.get_tabbyapi_key`` per request (codex P2 on the
-        # fr_0e7ccff1 PR) so an engine-side key rotation is picked up
-        # without a restart. A config-pinned key still wins inside the
-        # provider's resolution order.
         from reviewer.credentials import get_tabbyapi_key
         tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
         tabby_timeout = (
@@ -4284,6 +4260,168 @@ class ReviewerAgent(BaseAgent):
             declared_models=declared_by_backend.get("tabbyapi", []),
         )
         return registry
+
+    def _build_default_registry(self) -> ProviderRegistry:
+        """Construct the canonical, LIVE ProviderRegistry from agent
+        config -- the one ``_ensure_registry``/bus skills use.
+
+        Registers ClaudeCli / CodexCli / GhCopilot under their
+        canonical backend names (shared with
+        :meth:`_build_direct_engine_registry` via
+        :meth:`_external_providers_setup`), then ollama/tabbyapi as
+        dispatcher-gatewayed ``DispatcherProvider`` instances.
+        Registration order is insertion order; ``list_models`` returns
+        providers in that order.
+        """
+        registry, providers_cfg, declared_by_backend = self._external_providers_setup()
+        ollama_cfg = _as_dict(providers_cfg.get("ollama"))
+        tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
+        dispatcher_cfg = _as_dict(providers_cfg.get("dispatcher"))
+
+        # fr_reviewer_50a5b842: "internal" LLM access (tabbyapi + ollama
+        # -- the self-hosted stack that competes for the shared local
+        # GPU / runs through our own ollama daemon) is gatewayed through
+        # khonliang-dispatcher instead of each provider opening its own
+        # HTTP connection. claude_cli/codex_cli/gh_copilot are external,
+        # no local GPU/VRAM footprint, and stay untouched (confirmed
+        # with the maintainer -- external-LLM gatewaying is a reasonable
+        # future FR, not required now).
+        #
+        # ``default_model`` is threaded onto EACH instance's OWN
+        # ``DispatcherProviderConfig.default_model`` now (codex review
+        # finding, round 2) -- not just registry/list_models metadata.
+        # Every call reaching a DispatcherProvider without an explicit
+        # ``request.metadata["model"]`` override falls back to this
+        # per-instance pin, restoring exact backend-pin semantics from
+        # the old OllamaProviderConfig/TabbyAPIProviderConfig
+        # (``_resolve_model``): a caller/rule-table/degrade-path choice
+        # of "this specific backend" must stay pinned to it, not be
+        # handed to the dispatcher's skill resolver to redecide across
+        # both internal engines. See DispatcherProviderConfig.default_model's
+        # own docstring for the full reasoning.
+        #
+        # codex review finding (round 4): using `or` here made it
+        # impossible to configure an intentionally EMPTY
+        # providers.<backend>.default_model -- the one way an operator
+        # opts a gatewayed backend fully into the dispatcher's
+        # skill_policy.yaml routing (see DispatcherProviderConfig.default_model).
+        # An `or` fallback treats explicit "" the same as the key being
+        # absent entirely, silently forcing the hardcoded fallback
+        # model and making skill=request.kind unreachable from config.
+        # Distinguish "key absent" (`None` -- apply the backward-compat
+        # fallback) from "key present, possibly empty" (respect it
+        # verbatim, including "").
+        ollama_default_raw = ollama_cfg.get("default_model")
+        ollama_default = (
+            str(ollama_default_raw)
+            if ollama_default_raw is not None
+            else "deepseek-coder-v2:16b"
+        )
+        tabby_default_raw = tabbyapi_cfg.get("default_model")
+        tabby_default = (
+            str(tabby_default_raw)
+            if tabby_default_raw is not None
+            else DEFAULT_REVIEWER_MODEL
+        )
+        # codex review finding (round 3): forwarded generation options
+        # were dropped entirely on the gatewayed path. num_ctx is the
+        # one Ollama tuning knob DispatcherProvider can still honor
+        # (see DispatcherProviderConfig.num_ctx / _build_engine_options
+        # in dispatcher_provider.py for why ``format`` can't be).
+        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
+        ollama_num_ctx = (
+            ollama_num_ctx_raw
+            if isinstance(ollama_num_ctx_raw, int)
+            and not isinstance(ollama_num_ctx_raw, bool)
+            and ollama_num_ctx_raw > 0
+            else None
+        )
+        dispatcher_base_url = str(
+            dispatcher_cfg.get("base_url") or "http://localhost:8790"
+        )
+        dispatcher_deadline_raw = dispatcher_cfg.get("deadline_s")
+        dispatcher_deadline = (
+            float(dispatcher_deadline_raw)
+            if isinstance(dispatcher_deadline_raw, (int, float))
+            and not isinstance(dispatcher_deadline_raw, bool)
+            and dispatcher_deadline_raw > 0
+            else None
+        )
+        dispatcher_deadline_kwargs = (
+            {"deadline_s": dispatcher_deadline}
+            if dispatcher_deadline is not None
+            else {}
+        )
+        # codex review finding (round 5): DispatcherClient defaults its
+        # own httpx transport timeout to 30s, unrelated to deadline_s
+        # (the wall-clock budget dispatcher_lib's own retry loop holds
+        # across attempts) -- a single POST /v1/submit call can
+        # legitimately take up to deadline_s while the dispatcher
+        # queues/admits/swaps a model, so a 30s transport timeout would
+        # fire mid-request on anything longer, get treated as a
+        # retryable transport error, and spin through retries instead
+        # of ever completing. Must be at least as generous as the
+        # configured (or default) deadline_s.
+        effective_deadline_s = (
+            dispatcher_deadline
+            if dispatcher_deadline is not None
+            else DispatcherProviderConfig().deadline_s
+        )
+        dispatcher_client = DispatcherClient(
+            base_url=dispatcher_base_url,
+            caller="khonliang-reviewer",
+            timeout=effective_deadline_s,
+        )
+        registry.register(
+            DispatcherProvider(
+                "ollama",
+                DispatcherProviderConfig(
+                    base_url=dispatcher_base_url,
+                    default_model=ollama_default,
+                    num_ctx=ollama_num_ctx,
+                    **dispatcher_deadline_kwargs,
+                ),
+                client=dispatcher_client,
+            ),
+            default_model=ollama_default,
+            declared_models=declared_by_backend.get("ollama", []),
+        )
+        registry.register(
+            DispatcherProvider(
+                "tabbyapi",
+                DispatcherProviderConfig(
+                    base_url=dispatcher_base_url,
+                    default_model=tabby_default,
+                    **dispatcher_deadline_kwargs,
+                ),
+                client=dispatcher_client,
+            ),
+            default_model=tabby_default,
+            declared_models=declared_by_backend.get("tabbyapi", []),
+        )
+        return registry
+
+    def _build_direct_engine_selector(self) -> ProviderSelector:
+        """Selector variant over :meth:`_build_direct_engine_registry`
+        -- for the offline comparison tools (fr_reviewer_50a5b842
+        codex review finding), mirroring :meth:`_build_default_selector`
+        exactly except for which registry backs it. Not cached (unlike
+        ``_ensure_selector``): these tools construct one short-lived
+        ``ReviewerAgent`` per invocation, so there's no repeated-call
+        cost to amortize."""
+        config = self._load_config()
+        resolved_backend = str(
+            config.get("default_provider") or DEFAULT_REVIEWER_BACKEND
+        )
+        configured_model = str(config.get("default_model") or "")
+        return ProviderSelector(
+            self._build_direct_engine_registry().providers,
+            SelectorConfig(
+                default_backend=resolved_backend,
+                default_model=configured_model,
+                default_models=_coerce_default_models(config.get("default_models")),
+            ),
+        )
 
     def _build_default_selector(self) -> ProviderSelector:
         config = self._load_config()

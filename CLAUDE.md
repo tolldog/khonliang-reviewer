@@ -26,25 +26,44 @@ Claude-via-CLI, Codex-via-CLI, and GitHub-Copilot-via-CLI. See `README.md`
 for provisioning/setup per backend. Two notes worth keeping here rather
 than in the README:
 
-- **Ollama** talks to the **native** `/api/chat` endpoint
-  (`http://localhost:11434/api/chat`), not the OpenAI-compat `/v1` shim —
-  the shim *silently drops* `options.num_ctx`, truncating every large
-  review at the 4096-token default (`bug_reviewer_832a909b`); the native
-  endpoint honors it. Configs still set `base_url` to the `/v1` base for
-  back-compat; the provider strips the `/v1` suffix itself.
+- **Ollama and TabbyAPI (fr_reviewer_50a5b842, landed)** both route
+  through `reviewer/providers/dispatcher_provider.py::DispatcherProvider`
+  now, NOT their own `ollama.py`/`tabbyapi.py` HTTP clients directly —
+  those two files still exist (used by offline tools:
+  `reviewer/tools/benchmark_sweep.py`, `reviewer/tools/fp_regression.py`,
+  which deliberately want direct engine access for controlled A/B
+  comparisons) but are no longer wired into the live `_build_default_registry`
+  path. `DispatcherProvider` calls `khonliang-dispatcher` via
+  `khonliang-dispatcher-lib`'s `DispatcherClient`: an explicit
+  `request.metadata["model"]` still sends `model=` straight through
+  (unchanged); absent that, it falls back to THIS instance's own
+  `DispatcherProviderConfig.default_model` (one per backend —
+  `providers.ollama.default_model` / `providers.tabbyapi.default_model`,
+  same as the old `_resolve_model` convention) so an explicit backend
+  choice (rule-table default, the tabby-unavailable degrade-to-ollama
+  reroute) stays pinned to that engine. Only when even the per-backend
+  default is unset does it send `skill=request.kind` and let the
+  dispatcher's `skill_policy.yaml` resolve the model server-side —
+  codex review round 2 caught that sending bare `skill=` whenever
+  `model` was absent silently broke backend pinning, since the
+  dispatcher's skill resolver doesn't know which of the two registered
+  instances (ollama vs tabbyapi) initiated the call. This is the
+  `dispatcher-will-own-tabbyapi` project memory's forward note, now
+  resolved — don't re-litigate the "should this go through a gateway"
+  question, it's decided; do keep the offline tools' direct-provider
+  path in mind before assuming ALL ollama/tabbyapi code paths are
+  gatewayed.
 - **Claude-via-CLI** is a deliberate exception to the usual
   SDK-over-subprocess preference: the Anthropic SDK does not accept
   subscription OAuth tokens, and using them from third-party SDKs
   violates the 2026 Consumer TOS. `claude -p` is the only sanctioned path
   for subscription-backed Claude usage (`CLAUDE_CODE_OAUTH_TOKEN`,
   provisioned per-machine via `claude setup-token`).
-
-**Forward note:** per-call `(backend, model)` selection is expected to be
-superseded by a dispatcher-owned skill-request model (the caller asks for
-a capability, dispatcher picks the engine) once that work lands — see the
-`dispatcher-will-own-tabbyapi` project memory. Don't invest further in
-backend-selection plumbing/docs beyond factual accuracy until that
-direction is confirmed.
+- **External LLM gatewaying (claude_cli/codex_cli/gh_copilot) is explicitly
+  out of scope** for the dispatcher reroute — confirmed with the
+  maintainer 2026-07-07: these have no local GPU/VRAM footprint, so
+  there's no gateway benefit today. A `ClaudeCliAdapter`-style dispatcher
+  engine kind is a reasonable future FR, not started.
 
 ## Credentials
 

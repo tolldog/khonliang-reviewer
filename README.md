@@ -159,16 +159,45 @@ selection resolves in this order:
 
 The `model` argument is honored on all five backends:
 
-- **Ollama** uses `model` directly in the `chat.completions.create`
-  call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
-- **TabbyAPI** (the resident hot-tier engine, `reviewer/providers/tabbyapi.py`)
-  uses `model` directly against its OpenAI-compatible `/v1/chat/completions`
-  endpoint — same shape as Ollama. Note: this per-call `(backend, model)`
-  selection is expected to be superseded by a dispatcher-owned skill-request
-  model (the caller asks for a capability, not a specific backend/model) once
-  that lands — see the `dispatcher-will-own-tabbyapi` project memory. Don't
-  invest further docs/plumbing in this section beyond factual accuracy until
-  that direction is confirmed.
+- **Ollama** and **TabbyAPI** (fr_reviewer_50a5b842, landed) no longer
+  talk directly to their engines — both are `DispatcherProvider`
+  instances (`reviewer/providers/dispatcher_provider.py`) gatewayed
+  through `khonliang-dispatcher` via `khonliang-dispatcher-lib`'s
+  `DispatcherClient`, so the dispatcher's VRAM lease ledger / admission
+  gate see reviewer's traffic instead of it competing for the shared
+  local GPU outside the gateway's view. `model` still works exactly as
+  before when the caller supplies one (an explicit
+  `request.metadata["model"]` — an A/B-comparison pin, or the rule
+  table's `kimi-k2.5:cloud` long-context escalation — is sent to the
+  dispatcher as `model=`). Absent that, the provider falls back to
+  its OWN per-backend `providers.<ollama|tabbyapi>.default_model`
+  pin (same as the old `_resolve_model` convention) so an explicit
+  backend choice — the rule table's default, or the tabby-unavailable
+  degrade-to-ollama reroute — stays pinned to that specific engine
+  rather than being handed to the dispatcher's skill resolver to
+  redecide across both internal engines. Only when even that
+  per-backend default is unset does the provider send `skill=<kind>`
+  and let the dispatcher's own `skill_policy.yaml` resolve the model
+  server-side. Configure the dispatcher's base
+  URL via `providers.dispatcher.base_url` (default
+  `http://localhost:8790`) and the per-call budget via
+  `providers.dispatcher.deadline_s` (default `240`, generous vs. the
+  old direct-HTTP timeouts since a dispatcher call may queue behind
+  other tenants or swap a model in first). `claude_cli`/`codex_cli`/
+  `gh_copilot` are external APIs with no local GPU footprint and are
+  untouched by this — see `dispatcher-will-own-tabbyapi` project
+  memory for the (not-yet-scoped) external-LLM follow-on.
+
+  Backend-specific generation options are still forwarded through the
+  gateway (`ChatTask.options`): Ollama's `num_ctx` (config-pinned via
+  `providers.ollama.num_ctx`, or the same auto-bump-from-prompt-length
+  heuristic as before), and TabbyAPI's `max_tokens` /
+  `chat_template_kwargs: {"enable_thinking": false}`. One known,
+  accepted gap: Ollama's `format: "json"` grammar-constraint has no
+  equivalent in the dispatcher's wire contract today (it's a
+  top-level sibling of `options` in Ollama's own native API, not a
+  nested key) — filed as a dispatcher-side follow-on,
+  `fr_dispatcher_ba059d43`.
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).
