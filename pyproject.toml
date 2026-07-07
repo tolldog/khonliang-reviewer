@@ -5,6 +5,7 @@ description = "Bus-native reviewer agent — pluggable review providers, usage a
 requires-python = ">=3.11"
 dependencies = [
     "khonliang-reviewer-lib @ git+https://github.com/tolldog/khonliang-reviewer-lib.git@main",
+    "khonliang-dispatcher-lib @ git+https://github.com/tolldog/khonliang-dispatcher-lib.git@main",
     "khonliang-bus-lib>=0.5.0",  # >=0.5.0 for Welcome / WelcomeEntryPoint exports
     "pyyaml>=6.0",
     # The Ollama provider talks to the native ``/api/chat`` endpoint via

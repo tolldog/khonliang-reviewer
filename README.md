@@ -159,16 +159,29 @@ selection resolves in this order:
 
 The `model` argument is honored on all five backends:
 
-- **Ollama** uses `model` directly in the `chat.completions.create`
-  call (any Ollama-served model id — `qwen2.5-coder:14b`, `kimi-k2.5:cloud`, etc.).
-- **TabbyAPI** (the resident hot-tier engine, `reviewer/providers/tabbyapi.py`)
-  uses `model` directly against its OpenAI-compatible `/v1/chat/completions`
-  endpoint — same shape as Ollama. Note: this per-call `(backend, model)`
-  selection is expected to be superseded by a dispatcher-owned skill-request
-  model (the caller asks for a capability, not a specific backend/model) once
-  that lands — see the `dispatcher-will-own-tabbyapi` project memory. Don't
-  invest further docs/plumbing in this section beyond factual accuracy until
-  that direction is confirmed.
+- **Ollama** and **TabbyAPI** (fr_reviewer_50a5b842, landed) no longer
+  talk directly to their engines — both are `DispatcherProvider`
+  instances (`reviewer/providers/dispatcher_provider.py`) gatewayed
+  through `khonliang-dispatcher` via `khonliang-dispatcher-lib`'s
+  `DispatcherClient`, so the dispatcher's VRAM lease ledger / admission
+  gate see reviewer's traffic instead of it competing for the shared
+  local GPU outside the gateway's view. `model` still works exactly as
+  before when the caller supplies one (an explicit
+  `request.metadata["model"]` — an A/B-comparison pin, or the rule
+  table's `kimi-k2.5:cloud` long-context escalation — is sent to the
+  dispatcher as `model=`). When the caller supplies neither `model`
+  nor a rule-table pick (the old `FAST_TIER_MODEL` empty-sentinel
+  case — "whatever's resident"), the provider sends `skill=<kind>`
+  instead and lets the dispatcher's own `skill_policy.yaml` resolve
+  the box-specific model server-side. Configure the dispatcher's base
+  URL via `providers.dispatcher.base_url` (default
+  `http://localhost:8790`) and the per-call budget via
+  `providers.dispatcher.deadline_s` (default `240`, generous vs. the
+  old direct-HTTP timeouts since a dispatcher call may queue behind
+  other tenants or swap a model in first). `claude_cli`/`codex_cli`/
+  `gh_copilot` are external APIs with no local GPU footprint and are
+  untouched by this — see `dispatcher-will-own-tabbyapi` project
+  memory for the (not-yet-scoped) external-LLM follow-on.
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).

@@ -385,20 +385,23 @@ def _resolve_provider_and_model(backend: str, model: str, config_path: str = "")
         raise SystemExit(str(exc)) from exc
     if not resolved_model:
         # The selector's own "" sentinel means "let the provider decide" —
-        # true at request time (tabbyapi/ollama's own ``_resolve_model``
-        # reads ``self.config.default_model`` when metadata carries ""),
-        # but for DISPLAY purposes here we want that same value now rather
-        # than showing an empty model id. For those two backends,
-        # ``provider.config.default_model`` is always resolved to a
-        # concrete string at agent boot (``_build_default_registry``); for
+        # true at request time (tabbyapi/ollama now go through
+        # DispatcherProvider, which resolves an unset model via
+        # ``skill=`` server-side), but for DISPLAY purposes here we
+        # want that same value now rather than showing an empty model
+        # id. fr_reviewer_50a5b842: tabbyapi/ollama no longer carry
+        # ``default_model`` on the provider's own config (DispatcherProvider
+        # doesn't need it internally) — it now lives on the REGISTRY
+        # entry instead (registered alongside the provider in
+        # ``_build_default_registry``, still sourced from the same
+        # ``providers.<backend>.default_model`` config key). For
         # ``codex_cli``/``gh_copilot``/``claude_cli`` an empty
         # ``default_model`` is a legitimate "let the CLI/binary pick its
         # own default" state (Copilot PR #73 review round 5), so this can
         # still return "" for those — display-only, not a functional bug,
         # since this tool only ever targets tabbyapi/ollama.
-        resolved_model = getattr(
-            getattr(provider, "config", None), "default_model", ""
-        )
+        [reg] = agent._ensure_registry().list(provider.name)
+        resolved_model = reg.default_model
     return provider, resolved_model
 
 

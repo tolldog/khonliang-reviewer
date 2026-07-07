@@ -65,18 +65,18 @@ from reviewer.config.repo import (
     load as load_repo_config,
     provider_to_vendor,
 )
+from dispatcher_lib import DispatcherClient
+
 from reviewer.github_client import GithubClientError, ReviewerGithubClient
 from reviewer.providers import (
     ClaudeCliProvider,
     ClaudeCliProviderConfig,
     CodexCliProvider,
     CodexCliProviderConfig,
+    DispatcherProvider,
+    DispatcherProviderConfig,
     GhCopilotProvider,
     GhCopilotProviderConfig,
-    OllamaProvider,
-    OllamaProviderConfig,
-    TabbyAPIProvider,
-    TabbyAPIProviderConfig,
 )
 from reviewer.providers._prompt import (
     _METADATA_BINARY_QUESTIONS_KEY,
@@ -4099,6 +4099,7 @@ class ReviewerAgent(BaseAgent):
         copilot_cfg = _as_dict(providers_cfg.get("gh_copilot"))
         ollama_cfg = _as_dict(providers_cfg.get("ollama"))
         tabbyapi_cfg = _as_dict(providers_cfg.get("tabbyapi"))
+        dispatcher_cfg = _as_dict(providers_cfg.get("dispatcher"))
 
         # Per-backend declared-models comes from the pricing YAML;
         # operators add a row per (backend, model) they care about,
@@ -4149,136 +4150,61 @@ class ReviewerAgent(BaseAgent):
             default_model=copilot_default,
             declared_models=declared_by_backend.get("gh_copilot", []),
         )
-        # Source Ollama's provider-default model from
-        # ``providers.ollama.default_model`` (per-provider config),
-        # falling back to a pinned ollama-served model. Since the
-        # fr_0e7ccff1 consolidation, ``DEFAULT_REVIEWER_MODEL`` names the
-        # TabbyAPI-resident model — an id ollama does not serve — so the
-        # ollama block keeps its own fallback pin (the pre-consolidation
-        # ecosystem default) instead of the shared constant. Decoupled
-        # from the global ``config.default_model`` so an operator who
-        # sets ``default_provider: claude_cli`` and ``default_model:
-        # claude-opus-4-7`` doesn't accidentally inject a Claude model
-        # id into Ollama when a caller picks ``backend: ollama``
-        # without specifying a model. The selector deliberately
-        # returns ``""`` for non-default-backend selections (see
-        # ``ProviderSelector.select``); each provider then applies its
-        # own config-level default.
+        # fr_reviewer_50a5b842: "internal" LLM access (tabbyapi + ollama
+        # -- the self-hosted stack that competes for the shared local
+        # GPU / runs through our own ollama daemon) is gatewayed through
+        # khonliang-dispatcher instead of each provider opening its own
+        # HTTP connection. claude_cli/codex_cli/gh_copilot are external,
+        # no local GPU/VRAM footprint, and stay untouched (confirmed
+        # with the maintainer -- external-LLM gatewaying is a reasonable
+        # future FR, not required now).
+        #
+        # ``default_model`` metadata registered below is still sourced
+        # from the SAME ``providers.ollama.default_model`` /
+        # ``providers.tabbyapi.default_model`` config keys as before --
+        # it's registry/list_models introspection only now (Ollama's
+        # fallback pin note below still explains why it's decoupled
+        # from ``config.default_model``). DispatcherProvider itself
+        # doesn't consume it: an unset ``request.metadata["model"]``
+        # goes through ``skill=request.kind`` instead, resolved
+        # server-side by the dispatcher's own ``skill_policy.yaml``.
         ollama_default = str(
             ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
         )
-        # Thread per-provider knobs through to the dataclass so the
-        # config-layer rung of the resolution order ("caller →
-        # config → None" / "caller → config → auto-bump") is
-        # actually reachable from ``config.yaml``. Without this,
-        # the advertised 3-/4-layer resolution skips the operator
-        # default and goes straight from caller to None / auto-bump.
-        # Treat-malformed-as-absent: a YAML payload with a non-string
-        # ``format`` or non-positive ``num_ctx`` collapses to None
-        # rather than crashing the provider boot path; the value
-        # types are validated again inside the resolution helpers,
-        # so this is belt-and-suspenders.
-        ollama_format_raw = ollama_cfg.get("format")
-        ollama_format = (
-            ollama_format_raw
-            if isinstance(ollama_format_raw, str) and ollama_format_raw
+        tabby_default = str(
+            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
+        )
+        dispatcher_client = DispatcherClient(
+            base_url=str(
+                dispatcher_cfg.get("base_url") or "http://localhost:8790"
+            ),
+            caller="khonliang-reviewer",
+        )
+        dispatcher_deadline_raw = dispatcher_cfg.get("deadline_s")
+        dispatcher_deadline = (
+            float(dispatcher_deadline_raw)
+            if isinstance(dispatcher_deadline_raw, (int, float))
+            and not isinstance(dispatcher_deadline_raw, bool)
+            and dispatcher_deadline_raw > 0
             else None
         )
-        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
-        ollama_num_ctx = (
-            ollama_num_ctx_raw
-            if isinstance(ollama_num_ctx_raw, int)
-            and not isinstance(ollama_num_ctx_raw, bool)
-            and ollama_num_ctx_raw > 0
-            else None
-        )
-        # ``api_key`` is sent as ``Authorization: Bearer`` on native
-        # requests; thread it from config so an auth-required Ollama
-        # endpoint is fixable purely via ``config.yaml`` (otherwise the
-        # docstring's promise is unreachable). Treat-malformed-as-absent;
-        # only pass it through when set so the dataclass default
-        # (``"ollama"`` placeholder) still applies when config omits it.
-        ollama_api_key_raw = ollama_cfg.get("api_key")
-        ollama_api_key = (
-            ollama_api_key_raw.strip()
-            if isinstance(ollama_api_key_raw, str) and ollama_api_key_raw.strip()
-            else None
-        )
-        # Cold-start timeout retry (fr_khonliang-reviewer_26734e09): on by
-        # default; only accept an explicit bool from config so a malformed
-        # value keeps the dataclass default (retry enabled) rather than
-        # silently disabling the resilience. Pass through only when set so
-        # the default lives in one place (the dataclass).
-        ollama_retry_raw = ollama_cfg.get("retry_on_timeout")
-        ollama_retry_on_timeout = (
-            ollama_retry_raw if isinstance(ollama_retry_raw, bool) else None
+        dispatcher_config = DispatcherProviderConfig(
+            **(
+                {"deadline_s": dispatcher_deadline}
+                if dispatcher_deadline is not None
+                else {}
+            )
         )
         registry.register(
-            OllamaProvider(
-                OllamaProviderConfig(
-                    base_url=str(
-                        ollama_cfg.get("base_url")
-                        or "http://localhost:11434/v1"
-                    ),
-                    default_model=ollama_default,
-                    num_ctx=ollama_num_ctx,
-                    format=ollama_format,
-                    **(
-                        {"retry_on_timeout": ollama_retry_on_timeout}
-                        if ollama_retry_on_timeout is not None
-                        else {}
-                    ),
-                    **({"api_key": ollama_api_key} if ollama_api_key else {}),
-                )
+            DispatcherProvider(
+                "ollama", dispatcher_config, client=dispatcher_client,
             ),
             default_model=ollama_default,
             declared_models=declared_by_backend.get("ollama", []),
         )
-        # TabbyAPI — the resident GPU engine (fr_khonliang-reviewer_0e7ccff1).
-        # ``api_key`` resolution: explicit config wins, else delegate to
-        # credentials discovery (env var → the engine's own api_tokens.yml).
-        # Discovery failure leaves the key empty; the provider then surfaces
-        # ``auth_not_provisioned`` on first use instead of failing boot —
-        # same graceful-degrade shape as the other backends.
-        tabby_default = str(
-            tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
-        )
-        tabby_api_key_raw = tabbyapi_cfg.get("api_key")
-        tabby_api_key = (
-            tabby_api_key_raw.strip()
-            if isinstance(tabby_api_key_raw, str) and tabby_api_key_raw.strip()
-            else None
-        )
-        # No static discovery here: the provider re-runs
-        # ``credentials.get_tabbyapi_key`` per request (codex P2 on the
-        # fr_0e7ccff1 PR) so an engine-side key rotation is picked up
-        # without a restart. A config-pinned key still wins inside the
-        # provider's resolution order.
-        from reviewer.credentials import get_tabbyapi_key
-        tabby_timeout_raw = tabbyapi_cfg.get("timeout_seconds")
-        tabby_timeout = (
-            float(tabby_timeout_raw)
-            if isinstance(tabby_timeout_raw, (int, float))
-            and not isinstance(tabby_timeout_raw, bool)
-            and tabby_timeout_raw > 0
-            else None
-        )
         registry.register(
-            TabbyAPIProvider(
-                TabbyAPIProviderConfig(
-                    base_url=str(
-                        tabbyapi_cfg.get("base_url")
-                        or "http://localhost:5000/v1"
-                    ),
-                    default_model=tabby_default,
-                    **({"api_key": tabby_api_key} if tabby_api_key else {}),
-                    **(
-                        {"timeout_seconds": tabby_timeout}
-                        if tabby_timeout is not None
-                        else {}
-                    ),
-                ),
-                api_key_provider=get_tabbyapi_key,
+            DispatcherProvider(
+                "tabbyapi", dispatcher_config, client=dispatcher_client,
             ),
             default_model=tabby_default,
             declared_models=declared_by_backend.get("tabbyapi", []),
