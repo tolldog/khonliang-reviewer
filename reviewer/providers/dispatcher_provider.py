@@ -69,6 +69,7 @@ from reviewer.providers._prompt import (
     parse_verdicts,
     validate_verdict_coverage,
 )
+from reviewer.providers.ollama import _suggest_num_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,70 @@ class DispatcherProviderConfig:
     #: overriding the caller's backend choice. ``skill=`` is only used
     #: as the last-resort fallback when this is also unset.
     default_model: str = ""
+    #: ``ollama`` instance only: operator-pinned ``num_ctx``, mirroring
+    #: ``OllamaProviderConfig.num_ctx`` (codex review finding, round 3
+    #: -- forwarded generation options were dropped entirely). ``None``
+    #: falls through to the auto-bump heuristic (:func:`_suggest_num_ctx`,
+    #: reused from ``reviewer.providers.ollama`` rather than
+    #: reimplemented) the same way the direct provider does.
+    num_ctx: int | None = None
+    #: ``tabbyapi`` instance only: forwarded as OpenAI ``max_tokens``,
+    #: mirroring ``TabbyAPIProviderConfig.max_tokens``.
+    max_tokens: int = 4096
+    #: ``tabbyapi`` instance only: send ``chat_template_kwargs:
+    #: {"enable_thinking": false}`` (mirrors
+    #: ``TabbyAPIProviderConfig.disable_thinking`` -- the switch that
+    #: actually suppresses the Qwen3 ``<think>`` preamble; see
+    #: ``tabbyapi.py``'s module docstring).
+    disable_thinking: bool = True
+
+
+def _build_engine_options(
+    name: str,
+    config: DispatcherProviderConfig,
+    request: ReviewRequest,
+    prompt: str,
+) -> dict[str, Any]:
+    """Forwarded generation options -- codex review finding (round 3):
+    the initial cut built ``ChatTask`` with no ``options`` at all,
+    silently dropping every backend-specific tuning knob the direct
+    providers used to send.
+
+    ``ChatTask.options`` reaches ``dispatcher_lib``'s wire body as the
+    ``options`` submit field, which the dispatcher's executors consume
+    differently per engine kind (``dispatcher/executors/ollama.py``
+    nests it under ollama's own native ``options`` object;
+    ``dispatcher/executors/tabby.py`` spreads it at the payload's top
+    level, matching tabby's OpenAI-compatible surface) -- both are
+    preserved exactly here.
+
+    ONE known, accepted gap: Ollama's ``format="json"`` grammar
+    constraint (``OllamaProviderConfig.format``, the switch that
+    actually enforces JSON output on the native endpoint) has NO
+    equivalent in the dispatcher's ``OllamaRequest`` -- it's a
+    top-level sibling of ``options`` in ollama's own API, and the
+    dispatcher wire contract only forwards ``options``. Gatewayed
+    Ollama reviews lose that enforcement until the dispatcher's own
+    contract grows a passthrough for it -- filed as
+    fr_dispatcher_ba059d43, a dispatcher-side follow-on; not
+    something reviewer can work around from its own request options.
+    """
+    if name == "ollama":
+        caller_num_ctx = request.metadata.get("num_ctx")
+        num_ctx = (
+            caller_num_ctx
+            if isinstance(caller_num_ctx, int)
+            and not isinstance(caller_num_ctx, bool)
+            and caller_num_ctx > 0
+            else (config.num_ctx or _suggest_num_ctx(prompt))
+        )
+        return {"num_ctx": num_ctx} if num_ctx is not None else {}
+    if name == "tabbyapi":
+        options: dict[str, Any] = {"max_tokens": config.max_tokens}
+        if config.disable_thinking:
+            options["chat_template_kwargs"] = {"enable_thinking": False}
+        return options
+    return {}
 
 
 class DispatcherProvider(ReviewProvider):
@@ -224,7 +289,10 @@ class DispatcherProvider(ReviewProvider):
         )
 
         run_kwargs: dict[str, Any] = {
-            "task": ChatTask(messages=[{"role": "user", "content": prompt}]),
+            "task": ChatTask(
+                messages=[{"role": "user", "content": prompt}],
+                options=_build_engine_options(self.name, self.config, request, prompt),
+            ),
             "deadline_s": self.config.deadline_s,
         }
         if model_override is not None:

@@ -4305,6 +4305,19 @@ class ReviewerAgent(BaseAgent):
         tabby_default = str(
             tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
         )
+        # codex review finding (round 3): forwarded generation options
+        # were dropped entirely on the gatewayed path. num_ctx is the
+        # one Ollama tuning knob DispatcherProvider can still honor
+        # (see DispatcherProviderConfig.num_ctx / _build_engine_options
+        # in dispatcher_provider.py for why ``format`` can't be).
+        ollama_num_ctx_raw = ollama_cfg.get("num_ctx")
+        ollama_num_ctx = (
+            ollama_num_ctx_raw
+            if isinstance(ollama_num_ctx_raw, int)
+            and not isinstance(ollama_num_ctx_raw, bool)
+            and ollama_num_ctx_raw > 0
+            else None
+        )
         dispatcher_base_url = str(
             dispatcher_cfg.get("base_url") or "http://localhost:8790"
         )
@@ -4330,6 +4343,7 @@ class ReviewerAgent(BaseAgent):
                 DispatcherProviderConfig(
                     base_url=dispatcher_base_url,
                     default_model=ollama_default,
+                    num_ctx=ollama_num_ctx,
                     **dispatcher_deadline_kwargs,
                 ),
                 client=dispatcher_client,

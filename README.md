@@ -187,6 +187,17 @@ The `model` argument is honored on all five backends:
   `gh_copilot` are external APIs with no local GPU footprint and are
   untouched by this — see `dispatcher-will-own-tabbyapi` project
   memory for the (not-yet-scoped) external-LLM follow-on.
+
+  Backend-specific generation options are still forwarded through the
+  gateway (`ChatTask.options`): Ollama's `num_ctx` (config-pinned via
+  `providers.ollama.num_ctx`, or the same auto-bump-from-prompt-length
+  heuristic as before), and TabbyAPI's `max_tokens` /
+  `chat_template_kwargs: {"enable_thinking": false}`. One known,
+  accepted gap: Ollama's `format: "json"` grammar-constraint has no
+  equivalent in the dispatcher's wire contract today (it's a
+  top-level sibling of `options` in Ollama's own native API, not a
+  nested key) — filed as a dispatcher-side follow-on,
+  `fr_dispatcher_ba059d43`.
 - **Claude-via-CLI** threads `model` through as `claude -p --model
   <spec>` (accepts aliases like `opus`/`sonnet` or full ids like
   `claude-opus-4-7`).

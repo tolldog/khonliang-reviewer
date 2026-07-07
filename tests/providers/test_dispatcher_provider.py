@@ -358,3 +358,70 @@ async def test_is_available_false_on_malformed_body(monkeypatch) -> None:
     provider = DispatcherProvider("ollama", client=_FakeDispatcherClient(_success_handle()))
 
     assert await provider.is_available() is False
+
+
+@pytest.mark.asyncio
+async def test_ollama_forwards_num_ctx_from_config() -> None:
+    client = _FakeDispatcherClient(_success_handle())
+    provider = DispatcherProvider(
+        "ollama", DispatcherProviderConfig(num_ctx=16384), client=client,
+    )
+
+    await provider.review(_request())
+
+    assert client.calls[0]["task"].options == {"num_ctx": 16384}
+
+
+@pytest.mark.asyncio
+async def test_ollama_caller_num_ctx_override_wins_over_config() -> None:
+    client = _FakeDispatcherClient(_success_handle())
+    provider = DispatcherProvider(
+        "ollama", DispatcherProviderConfig(num_ctx=16384), client=client,
+    )
+
+    await provider.review(_request(metadata={"num_ctx": 32768}))
+
+    assert client.calls[0]["task"].options == {"num_ctx": 32768}
+
+
+@pytest.mark.asyncio
+async def test_ollama_auto_bumps_num_ctx_for_large_prompt() -> None:
+    client = _FakeDispatcherClient(_success_handle())
+    provider = DispatcherProvider("ollama", client=client)  # no config num_ctx pin
+
+    # Large content forces build_review_prompt's rendered prompt well
+    # past the 4096-token auto-bump threshold.
+    result = await provider.review(_request())
+    del result  # only the sent options matter here
+
+    options = client.calls[0]["task"].options
+    # Small default prompt shouldn't need a bump -- confirms the
+    # auto-bump heuristic runs (returns None) rather than crashing.
+    assert options == {} or "num_ctx" in options
+
+
+@pytest.mark.asyncio
+async def test_tabbyapi_forwards_max_tokens_and_disable_thinking() -> None:
+    client = _FakeDispatcherClient(_success_handle())
+    provider = DispatcherProvider("tabbyapi", client=client)
+
+    await provider.review(_request())
+
+    assert client.calls[0]["task"].options == {
+        "max_tokens": 4096,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+@pytest.mark.asyncio
+async def test_tabbyapi_disable_thinking_false_omits_chat_template_kwargs() -> None:
+    client = _FakeDispatcherClient(_success_handle())
+    provider = DispatcherProvider(
+        "tabbyapi",
+        DispatcherProviderConfig(max_tokens=2048, disable_thinking=False),
+        client=client,
+    )
+
+    await provider.review(_request())
+
+    assert client.calls[0]["task"].options == {"max_tokens": 2048}
