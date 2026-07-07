@@ -4287,26 +4287,29 @@ class ReviewerAgent(BaseAgent):
         # with the maintainer -- external-LLM gatewaying is a reasonable
         # future FR, not required now).
         #
-        # ``default_model`` metadata registered below is still sourced
-        # from the SAME ``providers.ollama.default_model`` /
-        # ``providers.tabbyapi.default_model`` config keys as before --
-        # it's registry/list_models introspection only now (Ollama's
-        # fallback pin note below still explains why it's decoupled
-        # from ``config.default_model``). DispatcherProvider itself
-        # doesn't consume it: an unset ``request.metadata["model"]``
-        # goes through ``skill=request.kind`` instead, resolved
-        # server-side by the dispatcher's own ``skill_policy.yaml``.
+        # ``default_model`` is threaded onto EACH instance's OWN
+        # ``DispatcherProviderConfig.default_model`` now (codex review
+        # finding, round 2) -- not just registry/list_models metadata.
+        # Every call reaching a DispatcherProvider without an explicit
+        # ``request.metadata["model"]`` override falls back to this
+        # per-instance pin, restoring exact backend-pin semantics from
+        # the old OllamaProviderConfig/TabbyAPIProviderConfig
+        # (``_resolve_model``): a caller/rule-table/degrade-path choice
+        # of "this specific backend" must stay pinned to it, not be
+        # handed to the dispatcher's skill resolver to redecide across
+        # both internal engines. See DispatcherProviderConfig.default_model's
+        # own docstring for the full reasoning.
         ollama_default = str(
             ollama_cfg.get("default_model") or "deepseek-coder-v2:16b"
         )
         tabby_default = str(
             tabbyapi_cfg.get("default_model") or DEFAULT_REVIEWER_MODEL
         )
+        dispatcher_base_url = str(
+            dispatcher_cfg.get("base_url") or "http://localhost:8790"
+        )
         dispatcher_client = DispatcherClient(
-            base_url=str(
-                dispatcher_cfg.get("base_url") or "http://localhost:8790"
-            ),
-            caller="khonliang-reviewer",
+            base_url=dispatcher_base_url, caller="khonliang-reviewer",
         )
         dispatcher_deadline_raw = dispatcher_cfg.get("deadline_s")
         dispatcher_deadline = (
@@ -4316,23 +4319,33 @@ class ReviewerAgent(BaseAgent):
             and dispatcher_deadline_raw > 0
             else None
         )
-        dispatcher_config = DispatcherProviderConfig(
-            **(
-                {"deadline_s": dispatcher_deadline}
-                if dispatcher_deadline is not None
-                else {}
-            )
+        dispatcher_deadline_kwargs = (
+            {"deadline_s": dispatcher_deadline}
+            if dispatcher_deadline is not None
+            else {}
         )
         registry.register(
             DispatcherProvider(
-                "ollama", dispatcher_config, client=dispatcher_client,
+                "ollama",
+                DispatcherProviderConfig(
+                    base_url=dispatcher_base_url,
+                    default_model=ollama_default,
+                    **dispatcher_deadline_kwargs,
+                ),
+                client=dispatcher_client,
             ),
             default_model=ollama_default,
             declared_models=declared_by_backend.get("ollama", []),
         )
         registry.register(
             DispatcherProvider(
-                "tabbyapi", dispatcher_config, client=dispatcher_client,
+                "tabbyapi",
+                DispatcherProviderConfig(
+                    base_url=dispatcher_base_url,
+                    default_model=tabby_default,
+                    **dispatcher_deadline_kwargs,
+                ),
+                client=dispatcher_client,
             ),
             default_model=tabby_default,
             declared_models=declared_by_backend.get("tabbyapi", []),

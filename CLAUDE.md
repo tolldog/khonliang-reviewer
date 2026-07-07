@@ -36,9 +36,18 @@ than in the README:
   path. `DispatcherProvider` calls `khonliang-dispatcher` via
   `khonliang-dispatcher-lib`'s `DispatcherClient`: an explicit
   `request.metadata["model"]` still sends `model=` straight through
-  (unchanged), an unset one sends `skill=request.kind` and lets the
-  dispatcher's `skill_policy.yaml` resolve the box-specific model
-  server-side instead of reviewer's local config. This is the
+  (unchanged); absent that, it falls back to THIS instance's own
+  `DispatcherProviderConfig.default_model` (one per backend —
+  `providers.ollama.default_model` / `providers.tabbyapi.default_model`,
+  same as the old `_resolve_model` convention) so an explicit backend
+  choice (rule-table default, the tabby-unavailable degrade-to-ollama
+  reroute) stays pinned to that engine. Only when even the per-backend
+  default is unset does it send `skill=request.kind` and let the
+  dispatcher's `skill_policy.yaml` resolve the model server-side —
+  codex review round 2 caught that sending bare `skill=` whenever
+  `model` was absent silently broke backend pinning, since the
+  dispatcher's skill resolver doesn't know which of the two registered
+  instances (ollama vs tabbyapi) initiated the call. This is the
   `dispatcher-will-own-tabbyapi` project memory's forward note, now
   resolved — don't re-litigate the "should this go through a gateway"
   question, it's decided; do keep the offline tools' direct-provider

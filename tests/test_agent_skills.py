@@ -2927,6 +2927,32 @@ def test_dispatcher_base_url_threads_from_config_yaml(tmp_path):
     assert tabby_provider.name == "tabbyapi"
     assert ollama_provider._client.base_url == "http://example:8790"
     assert tabby_provider._client.base_url == "http://example:8790"
+    # codex review finding (round 2): DispatcherProvider.is_available()
+    # reads self.config.base_url, NOT the shared client's -- both must
+    # be threaded, or the availability/degrade probe hits the wrong host.
+    assert ollama_provider.config.base_url == "http://example:8790"
+    assert tabby_provider.config.base_url == "http://example:8790"
+
+
+def test_dispatcher_default_model_reachable_via_provider_config(tmp_path):
+    """codex review finding (round 2): review_text derives the
+    effective model for repo config lookups from
+    provider.config.default_model when chosen_model == "" -- this
+    must stay reachable on the gatewayed DispatcherProvider, not just
+    as registry/list_models metadata."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n"
+        "  ollama:\n"
+        "    default_model: glm-4.7-flash\n"
+    )
+    agent = ReviewerAgent(
+        agent_id="reviewer-test",
+        bus_url="http://mock",
+        config_path=str(config_path),
+    )
+    selector = agent._ensure_selector()
+    assert selector.providers["ollama"].config.default_model == "glm-4.7-flash"
 
 
 def test_dispatcher_deadline_s_threads_from_config_yaml(tmp_path):

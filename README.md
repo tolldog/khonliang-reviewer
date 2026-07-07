@@ -169,11 +169,16 @@ The `model` argument is honored on all five backends:
   before when the caller supplies one (an explicit
   `request.metadata["model"]` — an A/B-comparison pin, or the rule
   table's `kimi-k2.5:cloud` long-context escalation — is sent to the
-  dispatcher as `model=`). When the caller supplies neither `model`
-  nor a rule-table pick (the old `FAST_TIER_MODEL` empty-sentinel
-  case — "whatever's resident"), the provider sends `skill=<kind>`
-  instead and lets the dispatcher's own `skill_policy.yaml` resolve
-  the box-specific model server-side. Configure the dispatcher's base
+  dispatcher as `model=`). Absent that, the provider falls back to
+  its OWN per-backend `providers.<ollama|tabbyapi>.default_model`
+  pin (same as the old `_resolve_model` convention) so an explicit
+  backend choice — the rule table's default, or the tabby-unavailable
+  degrade-to-ollama reroute — stays pinned to that specific engine
+  rather than being handed to the dispatcher's skill resolver to
+  redecide across both internal engines. Only when even that
+  per-backend default is unset does the provider send `skill=<kind>`
+  and let the dispatcher's own `skill_policy.yaml` resolve the model
+  server-side. Configure the dispatcher's base
   URL via `providers.dispatcher.base_url` (default
   `http://localhost:8790`) and the per-call budget via
   `providers.dispatcher.deadline_s` (default `240`, generous vs. the

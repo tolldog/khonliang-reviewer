@@ -95,9 +95,12 @@ def _request(*, kind: str = "pr_diff", metadata: dict[str, Any] | None = None) -
 
 
 @pytest.mark.asyncio
-async def test_review_uses_skill_when_no_model_override() -> None:
+async def test_review_uses_skill_only_as_last_resort() -> None:
+    """No override AND no configured default_model on this instance --
+    the true last-resort case (an operator relying entirely on
+    skill_policy.yaml, no per-backend pin at all)."""
     client = _FakeDispatcherClient(_success_handle())
-    provider = DispatcherProvider("tabbyapi", client=client)
+    provider = DispatcherProvider("tabbyapi", client=client)  # default config: default_model=""
 
     result = await provider.review(_request(kind="pr_diff"))
 
@@ -108,6 +111,44 @@ async def test_review_uses_skill_when_no_model_override() -> None:
     assert result.model == "resident-model"
     assert result.summary == "Dispatcher-gatewayed review summary."
     assert result.findings[0].title == "No test for empty input"
+
+
+@pytest.mark.asyncio
+async def test_review_falls_back_to_instance_default_model_not_skill() -> None:
+    """codex review finding, round 2: the common case. No metadata
+    override, but THIS instance has a configured default_model (the
+    normal, non-empty operator config) -- must pin to that model, not
+    hand the choice to the dispatcher's skill resolver, or an explicit
+    backend=ollama/backend=tabbyapi pick (including the tabby-
+    unavailable degrade-to-ollama reroute) would silently lose its
+    pin and could land on either internal engine."""
+    client = _FakeDispatcherClient(_success_handle(model="deepseek-coder-v2:16b"))
+    provider = DispatcherProvider(
+        "ollama",
+        DispatcherProviderConfig(default_model="deepseek-coder-v2:16b"),
+        client=client,
+    )
+
+    result = await provider.review(_request(kind="pr_diff"))
+
+    assert client.calls[0]["model"] == "deepseek-coder-v2:16b"
+    assert "skill" not in client.calls[0]
+    assert client.calls[0]["role"] == "pr_diff"
+    assert result.model == "deepseek-coder-v2:16b"
+
+
+@pytest.mark.asyncio
+async def test_review_metadata_override_wins_over_instance_default() -> None:
+    client = _FakeDispatcherClient(_success_handle(model="pinned-model"))
+    provider = DispatcherProvider(
+        "ollama",
+        DispatcherProviderConfig(default_model="deepseek-coder-v2:16b"),
+        client=client,
+    )
+
+    await provider.review(_request(metadata={"model": "pinned-model"}))
+
+    assert client.calls[0]["model"] == "pinned-model"
 
 
 @pytest.mark.asyncio

@@ -93,6 +93,23 @@ class DispatcherProviderConfig:
     #: before dispatching, budget the old direct-HTTP calls never had
     #: to account for.
     deadline_s: float = 240.0
+    #: This INSTANCE's own pinned model (per-backend: the "ollama"
+    #: DispatcherProvider and the "tabbyapi" one each get their own
+    #: config with their own value here) -- restores exact backend-pin
+    #: semantics from the old OllamaProviderConfig/TabbyAPIProviderConfig
+    #: (codex review finding, round 2). Every existing call site that
+    #: reaches this provider WITHOUT a ``request.metadata["model"]``
+    #: override has already made a load-bearing choice of WHICH
+    #: registry entry to invoke -- the rule table's default backend,
+    #: the tabby-unavailable degrade-to-ollama reroute, or an explicit
+    #: caller ``backend=`` pin with no model. None of those mean "any
+    #: internal engine, don't care" -- they mean "this specific
+    #: backend, whatever model it's pinned to." Sending bare
+    #: ``skill=request.kind`` in that case would let the dispatcher's
+    #: skill_policy.yaml resolve to EITHER internal engine, silently
+    #: overriding the caller's backend choice. ``skill=`` is only used
+    #: as the last-resort fallback when this is also unset.
+    default_model: str = ""
 
 
 class DispatcherProvider(ReviewProvider):
@@ -189,22 +206,23 @@ class DispatcherProvider(ReviewProvider):
         # (ollama.py/tabbyapi.py's ``_resolve_model``): an explicit
         # ``request.metadata["model"]`` -- an operator's A/B-comparison
         # pin, or the rule table's explicit kimi-k2.5:cloud escalation
-        # -- always wins and is sent as ``model=``. Absent, this is the
-        # "whatever's resident" sentinel case: send ``skill=request.kind``
-        # instead and let the dispatcher's skill_policy.yaml resolve the
-        # box-specific model, rather than hardcoding it here.
+        # -- always wins. Absent, fall back to THIS instance's own
+        # ``config.default_model`` (codex review finding, round 2):
+        # every call reaching this provider without an override has
+        # already made a load-bearing choice of which backend to use
+        # (rule-table default, the tabby-unavailable degrade-to-ollama
+        # reroute, an explicit ``backend=`` pin) -- that choice must
+        # stay pinned to THIS engine, not be handed to the dispatcher's
+        # skill resolver to redecide. ``skill=request.kind`` is only
+        # the last-resort fallback when even the per-instance default
+        # is unset (an operator relying entirely on skill_policy.yaml).
         override = request.metadata.get("model")
         model_override = (
             override.strip()
             if isinstance(override, str) and override.strip()
-            else None
+            else (self.config.default_model or None)
         )
 
-        # This request's own audit/traceability label. role= is passed
-        # explicitly for the model_override path (no skill= there for
-        # the dispatcher to auto-default metadata.role from); the
-        # skill= path doesn't need it -- the dispatcher already
-        # defaults metadata.role to the skill name.
         run_kwargs: dict[str, Any] = {
             "task": ChatTask(messages=[{"role": "user", "content": prompt}]),
             "deadline_s": self.config.deadline_s,
